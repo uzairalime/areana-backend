@@ -1,0 +1,459 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// RBAC — roles are data, not code. Super admin creates/edits them in-panel.
+// ---------------------------------------------------------------------------
+enum RoleScope {
+  platform
+  arena
+}
+
+enum UserStatus {
+  pending
+  active
+  suspended
+}
+
+enum VenueStatus {
+  draft
+  pending
+  approved
+  rejected
+  suspended
+}
+
+enum BookingStatus {
+  pending
+  confirmed
+  cancelled
+  completed
+  no_show
+}
+
+model Role {
+  id          String    @id @default(cuid())
+  name        String    @unique
+  scope       RoleScope @default(arena)
+  description String?
+  permissions String[] // permission keys, e.g. "bookings.approve"
+  isSystem    Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+
+  users        User[]
+  venueAllowed VenueAllowedRole[]
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  name         String?
+  phone        String?
+  city         String?
+  passwordHash String? // staff only (owner/staff/super_admin). Players are OTP-only.
+  roleId       String
+  role         Role       @relation(fields: [roleId], references: [id])
+  referralCode String?    @unique
+  noShowCount  Int        @default(0)
+  status       UserStatus @default(active)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  venues            Venue[]
+  bookings          Booking[]
+  favorites         Favorite[]
+  reviews           Review[]
+  gamePosts         GamePost[]
+  deviceTokens      DeviceToken[]
+  promoRedemptions  PromoRedemption[]
+  staffVenues       VenueStaff[]
+  suggestions       VenueSuggestion[]
+  auditLogs         AuditLog[]       @relation("ActorLogs")
+  disputesRaised    Dispute[]        @relation("RaisedDisputes")
+  disputesResolved  Dispute[]        @relation("ResolvedDisputes")
+  grantedBadges     VenueBadge[]
+  curatedPosts      GamePost[]       @relation("CuratedPosts")
+  referralsMade     Referral[]       @relation("Referrer")
+  referralsReceived Referral[]       @relation("Referee")
+}
+
+model OtpCode {
+  id         String    @id @default(cuid())
+  email      String
+  codeHash   String
+  expiresAt  DateTime
+  attempts   Int       @default(0)
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([email])
+}
+
+model DeviceToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  platform  String?
+  createdAt DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Venues & courts
+// ---------------------------------------------------------------------------
+model Venue {
+  id                String      @id @default(cuid())
+  ownerId           String
+  owner             User        @relation(fields: [ownerId], references: [id])
+  name              String
+  address           String
+  city              String
+  lat               Float?
+  lng               Float?
+  sports            String[]
+  amenities         String[]
+  images            String[]
+  rating            Float       @default(0)
+  ratingCount       Int         @default(0)
+  autoAccept        Boolean     @default(false)
+  minAdvanceMinutes Int         @default(120)
+  maxAdvanceDays    Int         @default(14)
+  status            VenueStatus @default(draft)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  courts       Court[]
+  bookings     Booking[]
+  reviews      Review[]
+  favorites    Favorite[]
+  staff        VenueStaff[]
+  allowedRoles VenueAllowedRole[]
+  badges       VenueBadge[]
+  gamePosts    GamePost[]
+
+  @@index([status])
+  @@index([city, status])
+}
+
+model VenueAllowedRole {
+  venueId String
+  venue   Venue  @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  roleId  String
+  role    Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([venueId, roleId])
+}
+
+model VenueStaff {
+  id        String   @id @default(cuid())
+  venueId   String
+  venue     Venue    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([venueId, userId])
+}
+
+model Court {
+  id           String   @id @default(cuid())
+  venueId      String
+  venue        Venue    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  name         String // e.g. "Turf A"
+  sport        String // e.g. "Football"
+  size         String? // e.g. "7v7"
+  surface      String? // artificial_grass | natural_grass | hard
+  indoor       Boolean  @default(false)
+  pricePerHour Decimal  @db.Decimal(10, 2)
+  openMinutes  Int      @default(360) // 6:00 AM, minutes since midnight
+  closeMinutes Int      @default(1380) // 11:00 PM
+  slotMinutes  Int      @default(60)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  slotBlocks SlotBlock[]
+  bookings   Booking[]
+
+  @@index([venueId])
+}
+
+model SlotBlock {
+  id           String   @id @default(cuid())
+  courtId      String
+  court        Court    @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  date         DateTime @db.Date
+  startMinutes Int
+  endMinutes   Int
+  reason       String?
+  createdAt    DateTime @default(now())
+
+  @@index([courtId, date])
+}
+
+// ---------------------------------------------------------------------------
+// Bookings
+// ---------------------------------------------------------------------------
+model Booking {
+  id             String        @id @default(cuid())
+  userId         String? // null for walk-ins
+  user           User?         @relation(fields: [userId], references: [id])
+  guestName      String?
+  venueId        String
+  venue          Venue         @relation(fields: [venueId], references: [id])
+  courtId        String
+  court          Court         @relation(fields: [courtId], references: [id])
+  date           DateTime      @db.Date
+  startMinutes   Int // minutes since midnight
+  endMinutes     Int
+  totalPrice     Decimal       @db.Decimal(10, 2)
+  discountAmount Decimal       @default(0) @db.Decimal(10, 2)
+  promoCodeId    String?
+  promoCode      PromoCode?    @relation(fields: [promoCodeId], references: [id])
+  status         BookingStatus @default(pending)
+  shareCode      String?       @unique // group booking join link
+  checkInCode    String        @unique // QR shown in app, scanned by venue
+  checkedInAt    DateTime?
+  reminderSent   Boolean       @default(false)
+  recurrenceId   String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  participants     BookingParticipant[]
+  reviews          Review[]
+  reschedules      RescheduleRequest[]
+  disputes         Dispute[]
+  promoRedemptions PromoRedemption[]
+
+  @@unique([courtId, date, startMinutes]) // the double-booking guard
+  @@index([userId, date])
+  @@index([courtId, date])
+  @@index([recurrenceId])
+  @@index([status, date])
+}
+
+model BookingParticipant {
+  id        String   @id @default(cuid())
+  bookingId String
+  booking   Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  name      String
+  phone     String?
+  joinedAt  DateTime @default(now())
+
+  @@index([bookingId])
+}
+
+model RescheduleRequest {
+  id                    String   @id @default(cuid())
+  bookingId             String
+  booking               Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  requestedDate         DateTime @db.Date
+  requestedStartMinutes Int
+  requestedEndMinutes   Int
+  status                String   @default("pending") // pending | approved | rejected
+  reason                String?
+  createdAt             DateTime @default(now())
+  decidedAt             DateTime?
+
+  @@index([bookingId])
+}
+
+// ---------------------------------------------------------------------------
+// Social: favorites, reviews, game board
+// ---------------------------------------------------------------------------
+model Favorite {
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  venueId   String
+  venue     Venue    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, venueId])
+}
+
+model Review {
+  id         String    @id @default(cuid())
+  venueId    String
+  venue      Venue     @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  bookingId  String    @unique // one review per completed booking
+  booking    Booking   @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  rating     Int
+  comment    String?
+  ownerReply String?
+  repliedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([venueId])
+}
+
+model GamePost {
+  id            String    @id @default(cuid())
+  creatorId     String
+  creator       User      @relation(fields: [creatorId], references: [id])
+  venueId       String?
+  venue         Venue?    @relation(fields: [venueId], references: [id])
+  sport         String
+  city          String
+  date          DateTime  @db.Date
+  startMinutes  Int
+  playersNeeded Int
+  note          String?
+  status        String    @default("open") // open | full | closed
+  isCurated     Boolean   @default(false)
+  curatedById   String?
+  curatedBy     User?     @relation("CuratedPosts", fields: [curatedById], references: [id])
+  createdAt     DateTime  @default(now())
+
+  participants GameParticipant[]
+
+  @@index([city, date, status])
+}
+
+model GameParticipant {
+  id       String   @id @default(cuid())
+  postId   String
+  post     GamePost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  userId   String?
+  name     String
+  phone    String?
+  joinedAt DateTime @default(now())
+
+  @@index([postId])
+}
+
+// ---------------------------------------------------------------------------
+// Promos & referrals
+// ---------------------------------------------------------------------------
+model PromoCode {
+  id           String    @id @default(cuid())
+  code         String    @unique
+  kind         String // percent | flat
+  value        Decimal   @db.Decimal(10, 2)
+  maxDiscount  Decimal?  @db.Decimal(10, 2)
+  maxUses      Int?
+  usedCount    Int       @default(0)
+  perUserLimit Int       @default(1)
+  validFrom    DateTime  @default(now())
+  validTo      DateTime
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+
+  redemptions PromoRedemption[]
+  bookings    Booking[]
+}
+
+model PromoRedemption {
+  id          String    @id @default(cuid())
+  promoCodeId String
+  promoCode   PromoCode @relation(fields: [promoCodeId], references: [id])
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  bookingId   String?
+  booking     Booking?  @relation(fields: [bookingId], references: [id])
+  createdAt   DateTime  @default(now())
+
+  @@index([promoCodeId, userId])
+}
+
+model Referral {
+  id         String   @id @default(cuid())
+  referrerId String
+  referrer   User     @relation("Referrer", fields: [referrerId], references: [id])
+  refereeId  String   @unique
+  referee    User     @relation("Referee", fields: [refereeId], references: [id])
+  status     String   @default("pending") // pending | rewarded
+  createdAt  DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Platform: badges, disputes, banners, suggestions, audit
+// ---------------------------------------------------------------------------
+model Badge {
+  id                  String   @id @default(cuid())
+  name                String
+  tier                Int
+  criteriaDescription String?
+  iconUrl             String?
+  createdAt           DateTime @default(now())
+
+  venues VenueBadge[]
+}
+
+model VenueBadge {
+  venueId     String
+  venue       Venue    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  badgeId     String
+  badge       Badge    @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+  grantedAt   DateTime @default(now())
+  grantedById String?
+  grantedBy   User?    @relation(fields: [grantedById], references: [id])
+
+  @@id([venueId, badgeId])
+}
+
+model Dispute {
+  id           String    @id @default(cuid())
+  bookingId    String
+  booking      Booking   @relation(fields: [bookingId], references: [id])
+  raisedById   String
+  raisedBy     User      @relation("RaisedDisputes", fields: [raisedById], references: [id])
+  reason       String
+  status       String    @default("open") // open | resolved | dismissed
+  resolution   String?
+  resolvedById String?
+  resolvedBy   User?     @relation("ResolvedDisputes", fields: [resolvedById], references: [id])
+  createdAt    DateTime  @default(now())
+  resolvedAt   DateTime?
+
+  @@index([status])
+}
+
+model Banner {
+  id        String    @id @default(cuid())
+  title     String
+  imageUrl  String
+  linkUrl   String?
+  city      String?
+  isActive  Boolean   @default(true)
+  startsAt  DateTime  @default(now())
+  endsAt    DateTime?
+  createdAt DateTime  @default(now())
+}
+
+model VenueSuggestion {
+  id            String  @id @default(cuid())
+  suggestedById String?
+  suggestedBy   User?   @relation(fields: [suggestedById], references: [id])
+  name          String
+  city          String
+  phone         String?
+  note          String?
+  status        String  @default("new") // new | contacted | converted | dismissed
+  createdAt     DateTime @default(now())
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String
+  actor     User     @relation("ActorLogs", fields: [actorId], references: [id])
+  action    String
+  entity    String
+  entityId  String
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+}
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
