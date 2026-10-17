@@ -1,8 +1,12 @@
 # Peak / off-peak pricing — design plan
 
-Status: **planned (Phase 2), not built yet.** Added Oct 18, 2026.
-This is a design document — there is no peak pricing UI or API in the
-app today. Today's pricing is one flat `pricePerHour` per court.
+Status: **BUILT Oct 18, 2026** (design added the same day).
+Implemented as designed below: `CourtPriceWindow` model, per-slot
+pricing in the availability engine and booking creation, owner
+endpoints `POST /owner/courts/:id/price-windows` and
+`DELETE /owner/price-windows/:id`, a Peak pricing section in
+Courts → Timings & availability, and a Peak tag on player slot chips.
+Requires the `court_price_window` migration (`npm run prisma:migrate`).
 
 ## Goal
 
