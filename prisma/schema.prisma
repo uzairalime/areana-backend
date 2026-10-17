@@ -178,10 +178,46 @@ model Court {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  slotBlocks SlotBlock[]
-  bookings   Booking[]
+  slotBlocks     SlotBlock[]
+  weeklyWindows  CourtWeeklyWindow[]
+  recurringBlocks RecurringBlock[]
+  bookings       Booking[]
 
   @@index([venueId])
+}
+
+/// One row per open window of a weekday — multiple rows per weekday mean
+/// split shifts (e.g. 06:00–11:00 and 16:00–23:00). A court with NO rows
+/// at all falls back to its openMinutes/closeMinutes for every day; a
+/// court WITH rows is closed on weekdays that have no row.
+model CourtWeeklyWindow {
+  id           String   @id @default(cuid())
+  courtId      String
+  court        Court    @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  weekday      Int // 0 = Sunday … 6 = Saturday (JS getDay)
+  startMinutes Int
+  endMinutes   Int
+  createdAt    DateTime @default(now())
+
+  @@index([courtId, weekday])
+}
+
+/// A block that repeats on the given weekdays, optionally bounded by a
+/// date range (e.g. every Friday 12:30–14:30, or a Ramadan schedule for
+/// one month). One-off date blocks stay in SlotBlock.
+model RecurringBlock {
+  id           String    @id @default(cuid())
+  courtId      String
+  court        Court     @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  weekdays     Int[] // 0 = Sunday … 6 = Saturday
+  startMinutes Int
+  endMinutes   Int
+  reason       String?
+  startsOn     DateTime? @db.Date
+  endsOn       DateTime? @db.Date
+  createdAt    DateTime  @default(now())
+
+  @@index([courtId])
 }
 
 model SlotBlock {

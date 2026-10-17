@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Put,
   Query,
   UploadedFile,
   UseInterceptors,
@@ -18,7 +19,10 @@ import {
   BookingsQueryDto,
   CheckInScanDto,
   CreateBlockDto,
+  CreateClosureDto,
   CreateCourtDto,
+  CreateRecurringBlockDto,
+  SetWeeklyHoursDto,
   CreateStaffDto,
   CreateVenueDto,
   RejectDto,
@@ -146,6 +150,54 @@ export class OwnerController {
   @Delete('blocks/:id')
   deleteBlock(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.deleteBlock(user, id);
+  }
+
+  // ------------------------------------------------- availability manager
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Get('courts/:courtId/availability')
+  courtAvailability(@CurrentUser() user: AuthUser, @Param('courtId') courtId: string) {
+    return this.owner.courtAvailabilityRules(user, courtId);
+  }
+
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Put('courts/:courtId/weekly-hours')
+  setWeeklyHours(
+    @CurrentUser() user: AuthUser,
+    @Param('courtId') courtId: string,
+    @Body() dto: SetWeeklyHoursDto,
+  ) {
+    return this.owner.setWeeklyHours(user, courtId, dto);
+  }
+
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Post('courts/:courtId/recurring-blocks')
+  createRecurringBlock(
+    @CurrentUser() user: AuthUser,
+    @Param('courtId') courtId: string,
+    @Body() dto: CreateRecurringBlockDto,
+  ) {
+    return this.owner.createRecurringBlock(user, courtId, dto);
+  }
+
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Delete('recurring-blocks/:id')
+  deleteRecurringBlock(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.deleteRecurringBlock(user, id);
+  }
+
+  @RequireAnyPerm('blocks.manage', 'schedule.manage')
+  @ApiTags('owner · calendar blocks')
+  @Post('venues/:venueId/closures')
+  createClosure(
+    @CurrentUser() user: AuthUser,
+    @Param('venueId') venueId: string,
+    @Body() dto: CreateClosureDto,
+  ) {
+    return this.owner.createClosure(user, venueId, dto);
   }
 
   // --------------------------------------------------------------- bookings

@@ -1,4 +1,5 @@
-import { IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Min } from 'class-validator';
+import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Min, ValidateNested } from 'class-validator';
+import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class CreateVenueDto {
@@ -97,4 +98,70 @@ export class BookingsQueryDto {
   @IsOptional()
   @IsIn(['pending', 'confirmed', 'cancelled', 'completed', 'no_show'])
   status?: string;
+}
+
+// ------------------------------------------------------- availability manager
+export class WeeklyWindowDto {
+  @ApiProperty({ example: 360 }) @IsInt() @Min(0) startMinutes: number;
+  @ApiProperty({ example: 1380 }) @IsInt() @Min(0) endMinutes: number;
+}
+
+export class WeeklyDayDto {
+  @ApiProperty({ example: 1, description: '0 = Sunday … 6 = Saturday' })
+  @IsInt()
+  @Min(0)
+  weekday: number;
+  @ApiProperty({ type: [WeeklyWindowDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => WeeklyWindowDto)
+  windows: WeeklyWindowDto[];
+}
+
+export class SetWeeklyHoursDto {
+  @ApiProperty({ type: [WeeklyDayDto] })
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => WeeklyDayDto)
+  days: WeeklyDayDto[];
+  @ApiPropertyOptional({
+    description:
+      'Set true to save even when existing bookings conflict (they are kept).',
+  })
+  @IsOptional()
+  @IsBoolean()
+  acknowledgeConflicts?: boolean;
+}
+
+export class CreateRecurringBlockDto {
+  @ApiProperty({ type: [Number], example: [5], description: '0 = Sunday … 6 = Saturday' })
+  @IsArray()
+  @IsInt({ each: true })
+  weekdays: number[];
+  @ApiProperty({ example: 750 }) @IsInt() @Min(0) startMinutes: number;
+  @ApiProperty({ example: 870 }) @IsInt() @Min(0) endMinutes: number;
+  @ApiPropertyOptional() @IsOptional() @IsString() reason?: string;
+  @ApiPropertyOptional({ example: '2026-11-01' })
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  startsOn?: string;
+  @ApiPropertyOptional({ example: '2026-11-30' })
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  endsOn?: string;
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  acknowledgeConflicts?: boolean;
+}
+
+export class CreateClosureDto {
+  @ApiProperty({ example: '2026-10-20' })
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  date: string;
+  @ApiPropertyOptional({ description: 'Omit to close every court of the venue.' })
+  @IsOptional()
+  @IsString()
+  courtId?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() reason?: string;
 }

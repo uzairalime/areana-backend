@@ -34,7 +34,7 @@ export class AvailabilityService {
     const court = await this.courts.getActiveCourt(courtId);
     const date = parseDateOnly(dateStr);
 
-    const [bookings, blocks] = await Promise.all([
+    const [bookings, windows, blockedRanges] = await Promise.all([
       this.prisma.booking.findMany({
         where: {
           courtId,
@@ -43,12 +43,10 @@ export class AvailabilityService {
         },
         select: { startMinutes: true, endMinutes: true },
       }),
-      this.prisma.slotBlock.findMany({
-        where: { courtId, date },
-        select: { startMinutes: true, endMinutes: true },
-      }),
+      this.courts.windowsForDate(court, date),
+      this.courts.blockedRangesForDate(courtId, date),
     ]);
-    const busy = [...bookings, ...blocks];
+    const busy = [...bookings, ...blockedRanges];
 
     const now = new Date();
     const minBookableAt = new Date(now.getTime() + court.venue.minAdvanceMinutes * 60_000);
@@ -56,25 +54,29 @@ export class AvailabilityService {
     maxDate.setDate(maxDate.getDate() + court.venue.maxAdvanceDays);
     const beyondWindow = date > maxDate;
 
+    // Slots are generated per open window for the day (weekly template
+    // or the court's default hours; empty windows = closed that day).
     const slots: SlotDto[] = [];
-    for (
-      let start = court.openMinutes;
-      start + court.slotMinutes <= court.closeMinutes;
-      start += court.slotMinutes
-    ) {
-      const end = start + court.slotMinutes;
-      const clash = busy.some((b) => start < b.endMinutes && end > b.startMinutes);
+    for (const w of windows) {
+      for (
+        let start = w.startMinutes;
+        start + court.slotMinutes <= w.endMinutes;
+        start += court.slotMinutes
+      ) {
+        const end = start + court.slotMinutes;
+        const clash = busy.some((b) => start < b.endMinutes && end > b.startMinutes);
 
-      const slotAt = new Date(date);
-      slotAt.setHours(Math.floor(start / 60), start % 60, 0, 0);
-      const tooSoon = slotAt < minBookableAt;
+        const slotAt = new Date(date);
+        slotAt.setHours(Math.floor(start / 60), start % 60, 0, 0);
+        const tooSoon = slotAt < minBookableAt;
 
-      slots.push({
-        startMinutes: start,
-        endMinutes: end,
-        available: !clash && !tooSoon && !beyondWindow,
-        price: Number(court.pricePerHour) * (court.slotMinutes / 60),
-      });
+        slots.push({
+          startMinutes: start,
+          endMinutes: end,
+          available: !clash && !tooSoon && !beyondWindow,
+          price: Number(court.pricePerHour) * (court.slotMinutes / 60),
+        });
+      }
     }
 
     return {
@@ -83,6 +85,7 @@ export class AvailabilityService {
       date: dateStr,
       currency: 'PKR',
       slotMinutes: court.slotMinutes,
+      windows,
       slots,
     };
   }

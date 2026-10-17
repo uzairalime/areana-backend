@@ -13,10 +13,14 @@ import { BookingsService } from '../bookings/bookings.service';
 import { StorageService } from '../storage/storage.service';
 import { ReviewsService } from '../reviews/reviews.service';
 import { parseDateOnly, startOfToday } from '../common/date.util';
+import { CourtsService, toYmd } from '../courts/courts.service';
 import {
   BookingsQueryDto,
   CreateBlockDto,
+  CreateClosureDto,
   CreateCourtDto,
+  CreateRecurringBlockDto,
+  SetWeeklyHoursDto,
   CreateStaffDto,
   CreateVenueDto,
   UpdateCourtDto,
@@ -29,6 +33,7 @@ export class OwnerService {
   constructor(
     private prisma: PrismaService,
     private bookingOps: BookingsService,
+    private courtsSvc: CourtsService,
     private storage: StorageService,
     private reviewOps: ReviewsService,
   ) {}
@@ -248,6 +253,273 @@ export class OwnerService {
     return this.prisma.slotBlock.delete({ where: { id: blockId } });
   }
 
+  // ------------------------------------------------- availability manager
+  private async assertCourt(user: AuthUser, courtId: string) {
+    const court = await this.prisma.court.findUnique({ where: { id: courtId } });
+    if (!court) throw new NotFoundException('Court not found');
+    await this.assertVenue(user, court.venueId);
+    return court;
+  }
+
+  private conflictView(b: {
+    id: string;
+    date: Date;
+    startMinutes: number;
+    endMinutes: number;
+    status: string;
+    guestName: string | null;
+    user: { name: string } | null;
+  }) {
+    return {
+      bookingId: b.id,
+      date: toYmd(b.date),
+      startMinutes: b.startMinutes,
+      endMinutes: b.endMinutes,
+      status: b.status,
+      player: b.user?.name ?? (b.guestName ? `${b.guestName} (walk-in)` : 'Guest'),
+    };
+  }
+
+  /** Weekly template + recurring blocks for one court (owner view). */
+  async courtAvailabilityRules(user: AuthUser, courtId: string) {
+    const court = await this.assertCourt(user, courtId);
+    const [rows, recurringBlocks] = await Promise.all([
+      this.prisma.courtWeeklyWindow.findMany({
+        where: { courtId },
+        orderBy: [{ weekday: 'asc' }, { startMinutes: 'asc' }],
+      }),
+      this.prisma.recurringBlock.findMany({
+        where: { courtId },
+        orderBy: { createdAt: 'asc' },
+      }),
+    ]);
+    const weekly = Array.from({ length: 7 }, (_, weekday) => ({
+      weekday,
+      windows: rows
+        .filter((r) => r.weekday === weekday)
+        .map((r) => ({ startMinutes: r.startMinutes, endMinutes: r.endMinutes })),
+    }));
+    return {
+      courtId,
+      usesWeeklyTemplate: rows.length > 0,
+      defaultWindow: { startMinutes: court.openMinutes, endMinutes: court.closeMinutes },
+      weekly,
+      recurringBlocks: recurringBlocks.map((r) => ({
+        ...r,
+        startsOn: r.startsOn ? toYmd(r.startsOn) : null,
+        endsOn: r.endsOn ? toYmd(r.endsOn) : null,
+      })),
+    };
+  }
+
+  /**
+   * Replace a court's weekly-hours template. Conflict protection: future
+   * pending/confirmed bookings that no longer fit inside a window are
+   * reported; nothing is saved until the owner acknowledges them
+   * (acknowledged bookings are kept as-is — grandfathered).
+   */
+  async setWeeklyHours(user: AuthUser, courtId: string, dto: SetWeeklyHoursDto) {
+    const court = await this.assertCourt(user, courtId);
+    for (const day of dto.days) {
+      if (day.weekday < 0 || day.weekday > 6) {
+        throw new BadRequestException('weekday must be 0 (Sun) – 6 (Sat)');
+      }
+      const sorted = [...day.windows].sort((a, b) => a.startMinutes - b.startMinutes);
+      for (let i = 0; i < sorted.length; i++) {
+        const w = sorted[i];
+        if (w.endMinutes <= w.startMinutes || w.startMinutes < 0 || w.endMinutes > 1440) {
+          throw new BadRequestException('Each window must be within the day, end after start');
+        }
+        if (i > 0 && w.startMinutes < sorted[i - 1].endMinutes) {
+          throw new BadRequestException('Windows on the same day cannot overlap');
+        }
+      }
+    }
+
+    const future = await this.prisma.booking.findMany({
+      where: {
+        courtId,
+        date: { gte: startOfToday() },
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+      },
+      include: { user: { select: { name: true } } },
+      orderBy: [{ date: 'asc' }, { startMinutes: 'asc' }],
+    });
+    const conflicts = future
+      .filter((b) => {
+        const day = dto.days.find((d) => d.weekday === b.date.getDay());
+        const windows = day?.windows ?? [];
+        return !windows.some(
+          (w) => b.startMinutes >= w.startMinutes && b.endMinutes <= w.endMinutes,
+        );
+      })
+      .map((b) => this.conflictView(b));
+
+    if (conflicts.length > 0 && !dto.acknowledgeConflicts) {
+      return { saved: false, conflicts };
+    }
+
+    const flat = dto.days.flatMap((d) =>
+      d.windows.map((w) => ({
+        courtId,
+        weekday: d.weekday,
+        startMinutes: w.startMinutes,
+        endMinutes: w.endMinutes,
+      })),
+    );
+    await this.prisma.$transaction([
+      this.prisma.courtWeeklyWindow.deleteMany({ where: { courtId } }),
+      ...(flat.length > 0
+        ? [this.prisma.courtWeeklyWindow.createMany({ data: flat })]
+        : []),
+    ]);
+    // Keep the court's headline hours in sync (earliest open / latest
+    // close across the week) for dashboards and occupancy math.
+    if (flat.length > 0) {
+      await this.prisma.court.update({
+        where: { id: courtId },
+        data: {
+          openMinutes: Math.min(...flat.map((w) => w.startMinutes)),
+          closeMinutes: Math.max(...flat.map((w) => w.endMinutes)),
+        },
+      });
+    }
+    return { saved: true, conflicts };
+  }
+
+  /**
+   * Create a recurring block (e.g. daily break, Friday prayer break, a
+   * Ramadan schedule with a date range). Conflicts are bookings in the
+   * next 60 days (or the block's own range) that overlap it.
+   */
+  async createRecurringBlock(user: AuthUser, courtId: string, dto: CreateRecurringBlockDto) {
+    await this.assertCourt(user, courtId);
+    if (dto.weekdays.length === 0 || dto.weekdays.some((d) => d < 0 || d > 6)) {
+      throw new BadRequestException('weekdays must be a non-empty list of 0 (Sun) – 6 (Sat)');
+    }
+    if (dto.endMinutes <= dto.startMinutes) {
+      throw new BadRequestException('endMinutes must be after startMinutes');
+    }
+    const startsOn = dto.startsOn ? parseDateOnly(dto.startsOn) : null;
+    const endsOn = dto.endsOn ? parseDateOnly(dto.endsOn) : null;
+    if (startsOn && endsOn && endsOn < startsOn) {
+      throw new BadRequestException('endsOn must not be before startsOn');
+    }
+
+    const today = startOfToday();
+    const from = startsOn && startsOn > today ? startsOn : today;
+    const horizon = new Date(from);
+    horizon.setDate(horizon.getDate() + 60);
+    const to = endsOn && endsOn < horizon ? endsOn : horizon;
+
+    const conflicts: ReturnType<typeof this.conflictView>[] = [];
+    if (to >= from) {
+      const rows = await this.prisma.booking.findMany({
+        where: {
+          courtId,
+          date: { gte: from, lte: to },
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        },
+        include: { user: { select: { name: true } } },
+        orderBy: [{ date: 'asc' }, { startMinutes: 'asc' }],
+      });
+      for (const b of rows) {
+        if (!dto.weekdays.includes(b.date.getDay())) continue;
+        if (b.startMinutes < dto.endMinutes && b.endMinutes > dto.startMinutes) {
+          conflicts.push(this.conflictView(b));
+        }
+      }
+    }
+    if (conflicts.length > 0 && !dto.acknowledgeConflicts) {
+      return { saved: false, conflicts };
+    }
+    const block = await this.prisma.recurringBlock.create({
+      data: {
+        courtId,
+        weekdays: dto.weekdays,
+        startMinutes: dto.startMinutes,
+        endMinutes: dto.endMinutes,
+        reason: dto.reason,
+        startsOn,
+        endsOn,
+      },
+    });
+    return { saved: true, block, conflicts };
+  }
+
+  async deleteRecurringBlock(user: AuthUser, blockId: string) {
+    const block = await this.prisma.recurringBlock.findUnique({
+      where: { id: blockId },
+      include: { court: { select: { venueId: true } } },
+    });
+    if (!block) throw new NotFoundException('Recurring block not found');
+    await this.assertVenue(user, block.court.venueId);
+    await this.prisma.recurringBlock.delete({ where: { id: blockId } });
+    return { ok: true };
+  }
+
+  /**
+   * Close one day: writes a full-day SlotBlock per open window for one
+   * court — or for every court of the venue when courtId is omitted
+   * (rain day / holiday). Returns the day's affected bookings so the UI
+   * can offer to cancel them; nothing is cancelled automatically.
+   */
+  async createClosure(user: AuthUser, venueId: string, dto: CreateClosureDto) {
+    await this.assertVenue(user, venueId);
+    const date = parseDateOnly(dto.date);
+    const courts = await this.prisma.court.findMany({
+      where: {
+        venueId,
+        isActive: true,
+        ...(dto.courtId ? { id: dto.courtId } : {}),
+      },
+    });
+    if (dto.courtId && courts.length === 0) {
+      throw new NotFoundException('Court not found');
+    }
+    let created = 0;
+    const conflicts: (ReturnType<typeof this.conflictView> & { courtName: string })[] = [];
+    for (const court of courts) {
+      const windows = await this.courtsSvc.windowsForDate(court, date);
+      for (const w of windows) {
+        const existing = await this.prisma.slotBlock.findFirst({
+          where: {
+            courtId: court.id,
+            date,
+            startMinutes: w.startMinutes,
+            endMinutes: w.endMinutes,
+          },
+          select: { id: true },
+        });
+        if (!existing) {
+          await this.prisma.slotBlock.create({
+            data: {
+              courtId: court.id,
+              date,
+              startMinutes: w.startMinutes,
+              endMinutes: w.endMinutes,
+              reason: dto.reason ?? 'Closed',
+            },
+          });
+          created++;
+        }
+      }
+      const rows = await this.prisma.booking.findMany({
+        where: {
+          courtId: court.id,
+          date,
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        },
+        include: { user: { select: { name: true } } },
+        orderBy: { startMinutes: 'asc' },
+      });
+      for (const b of rows) {
+        conflicts.push({ ...this.conflictView(b), courtName: court.name });
+      }
+    }
+    return { created, conflicts };
+  }
+
   // --------------------------------------------------------------- bookings
   async bookings(user: AuthUser, query: BookingsQueryDto) {
     const ids = query.venueId
@@ -362,13 +634,23 @@ export class OwnerService {
       startMinutes: req.requestedStartMinutes,
       endMinutes: req.requestedEndMinutes,
     };
-    // Alignment + hours.
-    if (
-      startMinutes < court.openMinutes ||
-      endMinutes > court.closeMinutes ||
-      (startMinutes - court.openMinutes) % court.slotMinutes !== 0
-    ) {
+    // Alignment + the requested day's open windows (weekly template
+    // or the court's default hours).
+    const reqWindows = await this.courtsSvc.windowsForDate(court, req.requestedDate);
+    const reqWindow = reqWindows.find(
+      (w) => startMinutes >= w.startMinutes && endMinutes <= w.endMinutes,
+    );
+    if (!reqWindow || (startMinutes - reqWindow.startMinutes) % court.slotMinutes !== 0) {
       throw new BadRequestException('Requested slot is outside court hours');
+    }
+    const reqBlocked = await this.courtsSvc.blockedRangesForDate(
+      req.booking.courtId,
+      req.requestedDate,
+    );
+    if (
+      reqBlocked.some((r) => startMinutes < r.endMinutes && endMinutes > r.startMinutes)
+    ) {
+      throw new ConflictException('Requested slot is blocked by the arena');
     }
     // Conflict re-check (excluding the booking being moved).
     const clash = await this.prisma.booking.findFirst({

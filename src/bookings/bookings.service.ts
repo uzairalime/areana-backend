@@ -56,7 +56,7 @@ export class BookingsService {
     const slotCount = input.slotCount ?? 1;
     const { startMinutes } = input;
 
-    this.validateSlotGrid(court, startMinutes, slotCount);
+    await this.validateSlotGrid(court, date, startMinutes, slotCount);
     const endMinutes = startMinutes + court.slotMinutes * slotCount;
     if (!input.skipWindowCheck) {
       this.validateWindow(court, date, startMinutes);
@@ -116,12 +116,26 @@ export class BookingsService {
     return booking;
   }
 
-  private validateSlotGrid(court: any, startMinutes: number, slotCount: number) {
-    if (
-      startMinutes < court.openMinutes ||
-      startMinutes + court.slotMinutes * slotCount > court.closeMinutes ||
-      (startMinutes - court.openMinutes) % court.slotMinutes !== 0
-    ) {
+  /**
+   * The booking must sit fully inside ONE of the day's open windows
+   * (weekly template or default hours) and align to the slot grid
+   * anchored at that window's start.
+   */
+  private async validateSlotGrid(
+    court: any,
+    date: Date,
+    startMinutes: number,
+    slotCount: number,
+  ) {
+    const endMinutes = startMinutes + court.slotMinutes * slotCount;
+    const windows = await this.courts.windowsForDate(court, date);
+    if (windows.length === 0) {
+      throw new BadRequestException('Court is closed on this day');
+    }
+    const w = windows.find(
+      (x) => startMinutes >= x.startMinutes && endMinutes <= x.endMinutes,
+    );
+    if (!w || (startMinutes - w.startMinutes) % court.slotMinutes !== 0) {
       throw new BadRequestException('Slot is outside court hours or misaligned');
     }
   }
@@ -158,16 +172,12 @@ export class BookingsService {
     });
     if (clash) throw new ConflictException('Slot overlaps an existing booking');
 
-    const blocked = await this.prisma.slotBlock.findFirst({
-      where: {
-        courtId,
-        date,
-        startMinutes: { lt: endMinutes },
-        endMinutes: { gt: startMinutes },
-      },
-      select: { id: true },
-    });
-    if (blocked) throw new ConflictException('Slot is blocked by the arena');
+    const ranges = await this.courts.blockedRangesForDate(courtId, date);
+    if (
+      ranges.some((r) => startMinutes < r.endMinutes && endMinutes > r.startMinutes)
+    ) {
+      throw new ConflictException('Slot is blocked by the arena');
+    }
   }
 
   // -------------------------------------------------------------- recurring
