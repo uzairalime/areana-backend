@@ -19,6 +19,7 @@ import {
   CreateBlockDto,
   CreateClosureDto,
   CreateCourtDto,
+  CreatePriceWindowDto,
   CreateRecurringBlockDto,
   SetWeeklyHoursDto,
   CreateStaffDto,
@@ -310,12 +311,16 @@ export class OwnerService {
   /** Weekly template + recurring blocks for one court (owner view). */
   async courtAvailabilityRules(user: AuthUser, courtId: string) {
     const court = await this.assertCourt(user, courtId);
-    const [rows, recurringBlocks] = await Promise.all([
+    const [rows, recurringBlocks, priceWindows] = await Promise.all([
       this.prisma.courtWeeklyWindow.findMany({
         where: { courtId },
         orderBy: [{ weekday: 'asc' }, { startMinutes: 'asc' }],
       }),
       this.prisma.recurringBlock.findMany({
+        where: { courtId },
+        orderBy: { createdAt: 'asc' },
+      }),
+      this.prisma.courtPriceWindow.findMany({
         where: { courtId },
         orderBy: { createdAt: 'asc' },
       }),
@@ -336,7 +341,78 @@ export class OwnerService {
         startsOn: r.startsOn ? toYmd(r.startsOn) : null,
         endsOn: r.endsOn ? toYmd(r.endsOn) : null,
       })),
+      priceWindows: priceWindows.map((r) => ({
+        ...r,
+        pricePerHour: Number(r.pricePerHour),
+        startsOn: r.startsOn ? toYmd(r.startsOn) : null,
+        endsOn: r.endsOn ? toYmd(r.endsOn) : null,
+      })),
     };
+  }
+
+  /**
+   * Create a peak/off-peak price window. A slot can carry only one
+   * special rate, so windows must not overlap (same weekday + minutes +
+   * intersecting date ranges). Existing bookings are unaffected — their
+   * prices were snapshotted at booking time.
+   */
+  async createPriceWindow(user: AuthUser, courtId: string, dto: CreatePriceWindowDto) {
+    await this.assertCourt(user, courtId);
+    if (dto.weekdays.length === 0 || dto.weekdays.some((d) => d < 0 || d > 6)) {
+      throw new BadRequestException('weekdays must be a non-empty list of 0 (Sun) – 6 (Sat)');
+    }
+    if (dto.endMinutes <= dto.startMinutes || dto.endMinutes > 1800) {
+      throw new BadRequestException('Price window must end after it starts (overnight allowed, by 06:00)');
+    }
+    if (dto.pricePerHour < 0) {
+      throw new BadRequestException('pricePerHour cannot be negative');
+    }
+    const startsOn = dto.startsOn ? parseDateOnly(dto.startsOn) : null;
+    const endsOn = dto.endsOn ? parseDateOnly(dto.endsOn) : null;
+    if (startsOn && endsOn && endsOn < startsOn) {
+      throw new BadRequestException('endsOn must not be before startsOn');
+    }
+    const existing = await this.prisma.courtPriceWindow.findMany({
+      where: { courtId },
+    });
+    const clash = existing.some((w) => {
+      const sameDay = w.weekdays.some((d) => dto.weekdays.includes(d));
+      const sameTime =
+        dto.startMinutes < w.endMinutes && dto.endMinutes > w.startMinutes;
+      const aStart = startsOn ? toYmd(startsOn) : '0000-01-01';
+      const aEnd = endsOn ? toYmd(endsOn) : '9999-12-31';
+      const bStart = w.startsOn ? toYmd(w.startsOn) : '0000-01-01';
+      const bEnd = w.endsOn ? toYmd(w.endsOn) : '9999-12-31';
+      const sameDates = aStart <= bEnd && bStart <= aEnd;
+      return sameDay && sameTime && sameDates;
+    });
+    if (clash) {
+      throw new BadRequestException(
+        'Price windows cannot overlap — a slot can only have one special rate',
+      );
+    }
+    return this.prisma.courtPriceWindow.create({
+      data: {
+        courtId,
+        weekdays: dto.weekdays,
+        startMinutes: dto.startMinutes,
+        endMinutes: dto.endMinutes,
+        pricePerHour: dto.pricePerHour,
+        startsOn,
+        endsOn,
+      },
+    });
+  }
+
+  async deletePriceWindow(user: AuthUser, windowId: string) {
+    const win = await this.prisma.courtPriceWindow.findUnique({
+      where: { id: windowId },
+      include: { court: { select: { venueId: true } } },
+    });
+    if (!win) throw new NotFoundException('Price window not found');
+    await this.assertVenue(user, win.court.venueId);
+    await this.prisma.courtPriceWindow.delete({ where: { id: windowId } });
+    return { ok: true };
   }
 
   /**

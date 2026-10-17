@@ -64,7 +64,20 @@ export class BookingsService {
 
     await this.assertNoOverlap(court.id, date, startMinutes, endMinutes);
 
-    const gross = Number(court.pricePerHour) * ((court.slotMinutes * slotCount) / 60);
+    // Per-slot pricing: each slot takes the rate of the price window
+    // covering it (peak/off-peak), else the court's base rate — so a
+    // booking spanning the peak boundary prices each hour correctly.
+    const priceWindows = await this.courts.priceWindowsForDate(court.id, date);
+    const baseRate = Number(court.pricePerHour);
+    let gross = 0;
+    for (let i = 0; i < slotCount; i++) {
+      const rate = this.courts.priceRateForSlot(
+        priceWindows,
+        baseRate,
+        startMinutes + i * court.slotMinutes,
+      );
+      gross += rate * (court.slotMinutes / 60);
+    }
     let discount = 0;
     let promo: { id: string } | null = null;
     if (input.promoCode && input.userId) {

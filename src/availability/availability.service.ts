@@ -14,6 +14,8 @@ export interface SlotDto {
   endMinutes: number;
   available: boolean;
   price: number;
+  /** True when a peak/off-peak price window set this slot's price. */
+  peak: boolean;
 }
 
 @Injectable()
@@ -34,7 +36,7 @@ export class AvailabilityService {
     const court = await this.courts.getActiveCourt(courtId);
     const date = parseDateOnly(dateStr);
 
-    const [bookings, windows, blockedRanges] = await Promise.all([
+    const [bookings, windows, blockedRanges, priceWindows] = await Promise.all([
       this.prisma.booking.findMany({
         where: {
           courtId,
@@ -45,6 +47,7 @@ export class AvailabilityService {
       }),
       this.courts.windowsForDate(court, date),
       this.courts.blockedRangesForDate(courtId, date),
+      this.courts.priceWindowsForDate(courtId, date),
     ]);
     const busy = [...bookings, ...blockedRanges];
 
@@ -70,11 +73,14 @@ export class AvailabilityService {
         slotAt.setHours(Math.floor(start / 60), start % 60, 0, 0);
         const tooSoon = slotAt < minBookableAt;
 
+        const baseRate = Number(court.pricePerHour);
+        const rate = this.courts.priceRateForSlot(priceWindows, baseRate, start);
         slots.push({
           startMinutes: start,
           endMinutes: end,
           available: !clash && !tooSoon && !beyondWindow,
-          price: Number(court.pricePerHour) * (court.slotMinutes / 60),
+          price: rate * (court.slotMinutes / 60),
+          peak: rate !== baseRate,
         });
       }
     }

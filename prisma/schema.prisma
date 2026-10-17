@@ -181,6 +181,7 @@ model Court {
   slotBlocks     SlotBlock[]
   weeklyWindows  CourtWeeklyWindow[]
   recurringBlocks RecurringBlock[]
+  priceWindows   CourtPriceWindow[]
   bookings       Booking[]
 
   @@index([venueId])
@@ -213,6 +214,25 @@ model RecurringBlock {
   startMinutes Int
   endMinutes   Int
   reason       String?
+  startsOn     DateTime? @db.Date
+  endsOn       DateTime? @db.Date
+  createdAt    DateTime  @default(now())
+
+  @@index([courtId])
+}
+
+/// A peak/off-peak rate window: on the given weekdays, slots starting
+/// inside [startMinutes, endMinutes) price at pricePerHour instead of
+/// the court's base rate. Optional date range for seasonal rates.
+/// Windows must not overlap each other for the same slot.
+model CourtPriceWindow {
+  id           String    @id @default(cuid())
+  courtId      String
+  court        Court     @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  weekdays     Int[] // 0 = Sunday … 6 = Saturday
+  startMinutes Int
+  endMinutes   Int
+  pricePerHour Decimal   @db.Decimal(10, 2)
   startsOn     DateTime? @db.Date
   endsOn       DateTime? @db.Date
   createdAt    DateTime  @default(now())

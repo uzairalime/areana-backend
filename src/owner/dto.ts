@@ -165,3 +165,24 @@ export class CreateClosureDto {
   courtId?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() reason?: string;
 }
+
+export class CreatePriceWindowDto {
+  @ApiProperty({ type: [Number], example: [1, 2, 3, 4, 5], description: '0 = Sunday … 6 = Saturday' })
+  @IsArray()
+  @IsInt({ each: true })
+  weekdays: number[];
+  @ApiProperty({ example: 1020, description: '17:00' }) @IsInt() @Min(0) startMinutes: number;
+  @ApiProperty({ example: 1380, description: '23:00' }) @IsInt() @Min(0) endMinutes: number;
+  @ApiProperty({ example: 3500, description: 'Rs per hour during this window' })
+  @IsNumber()
+  @Min(0)
+  pricePerHour: number;
+  @ApiPropertyOptional({ example: '2026-12-01' })
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  startsOn?: string;
+  @ApiPropertyOptional({ example: '2026-12-31' })
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  endsOn?: string;
+}

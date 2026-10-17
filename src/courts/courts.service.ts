@@ -44,6 +44,36 @@ export class CourtsService {
     return []; // template exists, this weekday is closed
   }
 
+  /** Price windows (peak/off-peak rates) applying on a given date. */
+  async priceWindowsForDate(courtId: string, date: Date) {
+    const rows = await this.prisma.courtPriceWindow.findMany({
+      where: { courtId },
+    });
+    const weekday = date.getDay();
+    const dayStr = toYmd(date);
+    return rows.filter(
+      (r) =>
+        r.weekdays.includes(weekday) &&
+        (!r.startsOn || toYmd(r.startsOn) <= dayStr) &&
+        (!r.endsOn || toYmd(r.endsOn) >= dayStr),
+    );
+  }
+
+  /**
+   * The Rs/hour rate for a slot starting at `startMinutes`: the price
+   * window covering the slot start, else the court's base rate.
+   */
+  priceRateForSlot(
+    windows: { startMinutes: number; endMinutes: number; pricePerHour: unknown }[],
+    baseRate: number,
+    startMinutes: number,
+  ): number {
+    const w = windows.find(
+      (x) => startMinutes >= x.startMinutes && startMinutes < x.endMinutes,
+    );
+    return w ? Number(w.pricePerHour) : baseRate;
+  }
+
   /** Whether the court has any weekly-hours template rows. */
   async hasWeeklyTemplate(courtId: string): Promise<boolean> {
     const n = await this.prisma.courtWeeklyWindow.count({ where: { courtId } });

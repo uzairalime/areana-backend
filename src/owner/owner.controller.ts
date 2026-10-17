@@ -21,6 +21,7 @@ import {
   CreateBlockDto,
   CreateClosureDto,
   CreateCourtDto,
+  CreatePriceWindowDto,
   CreateRecurringBlockDto,
   SetWeeklyHoursDto,
   CreateStaffDto,
@@ -180,6 +181,24 @@ export class OwnerController {
     @Body() dto: CreateRecurringBlockDto,
   ) {
     return this.owner.createRecurringBlock(user, courtId, dto);
+  }
+
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Post('courts/:courtId/price-windows')
+  createPriceWindow(
+    @CurrentUser() user: AuthUser,
+    @Param('courtId') courtId: string,
+    @Body() dto: CreatePriceWindowDto,
+  ) {
+    return this.owner.createPriceWindow(user, courtId, dto);
+  }
+
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Delete('price-windows/:id')
+  deletePriceWindow(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.deletePriceWindow(user, id);
   }
 
   @RequirePerm('courts.manage')
