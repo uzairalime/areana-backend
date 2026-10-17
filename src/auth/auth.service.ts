@@ -87,10 +87,10 @@ export class AuthService {
       });
       throw new UnauthorizedException('Code invalid or expired');
     }
-    await this.prisma.otpCode.update({
-      where: { id: record.id },
-      data: { consumedAt: new Date() },
-    });
+    // NOTE: the code is NOT consumed yet. A first-time player still has to
+    // complete signup (name/phone) with this same code in a follow-up call —
+    // consuming here would burn the code and make that call fail with 401.
+    // It is consumed below, only once every check has passed.
 
     const playerRole = await this.prisma.role.findUniqueOrThrow({ where: { name: 'player' } });
 
@@ -119,6 +119,11 @@ export class AuthService {
     if (user.status !== UserStatus.active) {
       throw new ForbiddenException('This account is not active');
     }
+    // All checks passed — now consume the code so it cannot be replayed.
+    await this.prisma.otpCode.update({
+      where: { id: record.id },
+      data: { consumedAt: new Date() },
+    });
     return { ...(await this.issueTokens(user)), welcomePromoCode };
   }
 
