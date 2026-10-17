@@ -793,6 +793,27 @@ export class OwnerService {
     });
     if (clash) throw new ConflictException('Requested slot is no longer available');
 
+    // Re-price at the new slot with the same per-slot engine as booking
+    // creation (peak/off-peak windows on the requested date), keeping
+    // any promo discount the player already had. Without this the moved
+    // booking kept its old price — an off-peak booking could move into
+    // peak hours, or a longer duration, for free.
+    const priceWindows = await this.courtsSvc.priceWindowsForDate(
+      court.id,
+      req.requestedDate,
+    );
+    const baseRate = Number(court.pricePerHour);
+    let gross = 0;
+    for (let s = startMinutes; s < endMinutes; s += court.slotMinutes) {
+      gross +=
+        this.courtsSvc.priceRateForSlot(priceWindows, baseRate, s) *
+        (court.slotMinutes / 60);
+    }
+    const newTotal = Math.max(
+      0,
+      gross - Number(req.booking.discountAmount ?? 0),
+    );
+
     const [booking] = await this.prisma.$transaction([
       this.prisma.booking.update({
         where: { id: req.bookingId },
@@ -800,6 +821,7 @@ export class OwnerService {
           date: req.requestedDate,
           startMinutes,
           endMinutes,
+          totalPrice: newTotal,
           status: BookingStatus.confirmed,
         },
       }),

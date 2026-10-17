@@ -14,8 +14,10 @@ export interface SlotDto {
   endMinutes: number;
   available: boolean;
   price: number;
-  /** True when a peak/off-peak price window set this slot's price. */
+  /** True when a price window priced this slot ABOVE the base rate. */
   peak: boolean;
+  /** True when a price window priced this slot BELOW the base rate. */
+  deal: boolean;
 }
 
 @Injectable()
@@ -80,7 +82,8 @@ export class AvailabilityService {
           endMinutes: end,
           available: !clash && !tooSoon && !beyondWindow,
           price: rate * (court.slotMinutes / 60),
-          peak: rate !== baseRate,
+          peak: rate > baseRate,
+          deal: rate < baseRate,
         });
       }
     }
