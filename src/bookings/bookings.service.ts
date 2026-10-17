@@ -178,6 +178,45 @@ export class BookingsService {
     ) {
       throw new ConflictException('Slot is blocked by the arena');
     }
+
+    // Overnight spill: a booking ending after midnight (endMinutes >
+    // 1440, stored on the evening's date) must not clash with early
+    // bookings stored on the next date — and vice versa.
+    if (endMinutes > 1440) {
+      const nextDate = new Date(date);
+      nextDate.setDate(nextDate.getDate() + 1);
+      const spillClash = await this.prisma.booking.findFirst({
+        where: {
+          courtId,
+          date: nextDate,
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          startMinutes: { lt: endMinutes - 1440 },
+          endMinutes: { gt: 0 },
+        },
+        select: { id: true },
+      });
+      if (spillClash) throw new ConflictException('Slot overlaps an existing booking');
+    }
+    if (startMinutes < 360) {
+      const prevDate = new Date(date);
+      prevDate.setDate(prevDate.getDate() - 1);
+      const prev = await this.prisma.booking.findMany({
+        where: {
+          courtId,
+          date: prevDate,
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          endMinutes: { gt: 1440 },
+        },
+        select: { startMinutes: true, endMinutes: true },
+      });
+      if (
+        prev.some(
+          (b) => b.startMinutes - 1440 < endMinutes && b.endMinutes - 1440 > startMinutes,
+        )
+      ) {
+        throw new ConflictException('Slot overlaps an existing booking');
+      }
+    }
   }
 
   // -------------------------------------------------------------- recurring

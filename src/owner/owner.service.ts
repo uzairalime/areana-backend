@@ -200,16 +200,43 @@ export class OwnerService {
     return this.prisma.court.findMany({ where: { venueId }, orderBy: { name: 'asc' } });
   }
 
+  /**
+   * Overnight courts: a close time at or before the open time means the
+   * court closes after midnight — stored as minutes past 1440 (e.g.
+   * 02:00 close = 1560). Max 20 open hours, spill capped at 06:00.
+   */
+  private normalizeCourtHours(openMinutes: number, closeMinutes: number) {
+    let close = closeMinutes;
+    if (close <= openMinutes) close += 1440;
+    if (close - openMinutes > 1200 || close > 1800) {
+      throw new BadRequestException(
+        'A court can be open at most 20 hours, closing by 06:00 next day',
+      );
+    }
+    return close;
+  }
+
   async createCourt(user: AuthUser, venueId: string, dto: CreateCourtDto) {
     await this.assertVenue(user, venueId);
-    return this.prisma.court.create({ data: { venueId, ...dto } });
+    const data = { ...dto };
+    if (data.openMinutes != null && data.closeMinutes != null) {
+      data.closeMinutes = this.normalizeCourtHours(data.openMinutes, data.closeMinutes);
+    }
+    return this.prisma.court.create({ data: { venueId, ...data } });
   }
 
   async updateCourt(user: AuthUser, courtId: string, dto: UpdateCourtDto) {
     const court = await this.prisma.court.findUnique({ where: { id: courtId } });
     if (!court) throw new NotFoundException('Court not found');
     await this.assertVenue(user, court.venueId);
-    return this.prisma.court.update({ where: { id: courtId }, data: dto });
+    const data = { ...dto };
+    if (data.openMinutes != null || data.closeMinutes != null) {
+      data.closeMinutes = this.normalizeCourtHours(
+        data.openMinutes ?? court.openMinutes,
+        data.closeMinutes ?? court.closeMinutes,
+      );
+    }
+    return this.prisma.court.update({ where: { id: courtId }, data });
   }
 
   // ---------------------------------------------------------------- blocks
@@ -327,12 +354,34 @@ export class OwnerService {
       const sorted = [...day.windows].sort((a, b) => a.startMinutes - b.startMinutes);
       for (let i = 0; i < sorted.length; i++) {
         const w = sorted[i];
-        if (w.endMinutes <= w.startMinutes || w.startMinutes < 0 || w.endMinutes > 1440) {
-          throw new BadRequestException('Each window must be within the day, end after start');
+        // Windows start on their own day; the end may run past midnight
+        // (overnight courts) up to 06:00 next day, max 20h per window.
+        if (
+          w.startMinutes < 0 ||
+          w.startMinutes >= 1440 ||
+          w.endMinutes <= w.startMinutes ||
+          w.endMinutes > 1800 ||
+          w.endMinutes - w.startMinutes > 1200
+        ) {
+          throw new BadRequestException(
+            'Each window must start within its day, end after it starts, and run at most 20 hours (closing by 06:00 next day)',
+          );
         }
         if (i > 0 && w.startMinutes < sorted[i - 1].endMinutes) {
           throw new BadRequestException('Windows on the same day cannot overlap');
         }
+      }
+    }
+    // An overnight spill must not collide with the next day's first
+    // window (the same physical hours can't be sold under two dates).
+    for (const day of dto.days) {
+      const spill = Math.max(0, ...day.windows.map((w) => w.endMinutes - 1440));
+      if (spill <= 0) continue;
+      const next = dto.days.find((d) => d.weekday === (day.weekday + 1) % 7);
+      if (next && next.windows.some((w) => w.startMinutes < spill)) {
+        throw new BadRequestException(
+          'The next day has a window starting before this day\'s overnight closing ends',
+        );
       }
     }
 
@@ -399,6 +448,9 @@ export class OwnerService {
     }
     if (dto.endMinutes <= dto.startMinutes) {
       throw new BadRequestException('endMinutes must be after startMinutes');
+    }
+    if (dto.endMinutes > 1440) {
+      throw new BadRequestException('Recurring breaks cannot cross midnight');
     }
     const startsOn = dto.startsOn ? parseDateOnly(dto.startsOn) : null;
     const endsOn = dto.endsOn ? parseDateOnly(dto.endsOn) : null;

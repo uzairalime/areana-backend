@@ -56,13 +56,26 @@ export class CourtsService {
    * covers the date.
    */
   async blockedRangesForDate(courtId: string, date: Date): Promise<DayWindow[]> {
-    const [oneOff, recurring] = await Promise.all([
+    const nextDay = new Date(date);
+    nextDay.setDate(nextDay.getDate() + 1);
+    const [oneOff, recurring, nextBlocks] = await Promise.all([
       this.prisma.slotBlock.findMany({
         where: { courtId, date },
         select: { startMinutes: true, endMinutes: true },
       }),
       this.prisma.recurringBlock.findMany({ where: { courtId } }),
+      // Overnight spill: an early-morning block on the NEXT date (e.g.
+      // Sat 01:00–02:00) also blocks this date's overnight window
+      // (Fri 18:00–02:00), where those hours are minutes 1500–1560.
+      this.prisma.slotBlock.findMany({
+        where: { courtId, date: nextDay, startMinutes: { lt: 360 } },
+        select: { startMinutes: true, endMinutes: true },
+      }),
     ]);
+    const spill = nextBlocks.map((b) => ({
+      startMinutes: b.startMinutes + 1440,
+      endMinutes: b.endMinutes + 1440,
+    }));
     const weekday = date.getDay();
     const dayStr = toYmd(date);
     const rec = recurring
@@ -73,7 +86,7 @@ export class CourtsService {
           (!r.endsOn || toYmd(r.endsOn) >= dayStr),
       )
       .map((r) => ({ startMinutes: r.startMinutes, endMinutes: r.endMinutes }));
-    return [...oneOff, ...rec];
+    return [...oneOff, ...rec, ...spill];
   }
 
   // Public: courts of one approved venue.
