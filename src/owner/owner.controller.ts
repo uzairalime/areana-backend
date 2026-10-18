@@ -72,6 +72,20 @@ export class OwnerController {
 
   @RequirePerm('venues.manage')
   @ApiTags('owner · venues & courts')
+  @Post('venues/:id/archive')
+  archiveVenue(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.archiveVenue(user, id);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
+  @Post('venues/:id/unarchive')
+  unarchiveVenue(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.unarchiveVenue(user, id);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
   @Post('venues/:id/submit')
   submitVenue(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.submitVenue(user, id);

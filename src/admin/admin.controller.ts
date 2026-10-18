@@ -265,6 +265,12 @@ export class AdminController {
   }
 
   @ApiTags('admin · broadcasts & banners')
+  @Get('broadcasts/audience')
+  broadcastAudience(@Query('city') city?: string) {
+    return this.admin.broadcastAudience(city);
+  }
+
+  @ApiTags('admin · broadcasts & banners')
   @Get('banners')
   listBanners() {
     return this.admin.listBanners();

@@ -19,6 +19,11 @@ export class DisputesService {
       where: { id: dto.bookingId, userId },
     });
     if (!booking) throw new NotFoundException('Booking not found');
+    if (booking.status !== 'completed' && booking.status !== 'no_show') {
+      throw new BadRequestException(
+        'You can only raise a dispute after the game has been played',
+      );
+    }
     const open = await this.prisma.dispute.findFirst({
       where: { bookingId: dto.bookingId, status: 'open' },
     });

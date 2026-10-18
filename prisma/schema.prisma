@@ -73,6 +73,7 @@ model User {
   gamePosts         GamePost[]
   deviceTokens      DeviceToken[]
   notifications     Notification[]
+  waitlistEntries   SlotWaitlist[]
   promoRedemptions  PromoRedemption[]
   staffVenues       VenueStaff[]
   suggestions       VenueSuggestion[]
@@ -149,6 +150,7 @@ model Venue {
   autoAccept        Boolean     @default(false)
   minAdvanceMinutes Int         @default(120)
   maxAdvanceDays    Int         @default(14)
+  archivedAt        DateTime?
   status            VenueStatus @default(draft)
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
@@ -208,6 +210,7 @@ model Court {
   recurringBlocks RecurringBlock[]
   priceWindows   CourtPriceWindow[]
   bookings       Booking[]
+  waitlistEntries SlotWaitlist[]
 
   @@index([venueId])
 }
@@ -374,6 +377,21 @@ model Review {
   createdAt  DateTime  @default(now())
 
   @@index([venueId])
+}
+
+model SlotWaitlist {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  courtId      String
+  court        Court     @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  date         DateTime  @db.Date
+  startMinutes Int
+  notifiedAt   DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@unique([userId, courtId, date, startMinutes])
+  @@index([courtId, date, startMinutes])
 }
 
 model GamePost {

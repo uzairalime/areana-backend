@@ -14,6 +14,7 @@ import { BookingsModule } from './bookings/bookings.module';
 import { SearchModule } from './search/search.module';
 import { DeeplinkModule } from './deeplink/deeplink.module';
 import { GamePostsModule } from './game-posts/game-posts.module';
+import { WaitlistModule } from './waitlist/waitlist.module';
 import { PromosModule } from './promos/promos.module';
 import { FavoritesModule } from './favorites/favorites.module';
 import { ReviewsModule } from './reviews/reviews.module';
@@ -49,6 +50,7 @@ import { HealthModule } from './health/health.module';
     SearchModule,
     DeeplinkModule,
     GamePostsModule,
+    WaitlistModule,
     PromosModule,
     FavoritesModule,
     ReviewsModule,

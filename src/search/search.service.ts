@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { VenueStatus, UserStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { AvailabilityService } from '../availability/availability.service';
-import { parseDateOnly } from '../common/date.util';
+import { parseDateOnly, startOfToday } from '../common/date.util';
 
 export interface SlotSearchQuery {
   sport?: string;
@@ -29,6 +29,7 @@ export class SearchService {
     const venues = await this.prisma.venue.findMany({
       where: {
         status: VenueStatus.approved,
+        archivedAt: null,
         owner: { status: UserStatus.active },
         ...(q.city ? { city: { equals: q.city, mode: 'insensitive' } } : {}),
         courts: {
@@ -48,6 +49,7 @@ export class SearchService {
         rating: true,
         images: true,
         photos: true,
+        maxAdvanceDays: true,
         courts: {
           where: {
             isActive: true,
@@ -69,8 +71,14 @@ export class SearchService {
       take: 200,
     });
 
+    // Only venues whose booking window covers the requested date —
+    // otherwise search offers slots the booking endpoint will refuse.
+    const dayOffset = Math.round(
+      (parseDateOnly(q.date).getTime() - startOfToday().getTime()) / 86_400_000,
+    );
     const results: any[] = [];
     for (const venue of venues) {
+      if (dayOffset > venue.maxAdvanceDays) continue;
       const courts: any[] = [];
       for (const court of venue.courts) {
         const avail = await this.availability.getAvailability(court.id, q.date);

@@ -220,6 +220,23 @@ export class OwnerService {
     });
   }
 
+  /** Retire a venue: hidden from players everywhere, history kept. */
+  async archiveVenue(user: AuthUser, venueId: string) {
+    const venue = await this.assertVenue(user, venueId);
+    return this.prisma.venue.update({
+      where: { id: venue.id },
+      data: { archivedAt: new Date() },
+    });
+  }
+
+  async unarchiveVenue(user: AuthUser, venueId: string) {
+    const venue = await this.assertVenue(user, venueId);
+    return this.prisma.venue.update({
+      where: { id: venue.id },
+      data: { archivedAt: null },
+    });
+  }
+
   async removeVenueImage(user: AuthUser, venueId: string, url: string) {
     const venue = await this.assertVenue(user, venueId);
     await this.storage.deleteImage(url);
@@ -903,6 +920,30 @@ export class OwnerService {
         data: { status: 'approved', decidedAt: new Date() },
       }),
     ]);
+    // The old slot just freed up — ping anyone waitlisted for it.
+    const freed = await this.prisma.slotWaitlist.findMany({
+      where: {
+        courtId: req.booking.courtId,
+        date: req.booking.date,
+        startMinutes: req.booking.startMinutes,
+        notifiedAt: null,
+      },
+    });
+    for (const w of freed) {
+      await this.notifications
+        .pushToUser(w.userId, {
+          title: 'A slot just opened up',
+          body: `A slot you were waiting on is free again on ${req.booking.date.toISOString().slice(0, 10)} — first come, first served.`,
+          data: { type: 'slot_opened' },
+        })
+        .catch(() => {});
+    }
+    if (freed.length > 0) {
+      await this.prisma.slotWaitlist.updateMany({
+        where: { id: { in: freed.map((w) => w.id) } },
+        data: { notifiedAt: new Date() },
+      });
+    }
     // A linked game post follows its booking to the new time, and the
     // squad hears about the move.
     const post = await this.prisma.gamePost.findUnique({
@@ -977,8 +1018,39 @@ export class OwnerService {
       throw new ForbiddenException('Cannot assign this role to team members');
     }
     const email = dto.email.toLowerCase().trim();
-    const exists = await this.prisma.user.findUnique({ where: { email } });
-    if (exists) throw new ConflictException('Email already registered');
+    const exists = await this.prisma.user.findUnique({
+      where: { email },
+      include: { role: true },
+    });
+    if (exists) {
+      // Re-hiring someone who was removed: their account was suspended
+      // when the last venue link went away — revive it in place rather
+      // than dead-ending on 'email already registered'.
+      const linkCount = await this.prisma.venueStaff.count({
+        where: { userId: exists.id },
+      });
+      if (
+        exists.status === 'suspended' &&
+        exists.role.scope === 'arena' &&
+        linkCount === 0
+      ) {
+        const revived = await this.prisma.user.update({
+          where: { id: exists.id },
+          data: {
+            name: dto.name,
+            passwordHash: await bcrypt.hash(dto.password, 10),
+            roleId: dto.roleId,
+            status: 'active',
+          },
+        });
+        await this.prisma.venueStaff.create({
+          data: { venueId, userId: revived.id },
+        });
+        const { passwordHash: _p, ...safe } = revived;
+        return safe;
+      }
+      throw new ConflictException('Email already registered');
+    }
 
     const member = await this.prisma.user.create({
       data: {
@@ -997,7 +1069,29 @@ export class OwnerService {
     const link = await this.prisma.venueStaff.findUnique({ where: { id: staffLinkId } });
     if (!link) throw new NotFoundException('Team member not found');
     await this.assertVenue(user, link.venueId);
-    return this.prisma.venueStaff.delete({ where: { id: staffLinkId } });
+    const deleted = await this.prisma.venueStaff.delete({ where: { id: staffLinkId } });
+    // Last venue removed = the account must not keep a live login to an
+    // empty panel. Suspend arena-scoped staff with no links left (and
+    // kill their sessions); re-adding them later revives the account.
+    const remaining = await this.prisma.venueStaff.count({
+      where: { userId: link.userId },
+    });
+    if (remaining === 0) {
+      const member = await this.prisma.user.findUnique({
+        where: { id: link.userId },
+        include: { role: { select: { scope: true } } },
+      });
+      if (member?.role.scope === 'arena') {
+        await this.prisma.user.update({
+          where: { id: link.userId },
+          data: { status: 'suspended' },
+        });
+        await this.prisma.refreshSession.deleteMany({
+          where: { userId: link.userId },
+        });
+      }
+    }
+    return deleted;
   }
 
   // --------------------------------------------------------------- customers

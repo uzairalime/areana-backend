@@ -75,3 +75,14 @@ export class StaffLoginDto {
   @IsString()
   password: string;
 }
+
+export class ChangePasswordDto {
+  @ApiProperty()
+  @IsString()
+  currentPassword: string;
+
+  @ApiProperty({ minLength: 8, maxLength: 72 })
+  @IsString()
+  @Length(8, 72)
+  newPassword: string;
+}

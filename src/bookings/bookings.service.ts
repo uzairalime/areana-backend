@@ -288,6 +288,11 @@ export class BookingsService {
     });
     for (const b of affected) {
       await this.cleanupGamePost(b.id, 'The host cancelled their booking, so this game is off.');
+      const full = await this.prisma.booking.findUnique({
+        where: { id: b.id },
+        select: { courtId: true, date: true, startMinutes: true },
+      });
+      if (full) await this.notifyWaitlist(full.courtId, full.date, full.startMinutes);
     }
     return { cancelled: res.count };
   }
@@ -349,6 +354,7 @@ export class BookingsService {
       data: { status: BookingStatus.cancelled },
     });
     await this.cleanupGamePost(bookingId, 'The host cancelled their booking, so this game is off.');
+    await this.notifyWaitlist(booking.courtId, booking.date, booking.startMinutes);
     return updated;
   }
 
@@ -404,6 +410,36 @@ export class BookingsService {
         .catch(() => {});
     }
     await this.prisma.gamePost.delete({ where: { id: post.id } });
+  }
+
+  /**
+   * When a booked slot frees up (cancellation, reschedule-away), tell
+   * everyone waitlisted for exactly that slot — first come, first served.
+   */
+  async notifyWaitlist(courtId: string, date: Date, startMinutes: number) {
+    const entries = await this.prisma.slotWaitlist.findMany({
+      where: { courtId, date, startMinutes, notifiedAt: null },
+    });
+    if (entries.length === 0) return;
+    const court = await this.prisma.court.findUnique({
+      where: { id: courtId },
+      include: { venue: { select: { name: true } } },
+    });
+    const hh = String(Math.floor(startMinutes / 60) % 24).padStart(2, '0');
+    const mm = String(startMinutes % 60).padStart(2, '0');
+    for (const e of entries) {
+      await this.notifications
+        .pushToUser(e.userId, {
+          title: 'A slot just opened up',
+          body: `${court?.venue.name ?? 'A venue'} · ${court?.name ?? 'Court'} on ${date.toISOString().slice(0, 10)} at ${hh}:${mm} is free again — grab it before someone else does.`,
+          data: { type: 'slot_opened' },
+        })
+        .catch(() => {});
+    }
+    await this.prisma.slotWaitlist.updateMany({
+      where: { id: { in: entries.map((e) => e.id) } },
+      data: { notifiedAt: new Date() },
+    });
   }
 
   async joinShared(shareCode: string, dto: JoinSharedDto, userId?: string) {
@@ -638,6 +674,11 @@ export class BookingsService {
         data: { status: BookingStatus.cancelled },
       });
       await this.cleanupGamePost(b.id, "The host's account was suspended, so this game is off.");
+      const fullB = await this.prisma.booking.findUnique({
+        where: { id: b.id },
+        select: { courtId: true, date: true, startMinutes: true },
+      });
+      if (fullB) await this.notifyWaitlist(fullB.courtId, fullB.date, fullB.startMinutes);
       if (b.venue.owner?.email) {
         await this.notifications
           .notifyOwnerNewBooking(
@@ -677,6 +718,7 @@ export class BookingsService {
       data: { status: BookingStatus.cancelled },
     });
     await this.cleanupGamePost(bookingId, 'The venue cancelled the booking, so this game is off.');
+    await this.notifyWaitlist(booking.courtId, booking.date, booking.startMinutes);
     return updated;
   }
 

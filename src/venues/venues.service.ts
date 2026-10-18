@@ -15,6 +15,7 @@ export class VenuesService {
     // the owner's status is the single switch).
     const where: Prisma.VenueWhereInput = {
       status: VenueStatus.approved,
+      archivedAt: null,
       owner: { status: UserStatus.active },
     };
     if (city) where.city = { equals: city, mode: 'insensitive' };
@@ -80,7 +81,7 @@ export class VenuesService {
 
   async getById(id: string) {
     const venue = await this.prisma.venue.findFirst({
-      where: { id, status: VenueStatus.approved, owner: { status: UserStatus.active } },
+      where: { id, status: VenueStatus.approved, archivedAt: null, owner: { status: UserStatus.active } },
       include: {
         courts: { where: { isActive: true }, orderBy: { pricePerHour: 'asc' } },
         badges: { include: { badge: true }, orderBy: { badge: { tier: 'desc' } } },

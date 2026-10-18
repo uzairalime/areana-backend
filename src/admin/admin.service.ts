@@ -92,6 +92,26 @@ export class AdminService {
       include: { role: { select: { name: true } } },
     });
     if (!target) throw new NotFoundException('User not found');
+    if (status === UserStatus.suspended) {
+      // Nobody locks the platform out of its own admin panel.
+      if (id === actorId) {
+        throw new BadRequestException("You can't suspend your own account");
+      }
+      if (target.role.name === 'super_admin') {
+        const others = await this.prisma.user.count({
+          where: {
+            id: { not: id },
+            status: UserStatus.active,
+            role: { name: 'super_admin' },
+          },
+        });
+        if (others === 0) {
+          throw new BadRequestException(
+            "You can't suspend the last active super admin",
+          );
+        }
+      }
+    }
     const user = await this.prisma.user.update({ where: { id }, data: { status } });
     await this.audit(actorId, `user.${status}`, 'user', id);
     // Suspending a PLAYER cancels their upcoming bookings and tells both
@@ -133,6 +153,30 @@ export class AdminService {
               .catch(() => {});
           }
           await this.prisma.gamePost.delete({ where: { id: post.id } });
+        }
+        // Freed slot: ping its waitlist.
+        const waiting = await this.prisma.slotWaitlist.findMany({
+          where: {
+            courtId: b.courtId,
+            date: b.date,
+            startMinutes: b.startMinutes,
+            notifiedAt: null,
+          },
+        });
+        for (const w of waiting) {
+          await this.notifications
+            .pushToUser(w.userId, {
+              title: 'A slot just opened up',
+              body: `A slot you were waiting on is free again on ${b.date.toISOString().slice(0, 10)} — first come, first served.`,
+              data: { type: 'slot_opened' },
+            })
+            .catch(() => {});
+        }
+        if (waiting.length > 0) {
+          await this.prisma.slotWaitlist.updateMany({
+            where: { id: { in: waiting.map((w) => w.id) } },
+            data: { notifiedAt: new Date() },
+          });
         }
         if (b.venue.owner?.email) {
           await this.notifications
@@ -374,6 +418,18 @@ export class AdminService {
   }
 
   // ------------------------------------------------------------- broadcast
+  /** How many active players a broadcast would target (city optional). */
+  async broadcastAudience(city?: string) {
+    const audience = await this.prisma.user.count({
+      where: {
+        status: UserStatus.active,
+        role: { name: 'player' },
+        ...(city ? { city: { equals: city, mode: 'insensitive' } } : {}),
+      },
+    });
+    return { audience };
+  }
+
   async sendBroadcast(actorId: string, title: string, body: string, city?: string) {
     const targeted = await this.notifications.broadcastPush({ title, body }, city);
     await this.audit(actorId, 'broadcast.send', 'broadcast', city ?? 'all');

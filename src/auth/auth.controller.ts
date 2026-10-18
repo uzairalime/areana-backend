@@ -4,6 +4,7 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser, Public } from '../common/auth';
 import { AuthService } from './auth.service';
 import {
+  ChangePasswordDto,
   OwnerRegisterDto,
   RefreshDto,
   RequestOtpDto,
@@ -42,6 +43,12 @@ export class AuthController {
   @Post('logout')
   logout(@Body() dto: RefreshDto) {
     return this.auth.logout(dto.refreshToken);
+  }
+
+  /** Signed-in password accounts (owner/staff/admin) rotate their password. */
+  @Post('change-password')
+  changePassword(@CurrentUser() user: AuthUser, @Body() dto: ChangePasswordDto) {
+    return this.auth.changePassword(user.id, dto);
   }
 
   // --- arena owners self-register (super admin approves) ---

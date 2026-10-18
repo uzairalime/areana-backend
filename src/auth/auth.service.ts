@@ -189,6 +189,31 @@ export class AuthService {
   }
 
   /** Revokes the session behind a refresh token (best-effort, idempotent). */
+  /**
+   * Password rotation for panel accounts: verify the current password,
+   * store the new hash, and revoke EVERY refresh session — a changed
+   * password must log the account out everywhere, including here.
+   */
+  async changePassword(
+    userId: string,
+    dto: { currentPassword: string; newPassword: string },
+  ) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user?.passwordHash) {
+      throw new BadRequestException(
+        'This account signs in with email codes — there is no password to change',
+      );
+    }
+    const ok = await bcrypt.compare(dto.currentPassword, user.passwordHash);
+    if (!ok) throw new BadRequestException('Current password is incorrect');
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { passwordHash: await bcrypt.hash(dto.newPassword, 10) },
+    });
+    await this.prisma.refreshSession.deleteMany({ where: { userId } });
+    return { message: 'Password changed — please sign in again' };
+  }
+
   async logout(refreshToken: string) {
     try {
       const payload = await this.jwt.verifyAsync<{ sub: string; sid?: string }>(
