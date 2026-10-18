@@ -6,6 +6,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { BookingStatus, UserStatus, VenueStatus } from '@prisma/client';
+import { startOfToday } from '../common/date.util';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../common/prisma';
 import { BadgesService } from '../badges/badges.service';
@@ -86,8 +87,58 @@ export class AdminService {
   }
 
   async setUserStatus(actorId: string, id: string, status: UserStatus) {
+    const target = await this.prisma.user.findUnique({
+      where: { id },
+      include: { role: { select: { name: true } } },
+    });
+    if (!target) throw new NotFoundException('User not found');
     const user = await this.prisma.user.update({ where: { id }, data: { status } });
     await this.audit(actorId, `user.${status}`, 'user', id);
+    // Suspending a PLAYER cancels their upcoming bookings and tells both
+    // sides (owners keep their existing bookings under the round-3
+    // policy instead — their venues pause, nothing is cancelled).
+    if (status === UserStatus.suspended && target.role.name === 'player') {
+      const today = startOfToday();
+      const future = await this.prisma.booking.findMany({
+        where: {
+          userId: id,
+          date: { gte: today },
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        },
+        include: {
+          venue: { select: { name: true, owner: { select: { email: true } } } },
+        },
+      });
+      for (const b of future) {
+        await this.prisma.booking.update({
+          where: { id: b.id },
+          data: { status: BookingStatus.cancelled },
+        });
+        if (b.venue.owner?.email) {
+          await this.notifications
+            .notifyOwnerNewBooking(
+              b.venue.owner.email,
+              b.venue.name,
+              `A booking on ${b.date.toISOString().slice(0, 10)} was cancelled because the player's account was suspended.`,
+            )
+            .catch(() => {});
+        }
+      }
+      await this.notifications
+        .pushToUser(id, {
+          title: 'Account suspended',
+          body:
+            future.length > 0
+              ? `Your Areana account has been suspended and your ${future.length} upcoming booking${future.length === 1 ? ' was' : 's were'} cancelled.`
+              : 'Your Areana account has been suspended.',
+          data: { type: 'account_suspended' },
+        })
+        .catch(() => {});
+      await this.prisma.refreshSession.updateMany({
+        where: { userId: id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+    }
     return { id: user.id, status: user.status };
   }
 

@@ -5,7 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { BookingStatus, VenueStatus } from '@prisma/client';
+import { BookingStatus, VenueStatus, type Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { AuthUser } from '../common/auth';
 import { PrismaService } from '../common/prisma';
@@ -162,7 +162,25 @@ export class OwnerService {
     if (!user.permissions.includes('venues.manage')) {
       throw new ForbiddenException('Only the owner can edit venue settings');
     }
-    return this.prisma.venue.update({ where: { id: venueId }, data: dto });
+    // Identity edits on a LIVE venue go back through approval: approvals
+    // guard what a venue claims to be, so a name/address/city/pin change
+    // can't silently rewrite a reviewed listing. Operational fields
+    // (phone, description, amenities, photos) stay instant.
+    const current = await this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
+    const identityChanged =
+      (dto.name !== undefined && dto.name !== current.name) ||
+      (dto.address !== undefined && dto.address !== current.address) ||
+      (dto.city !== undefined && dto.city !== current.city) ||
+      (dto.lat !== undefined && dto.lat !== current.lat) ||
+      (dto.lng !== undefined && dto.lng !== current.lng);
+    const data: Prisma.VenueUpdateInput = { ...dto };
+    let backToPending = false;
+    if (identityChanged && current.status === VenueStatus.approved) {
+      data.status = VenueStatus.pending;
+      backToPending = true;
+    }
+    const venue = await this.prisma.venue.update({ where: { id: venueId }, data });
+    return { ...venue, backToPending };
   }
 
   async submitVenue(user: AuthUser, venueId: string) {

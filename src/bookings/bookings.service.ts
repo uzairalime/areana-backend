@@ -429,10 +429,17 @@ export class BookingsService {
   /** Owner/staff act on bookings of their venues (ownership verified by caller). */
   async acceptBooking(bookingId: string) {
     const booking = await this.getPending(bookingId);
-    const updated = await this.prisma.booking.update({
-      where: { id: bookingId },
+    // Atomic claim: only one decider can move the booking out of pending;
+    // a simultaneous second decision gets 'already decided' instead of
+    // silently overwriting the first.
+    const claimed = await this.prisma.booking.updateMany({
+      where: { id: bookingId, status: BookingStatus.pending },
       data: { status: BookingStatus.confirmed },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException('This booking has already been decided');
+    }
+    const updated = await this.prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
     if (booking.userId) {
       await this.notifications.notifyPlayerDecision(booking.userId, true, booking.venue.name, this.fmtWhen(booking)).catch(() => {});
     }
@@ -441,10 +448,14 @@ export class BookingsService {
 
   async rejectBooking(bookingId: string, reason?: string) {
     const booking = await this.getPending(bookingId);
-    const updated = await this.prisma.booking.update({
-      where: { id: bookingId },
+    const claimed = await this.prisma.booking.updateMany({
+      where: { id: bookingId, status: BookingStatus.pending },
       data: { status: BookingStatus.cancelled },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException('This booking has already been decided');
+    }
+    const updated = await this.prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
     if (booking.userId) {
       await this.notifications.notifyPlayerDecision(booking.userId, false, booking.venue.name, this.fmtWhen(booking), reason).catch(() => {});
     }
@@ -487,6 +498,27 @@ export class BookingsService {
   }
 
   async checkIn(bookingId: string) {
+    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    if (!booking) throw new NotFoundException('Booking not found');
+    if (booking.checkedInAt) {
+      throw new BadRequestException('This booking is already checked in');
+    }
+    if (booking.status !== BookingStatus.confirmed) {
+      throw new BadRequestException('Only confirmed bookings can be checked in');
+    }
+    // Check-in window: game day only, from 30 minutes before the slot
+    // until the slot ends. Anything else is almost certainly a wrong scan.
+    const today = startOfToday();
+    if (!isSameDay(booking.date, today)) {
+      throw new BadRequestException('Check-in is only available on the day of the booking');
+    }
+    const nowMin = minutesSinceMidnight();
+    if (nowMin < booking.startMinutes - 30) {
+      throw new BadRequestException('Check-in opens 30 minutes before the slot');
+    }
+    if (nowMin > booking.endMinutes) {
+      throw new BadRequestException('This slot has already ended');
+    }
     return this.prisma.booking.update({
       where: { id: bookingId },
       data: { checkedInAt: new Date() },
@@ -496,21 +528,98 @@ export class BookingsService {
   async markNoShow(bookingId: string) {
     const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
     if (!booking) throw new NotFoundException('Booking not found');
-    const updated = await this.prisma.booking.update({
-      where: { id: bookingId },
+    // Idempotent: re-marking an already no-show booking changes nothing
+    // (in particular, it must not add a second strike).
+    if (booking.status === BookingStatus.no_show) return booking;
+    if (booking.status !== BookingStatus.confirmed) {
+      throw new BadRequestException('Only confirmed bookings can be marked as no-show');
+    }
+    // A no-show can only be recorded once the slot has actually ended.
+    const today = startOfToday();
+    const ended =
+      booking.date < today ||
+      (isSameDay(booking.date, today) && booking.endMinutes <= minutesSinceMidnight());
+    if (!ended) {
+      throw new BadRequestException('A booking can only be marked no-show after its slot ends');
+    }
+    // Atomic claim: the status condition inside the UPDATE means two
+    // staff members marking at once can't both pass — one strike total.
+    const claimed = await this.prisma.booking.updateMany({
+      where: { id: bookingId, status: BookingStatus.confirmed },
       data: { status: BookingStatus.no_show },
     });
+    if (claimed.count === 0) {
+      return this.prisma.booking.findUnique({ where: { id: bookingId } });
+    }
+    const updated = await this.prisma.booking.findUnique({ where: { id: bookingId } });
     if (booking.userId) {
       const user = await this.prisma.user.update({
         where: { id: booking.userId },
         data: { noShowCount: { increment: 1 } },
       });
       const limit = parseInt((await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value ?? '3', 10);
-      if (user.noShowCount >= limit) {
-        await this.prisma.user.update({ where: { id: booking.userId }, data: { status: UserStatus.suspended } });
+      if (user.noShowCount >= limit && user.status === UserStatus.active) {
+        await this.suspendPlayerWithCascade(booking.userId);
       }
     }
     return updated;
+  }
+
+  /**
+   * Suspends a player and unwinds their future: upcoming bookings are
+   * cancelled, the player is told once, and each affected venue owner
+   * gets an email. (Owner suspensions deliberately do NOT use this —
+   * their bookings stand and venues pause; see round-3 policy.)
+   */
+  async suspendPlayerWithCascade(userId: string) {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { status: UserStatus.suspended },
+    });
+    const today = startOfToday();
+    const future = await this.prisma.booking.findMany({
+      where: {
+        userId,
+        date: { gte: today },
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+      },
+      include: {
+        venue: {
+          select: { name: true, owner: { select: { email: true } } },
+        },
+      },
+    });
+    for (const b of future) {
+      await this.prisma.booking.update({
+        where: { id: b.id },
+        data: { status: BookingStatus.cancelled },
+      });
+      if (b.venue.owner?.email) {
+        await this.notifications
+          .notifyOwnerNewBooking(
+            b.venue.owner.email,
+            b.venue.name,
+            `A booking on ${b.date.toISOString().slice(0, 10)} was cancelled because the player's account was suspended.`,
+          )
+          .catch(() => {});
+      }
+    }
+    await this.notifications
+      .pushToUser(userId, {
+        title: 'Account suspended',
+        body:
+          future.length > 0
+            ? `Your Areana account has been suspended and your ${future.length} upcoming booking${future.length === 1 ? ' was' : 's were'} cancelled.`
+            : 'Your Areana account has been suspended.',
+        data: { type: 'account_suspended' },
+      })
+      .catch(() => {});
+    // Revoke live sessions too, so suspension is immediate, not at the
+    // next refresh.
+    await this.prisma.refreshSession.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
   }
 
   async cancelByOwner(bookingId: string) {
