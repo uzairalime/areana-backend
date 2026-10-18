@@ -71,6 +71,7 @@ model User {
   reviews           Review[]
   gamePosts         GamePost[]
   deviceTokens      DeviceToken[]
+  notifications     Notification[]
   promoRedemptions  PromoRedemption[]
   staffVenues       VenueStaff[]
   suggestions       VenueSuggestion[]
@@ -519,4 +520,23 @@ model Setting {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt
+}
+
+/// In-app inbox copy of every personal notification (booking decisions,
+/// reminders, reschedule outcomes, game joins). Rows are written by
+/// NotificationsService.pushToUser alongside the push/email fan-out;
+/// broadcast campaigns are not fanned out into inboxes.
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  title     String
+  body      String
+  data      Json?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
 }

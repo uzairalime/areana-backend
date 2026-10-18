@@ -47,6 +47,7 @@ export class SearchService {
         city: true,
         rating: true,
         images: true,
+        photos: true,
         courts: {
           where: {
             isActive: true,

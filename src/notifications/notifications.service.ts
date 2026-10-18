@@ -44,9 +44,56 @@ export class NotificationsService {
 
   // --- primitives ---
   async pushToUser(userId: string, msg: PushMessage): Promise<void> {
+    // The inbox copy is written FIRST and unconditionally — a player
+    // with no registered device (web-only) still gets their history.
+    try {
+      await this.prisma.notification.create({
+        data: {
+          userId,
+          type: msg.data?.type ?? 'general',
+          title: msg.title,
+          body: msg.body,
+          data: msg.data ?? undefined,
+        },
+      });
+    } catch (e) {
+      this.logger.warn(`Inbox write failed for ${userId}: ${(e as Error).message}`);
+    }
     const tokens = await this.prisma.deviceToken.findMany({ where: { userId } });
     if (tokens.length === 0) return;
     await this.pushToTokens(tokens.map((t) => t.token), msg);
+  }
+
+  // --- inbox -------------------------------------------------------------
+  listMine(userId: string) {
+    return this.prisma.notification.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+  }
+
+  async unreadCount(userId: string): Promise<{ count: number }> {
+    const count = await this.prisma.notification.count({
+      where: { userId, readAt: null },
+    });
+    return { count };
+  }
+
+  async markAllRead(userId: string) {
+    await this.prisma.notification.updateMany({
+      where: { userId, readAt: null },
+      data: { readAt: new Date() },
+    });
+    return { ok: true };
+  }
+
+  async markRead(userId: string, id: string) {
+    await this.prisma.notification.updateMany({
+      where: { id, userId },
+      data: { readAt: new Date() },
+    });
+    return { ok: true };
   }
 
   async broadcastPush(msg: PushMessage, city?: string): Promise<number> {

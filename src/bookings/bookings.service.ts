@@ -309,7 +309,7 @@ export class BookingsService {
         court: { select: { name: true, sport: true } },
         // images/photos power the venue photo on the player's booking
         // cards — without them the cards rendered placeholders forever.
-        venue: { select: { name: true, address: true, city: true, images: true, photos: true } },
+        venue: { select: { name: true, address: true, city: true, lat: true, lng: true, images: true, photos: true } },
         _count: { select: { participants: true } },
       },
       orderBy: [{ date: 'asc' }, { startMinutes: 'asc' }],

@@ -15,6 +15,12 @@ export class GamePostsController {
     return this.games.list(query, user?.id);
   }
 
+  @Public()
+  @Get(':id')
+  getOne(@Param('id') id: string, @CurrentUser() user?: AuthUser) {
+    return this.games.getOne(id, user?.id);
+  }
+
   @RequirePerm('games.manage')
   @Post()
   create(@CurrentUser() user: AuthUser, @Body() dto: CreateGamePostDto) {

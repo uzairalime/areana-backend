@@ -52,6 +52,30 @@ export class GamePostsService {
     return posts.map((post) => ({ ...post, joined: joinedIds.has(post.id) }));
   }
 
+  /** One post with its squad — who is playing, not just how many. */
+  async getOne(id: string, userId?: string) {
+    const post = await this.prisma.gamePost.findUnique({
+      where: { id },
+      include: {
+        creator: { select: { name: true } },
+        venue: { select: { id: true, name: true, address: true, city: true } },
+        participants: {
+          orderBy: { joinedAt: 'asc' },
+          select: { name: true, joinedAt: true, userId: true },
+        },
+      },
+    });
+    if (!post) throw new NotFoundException('Game not found');
+    const { participants, ...rest } = post;
+    return {
+      ...rest,
+      date: post.date,
+      participants: participants.map((x) => ({ name: x.name, joinedAt: x.joinedAt })),
+      joined: userId ? participants.some((x) => x.userId === userId) : false,
+      _count: { participants: participants.length },
+    };
+  }
+
   create(userId: string, dto: CreateGamePostDto) {
     const date = parseDateOnly(dto.date);
     const now = new Date();
