@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
+import { UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 
 const venueSummary = {
@@ -19,7 +20,11 @@ export class FavoritesService {
 
   list(userId: string) {
     return this.prisma.favorite.findMany({
-      where: { userId },
+      // Paused venues (owner suspended) disappear from favorites too.
+      where: {
+        userId,
+        venue: { status: VenueStatus.approved, owner: { status: UserStatus.active } },
+      },
       include: { venue: { select: venueSummary } },
       orderBy: { createdAt: 'desc' },
     });

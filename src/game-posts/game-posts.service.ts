@@ -70,6 +70,9 @@ export class GamePostsService {
       include: { _count: { select: { participants: true } } },
     });
     if (!post) throw new NotFoundException('Game not found');
+    if (post.creatorId === user.id) {
+      throw new BadRequestException("You created this game — you're already hosting it");
+    }
     if (post.status !== 'open') throw new BadRequestException('This game is no longer open');
 
     const now = new Date();

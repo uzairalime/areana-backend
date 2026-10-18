@@ -1,5 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, VenueStatus } from '@prisma/client';
+import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { QueryVenuesDto } from './dto';
 
@@ -10,7 +10,13 @@ export class VenuesService {
   // Public listing — only approved venues are visible to players.
   async list(query: QueryVenuesDto) {
     const { q, city, sport, page = 1, limit = 20 } = query;
-    const where: Prisma.VenueWhereInput = { status: VenueStatus.approved };
+    // A suspended owner's venues are paused: hidden from players and
+    // unbookable until the owner is reactivated (no state to unwind —
+    // the owner's status is the single switch).
+    const where: Prisma.VenueWhereInput = {
+      status: VenueStatus.approved,
+      owner: { status: UserStatus.active },
+    };
     if (city) where.city = { equals: city, mode: 'insensitive' };
     if (sport) where.sports = { has: sport };
     if (q) {
@@ -67,7 +73,7 @@ export class VenuesService {
 
   async getById(id: string) {
     const venue = await this.prisma.venue.findFirst({
-      where: { id, status: VenueStatus.approved },
+      where: { id, status: VenueStatus.approved, owner: { status: UserStatus.active } },
       include: {
         courts: { where: { isActive: true }, orderBy: { pricePerHour: 'asc' } },
         badges: { include: { badge: true }, orderBy: { badge: { tier: 'desc' } } },

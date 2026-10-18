@@ -206,6 +206,12 @@ export class AdminService {
   }
 
   async createPromo(actorId: string, dto: any) {
+    if (dto.kind === 'percent' && (dto.value < 1 || dto.value > 100)) {
+      throw new BadRequestException('Percent promo value must be between 1 and 100');
+    }
+    if (dto.kind === 'flat' && dto.value < 1) {
+      throw new BadRequestException('Flat promo value must be at least Rs 1');
+    }
     const code = (dto.code ?? `PROMO-${Math.random().toString(36).slice(2, 8).toUpperCase()}`).toUpperCase();
     const promo = await this.prisma.promoCode.create({
       data: {

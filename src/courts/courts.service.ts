@@ -1,5 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { VenueStatus } from '@prisma/client';
+import { UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 
 export interface DayWindow {
@@ -137,7 +137,7 @@ export class CourtsService {
       where: {
         id: courtId,
         isActive: true,
-        venue: { status: VenueStatus.approved },
+        venue: { status: VenueStatus.approved, owner: { status: UserStatus.active } },
       },
       include: { venue: true },
     });

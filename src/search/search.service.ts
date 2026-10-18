@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { VenueStatus } from '@prisma/client';
+import { VenueStatus, UserStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { AvailabilityService } from '../availability/availability.service';
 import { parseDateOnly } from '../common/date.util';
@@ -29,6 +29,7 @@ export class SearchService {
     const venues = await this.prisma.venue.findMany({
       where: {
         status: VenueStatus.approved,
+        owner: { status: UserStatus.active },
         ...(q.city ? { city: { equals: q.city, mode: 'insensitive' } } : {}),
         courts: {
           some: {
