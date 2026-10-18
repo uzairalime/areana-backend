@@ -1,4 +1,6 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { encode as blurhashEncode } from 'blurhash';
+import sharp from 'sharp';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
 import { promises as fs } from 'fs';
@@ -17,24 +19,87 @@ export class StorageService {
 
   constructor(private config: ConfigService) {}
 
-  async saveVenueImage(venueId: string, file: Express.Multer.File): Promise<string> {
+  /** A processed image ready to store + its placeholder metadata. */
+  private async processImage(
+    file: Express.Multer.File,
+  ): Promise<{ buffer: Buffer; ext: 'jpg' | 'webp'; contentType: string; blurhash: string; width: number; height: number }> {
     if (!ALLOWED_MIME.has(file.mimetype)) {
       throw new BadRequestException('Only JPEG/PNG/WebP images are allowed');
     }
     if (file.size > MAX_BYTES) {
       throw new BadRequestException('Image must be under 5 MB');
     }
-    const ext = file.mimetype.split('/')[1].replace('jpeg', 'jpg');
-    const key = `venues/${venueId}/${randomBytes(8).toString('hex')}.${ext}`;
-
-    if (this.config.get('storage.driver') === 's3') {
-      return this.saveToS3(key, file);
+    try {
+      // Decode for real (the declared MIME is not trusted): sharp throws
+      // on anything that is not actually an image.
+      const rotated = sharp(file.buffer).rotate(); // EXIF orientation
+      const meta = await rotated.metadata();
+      if (!meta.width || !meta.height) throw new Error('no dimensions');
+      let pipeline = sharp(file.buffer).rotate();
+      if (meta.width > 1920) pipeline = pipeline.resize({ width: 1920 });
+      const isWebp = file.mimetype === 'image/webp';
+      const out = isWebp
+        ? await pipeline.webp({ quality: 80 }).toBuffer({ resolveWithObject: true })
+        : await pipeline.jpeg({ quality: 80, mozjpeg: true }).toBuffer({ resolveWithObject: true });
+      // BlurHash from a 32x20 raw thumbnail (component X/Y = 4x3).
+      const thumb = await sharp(file.buffer)
+        .rotate()
+        .resize(32, 20, { fit: 'fill' })
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      const blurhash = blurhashEncode(
+        new Uint8ClampedArray(thumb.data),
+        thumb.info.width,
+        thumb.info.height,
+        4,
+        3,
+      );
+      return {
+        buffer: Buffer.from(out.data),
+        ext: isWebp ? 'webp' : 'jpg',
+        contentType: isWebp ? 'image/webp' : 'image/jpeg',
+        blurhash,
+        width: out.info.width,
+        height: out.info.height,
+      };
+    } catch (e) {
+      if (e instanceof BadRequestException) throw e;
+      throw new BadRequestException('That file is not a valid image');
     }
-    const dir = join(this.config.get('storage.dir'), 'venues', venueId);
+  }
+
+  private async storeProcessed(
+    key: string,
+    processed: { buffer: Buffer; contentType: string },
+  ): Promise<string> {
+    if (this.config.get('storage.driver') === 's3') {
+      return this.saveProcessedToS3(key, processed);
+    }
+    const dir = join(this.config.get('storage.dir'), key.split('/').slice(0, -1).join('/'));
     await fs.mkdir(dir, { recursive: true });
     const filename = key.split('/').pop() as string;
-    await fs.writeFile(join(dir, filename), file.buffer);
-    return `/uploads/venues/${venueId}/${filename}`;
+    await fs.writeFile(join(dir, filename), processed.buffer);
+    return `/uploads/${key}`;
+  }
+
+  async saveVenueImage(
+    venueId: string,
+    file: Express.Multer.File,
+  ): Promise<{ url: string; blurhash: string; width: number; height: number }> {
+    const processed = await this.processImage(file);
+    const key = `venues/${venueId}/${randomBytes(8).toString('hex')}.${processed.ext}`;
+    const url = await this.storeProcessed(key, processed);
+    return { url, blurhash: processed.blurhash, width: processed.width, height: processed.height };
+  }
+
+  async saveBannerImage(
+    file: Express.Multer.File,
+  ): Promise<{ url: string; blurhash: string; width: number; height: number }> {
+    const processed = await this.processImage(file);
+    const key = `banners/${randomBytes(8).toString('hex')}.${processed.ext}`;
+    const url = await this.storeProcessed(key, processed);
+    return { url, blurhash: processed.blurhash, width: processed.width, height: processed.height };
   }
 
   async deleteImage(url: string): Promise<void> {
@@ -49,7 +114,10 @@ export class StorageService {
     }
   }
 
-  private async saveToS3(key: string, file: Express.Multer.File): Promise<string> {
+  private async saveProcessedToS3(
+    key: string,
+    processed: { buffer: Buffer; contentType: string },
+  ): Promise<string> {
     const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
     const cfg = this.config.get('storage.s3');
     const client = new S3Client({
@@ -62,8 +130,8 @@ export class StorageService {
       new PutObjectCommand({
         Bucket: cfg.bucket,
         Key: key,
-        Body: file.buffer,
-        ContentType: file.mimetype,
+        Body: processed.buffer,
+        ContentType: processed.contentType,
       }),
     );
     const base = (cfg.publicUrl ?? `https://${cfg.bucket}.s3.${cfg.region}.amazonaws.com`).replace(/\/$/, '');

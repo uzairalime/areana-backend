@@ -12,6 +12,7 @@ import { BadgesService } from '../badges/badges.service';
 import { DisputesService } from '../disputes/disputes.service';
 import { SuggestionsService } from '../suggestions/suggestions.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { StorageService } from '../storage/storage.service';
 import { CreateRoleDto, CreateUserDto, UpdateRoleDto } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 
@@ -23,6 +24,7 @@ export class AdminService {
     private disputes: DisputesService,
     private suggestions: SuggestionsService,
     private notifications: NotificationsService,
+    private storage: StorageService,
   ) {}
 
   private audit(actorId: string, action: string, entity: string, entityId: string) {
@@ -311,11 +313,17 @@ export class AdminService {
     return this.prisma.banner.findMany({ orderBy: { createdAt: 'desc' } });
   }
 
+  /** Process + store a banner image (same pipeline as venue photos). */
+  async uploadBannerImage(file: Express.Multer.File) {
+    return this.storage.saveBannerImage(file);
+  }
+
   async createBanner(actorId: string, dto: any) {
     const banner = await this.prisma.banner.create({
       data: {
         title: dto.title,
         imageUrl: dto.imageUrl,
+        blurhash: dto.blurhash ?? null,
         linkUrl: dto.linkUrl,
         city: dto.city,
         isActive: dto.isActive ?? true,

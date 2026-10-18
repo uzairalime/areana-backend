@@ -25,7 +25,16 @@ scheduler, admin broadcasts) — never from controllers.
 ## Image storage (`storage/`)
 
 `StorageService.saveVenueImage(venueId, file)`:
-- JPEG/PNG/WebP only, ≤ 5 MB, randomized filename.
+- JPEG/PNG/WebP only, ≤ 5 MB, randomized filename. The declared type is
+  not trusted: every upload is decoded with sharp (non-images rejected),
+  EXIF-rotated, capped at 1920px wide, and recompressed (JPEG/WebP q80) —
+  originals are never stored or served.
+- Each processed image also yields a **BlurHash** + final dimensions,
+  stored on `venue.photos` as `[{ url, blurhash, width, height }]`, kept
+  in lockstep with the plain-URL `venue.images` (legacy consumers). The
+  player web decodes the hash into a blurred placeholder while the real
+  photo loads. Photos uploaded before this pipeline have no entry and
+  fall back to the brand-gradient placeholder.
 - `STORAGE_DRIVER=local` (dev): written to `./uploads/venues/:venueId/`,
   served at `/uploads/...` via Express static, URL stored on `venue.images`.
 - `STORAGE_DRIVER=s3` (prod): uploaded to the S3-compatible bucket
@@ -34,7 +43,11 @@ scheduler, admin broadcasts) — never from controllers.
 - `deleteImage(url)` removes from whichever backend owns the URL.
 
 Uploads go through `POST /owner/venues/:id/images` (`multipart/form-data`,
-field `image`, perm `venues.manage`).
+field `image`, perm `venues.manage`). Photo order (first = cover) is
+managed via `PATCH /owner/venues/:id/images/order` with `{ urls }` — the
+exact current set in the new order. Banner images upload through
+`POST /admin/banners/upload` (same pipeline; the returned `blurhash` is
+saved on the banner via the normal create/update calls).
 
 ## Scheduler (`scheduler/`)
 

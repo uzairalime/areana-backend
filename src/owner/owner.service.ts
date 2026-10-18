@@ -177,21 +177,54 @@ export class OwnerService {
     });
   }
 
+  /**
+   * Rich photo entries aligned to `venue.images` order. Photos uploaded
+   * before the media pass have no stored entry — they get a bare { url }
+   * here (gradient placeholder in the apps) and gain a blurhash only if
+   * re-uploaded. `images` (plain URLs) stays the order source of truth.
+   */
+  private photoEntries(venue: { images: string[]; photos: unknown }): { url: string; blurhash?: string; width?: number; height?: number }[] {
+    const stored = Array.isArray(venue.photos) ? (venue.photos as { url: string }[]) : [];
+    const byUrl = new Map(stored.map((x) => [x.url, x]));
+    return venue.images.map((url) => byUrl.get(url) ?? { url });
+  }
+
   async addVenueImage(user: AuthUser, venueId: string, file: Express.Multer.File) {
     const venue = await this.assertVenue(user, venueId);
-    const url = await this.storage.saveVenueImage(venueId, file);
+    const photo = await this.storage.saveVenueImage(venueId, file);
+    const entries = [...this.photoEntries(venue), photo];
     return this.prisma.venue.update({
       where: { id: venueId },
-      data: { images: [...venue.images, url] },
+      data: { images: entries.map((e) => e.url), photos: entries },
     });
   }
 
   async removeVenueImage(user: AuthUser, venueId: string, url: string) {
     const venue = await this.assertVenue(user, venueId);
     await this.storage.deleteImage(url);
+    const entries = this.photoEntries(venue).filter((e) => e.url !== url);
     return this.prisma.venue.update({
       where: { id: venueId },
-      data: { images: venue.images.filter((i) => i !== url) },
+      data: { images: entries.map((e) => e.url), photos: entries },
+    });
+  }
+
+  /** Reorder a venue's photos (the first photo is the cover everywhere). */
+  async reorderVenueImages(user: AuthUser, venueId: string, urls: string[]) {
+    const venue = await this.assertVenue(user, venueId);
+    const entries = this.photoEntries(venue);
+    const current = entries.map((e) => e.url);
+    const sameSet =
+      urls.length === current.length &&
+      [...urls].sort().join('|') === [...current].sort().join('|');
+    if (!sameSet) {
+      throw new BadRequestException('Photo order must contain exactly the current photos');
+    }
+    const byUrl = new Map(entries.map((e) => [e.url, e]));
+    const ordered = urls.map((u) => byUrl.get(u) as { url: string });
+    return this.prisma.venue.update({
+      where: { id: venueId },
+      data: { images: urls, photos: ordered },
     });
   }
 

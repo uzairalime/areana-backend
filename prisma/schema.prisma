@@ -119,6 +119,10 @@ model Venue {
   sports            String[]
   amenities         String[]
   images            String[]
+  /// Rich photo entries [{ url, blurhash, width, height }] kept in
+  /// lockstep with `images` (plain URLs, legacy consumers). Additive —
+  /// no destructive column change; new uploads populate both.
+  photos            Json                @default("[]")
   rating            Float       @default(0)
   ratingCount       Int         @default(0)
   autoAccept        Boolean     @default(false)
@@ -476,6 +480,7 @@ model Banner {
   id        String    @id @default(cuid())
   title     String
   imageUrl  String
+  blurhash  String?
   linkUrl   String?
   city      String?
   isActive  Boolean   @default(true)

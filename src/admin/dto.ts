@@ -82,6 +82,7 @@ export class SendBroadcastDto {
 export class CreateBannerDto {
   @ApiProperty() @IsString() title: string;
   @ApiProperty() @IsString() imageUrl: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() blurhash?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() linkUrl?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() city?: string;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() isActive?: boolean;
@@ -91,6 +92,7 @@ export class CreateBannerDto {
 export class UpdateBannerDto {
   @ApiPropertyOptional() @IsOptional() @IsString() title?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() imageUrl?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() blurhash?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() linkUrl?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() city?: string;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() isActive?: boolean;

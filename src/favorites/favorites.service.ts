@@ -12,6 +12,7 @@ const venueSummary = {
   rating: true,
   ratingCount: true,
   status: true,
+  photos: true,
 } as const;
 
 @Injectable()

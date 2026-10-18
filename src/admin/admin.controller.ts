@@ -1,5 +1,6 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { PERMISSION_LIST } from '../common/permissions';
 import { AuthUser, CurrentUser, RequirePerm } from '../common/auth';
 import { AdminService } from './admin.service';
@@ -267,6 +268,14 @@ export class AdminController {
   @Get('banners')
   listBanners() {
     return this.admin.listBanners();
+  }
+
+  @ApiTags('admin · broadcasts & banners')
+  @Post('banners/upload')
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('image'))
+  uploadBannerImage(@UploadedFile() file: Express.Multer.File) {
+    return this.admin.uploadBannerImage(file);
   }
 
   @ApiTags('admin · broadcasts & banners')

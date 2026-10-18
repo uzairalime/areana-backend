@@ -92,6 +92,17 @@ export class OwnerController {
 
   @RequirePerm('venues.manage')
   @ApiTags('owner · venues & courts')
+  @Patch('venues/:id/images/order')
+  reorderImages(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body('urls') urls: string[],
+  ) {
+    return this.owner.reorderVenueImages(user, id, urls);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
   @Delete('venues/:id/images')
   removeImage(
     @CurrentUser() user: AuthUser,
