@@ -42,13 +42,21 @@ export class GamePostsService {
   }
 
   create(userId: string, dto: CreateGamePostDto) {
+    const date = parseDateOnly(dto.date);
+    const now = new Date();
+    if (date < startOfToday()) {
+      throw new BadRequestException('Game date is in the past');
+    }
+    if (isSameDay(date, now) && dto.startMinutes <= minutesSinceMidnight(now)) {
+      throw new BadRequestException('That start time has already passed today');
+    }
     return this.prisma.gamePost.create({
       data: {
         creatorId: userId,
         sport: dto.sport,
         city: dto.city,
         venueId: dto.venueId,
-        date: parseDateOnly(dto.date),
+        date,
         startMinutes: dto.startMinutes,
         playersNeeded: dto.playersNeeded,
         note: dto.note,

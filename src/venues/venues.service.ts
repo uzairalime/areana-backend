@@ -27,13 +27,42 @@ export class VenuesService {
         include: {
           _count: { select: { courts: true } },
           badges: { include: { badge: true }, orderBy: { badge: { tier: 'desc' } } },
+          courts: {
+            where: { isActive: true },
+            select: {
+              pricePerHour: true,
+              priceWindows: { select: { pricePerHour: true } },
+            },
+          },
         },
         orderBy: { rating: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
       }),
     ]);
-    return { total, page, limit, data };
+    // fromPrice = the cheapest hour a player could actually pay at this
+    // venue: the minimum over active courts of (base rate, any special
+    // price-window rate). Courts are stripped from the payload afterwards.
+    const shaped = data.map((v: any) => {
+      const rates: number[] = [];
+      for (const c of v.courts ?? []) {
+        rates.push(Number(c.pricePerHour));
+        for (const w of c.priceWindows ?? []) rates.push(Number(w.pricePerHour));
+      }
+      const { courts: _courts, ...rest } = v;
+      return { ...rest, fromPrice: rates.length ? Math.min(...rates) : null };
+    });
+    return { total, page, limit, data: shaped };
+  }
+
+  /** Distinct cities with at least one approved venue, A-Z. */
+  async cities(): Promise<string[]> {
+    const rows = await this.prisma.venue.findMany({
+      where: { status: VenueStatus.approved },
+      select: { city: true },
+      distinct: ['city'],
+    });
+    return rows.map((r) => r.city).sort((a, b) => a.localeCompare(b));
   }
 
   async getById(id: string) {

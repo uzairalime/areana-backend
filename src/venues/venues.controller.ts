@@ -15,6 +15,13 @@ export class VenuesController {
     return this.venues.list(query);
   }
 
+  /** Distinct cities that have at least one approved venue (for filter dropdowns). */
+  @Public()
+  @Get('cities')
+  cities() {
+    return this.venues.cities();
+  }
+
   @Public()
   @Get(':id')
   getById(@Param('id') id: string) {
