@@ -56,7 +56,14 @@ export class VenuesService {
         for (const w of c.priceWindows ?? []) rates.push(Number(w.pricePerHour));
       }
       const { courts: _courts, ...rest } = v;
-      return { ...rest, fromPrice: rates.length ? Math.min(...rates) : null };
+      // Sports shown to players always reflect the actual active courts
+      // (venue.sports heals at read time even before owners edit).
+      const courtSports = [...new Set((v.courts ?? []).map((c: any) => c.sport).filter(Boolean))];
+      return {
+        ...rest,
+        sports: courtSports.length ? courtSports : rest.sports,
+        fromPrice: rates.length ? Math.min(...rates) : null,
+      };
     });
     return { total, page, limit, data: shaped };
   }
@@ -80,6 +87,9 @@ export class VenuesService {
       },
     });
     if (!venue) throw new NotFoundException('Venue not found');
-    return venue;
+    const courtSports = [
+      ...new Set((venue.courts ?? []).map((c: any) => c.sport).filter(Boolean)),
+    ];
+    return courtSports.length ? { ...venue, sports: courtSports } : venue;
   }
 }

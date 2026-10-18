@@ -6,6 +6,7 @@ export class CreateVenueDto {
   @ApiProperty() @IsString() name: string;
   @ApiProperty() @IsString() address: string;
   @ApiProperty() @IsString() city: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() phone?: string;
   @ApiPropertyOptional() @IsOptional() @IsNumber() lat?: number;
   @ApiPropertyOptional() @IsOptional() @IsNumber() lng?: number;
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsString({ each: true }) sports?: string[];
@@ -16,6 +17,12 @@ export class UpdateVenueDto {
   @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() address?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() city?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() phone?: string;
+  // CreateVenueDto always had lat/lng but Update did not — the global
+  // ValidationPipe whitelist silently STRIPPED them, so editing a
+  // venue's coordinates in the panel never persisted.
+  @ApiPropertyOptional() @IsOptional() @IsNumber() lat?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() lng?: number;
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsString({ each: true }) sports?: string[];
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsString({ each: true }) amenities?: string[];
   @ApiPropertyOptional() @IsOptional() autoAccept?: boolean;

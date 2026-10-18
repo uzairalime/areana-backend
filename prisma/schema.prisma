@@ -114,6 +114,8 @@ model Venue {
   name              String
   address           String
   city              String
+  /// Public contact number players can call (directions, running late).
+  phone             String?
   lat               Float?
   lng               Float?
   sports            String[]

@@ -137,6 +137,7 @@ export class OwnerService {
         name: dto.name,
         address: dto.address,
         city: dto.city,
+        phone: dto.phone,
         lat: dto.lat,
         lng: dto.lng,
         sports: dto.sports ?? [],
@@ -250,13 +251,30 @@ export class OwnerService {
     return close;
   }
 
+  /**
+   * venue.sports is denormalized from the venue's ACTIVE courts — it
+   * drives the player web's sport filter and chips. It used to be set
+   * once from the create form and never updated, so it drifted from
+   * reality the moment courts changed.
+   */
+  private async syncVenueSports(venueId: string) {
+    const courts = await this.prisma.court.findMany({
+      where: { venueId, isActive: true },
+      select: { sport: true },
+    });
+    const sports = [...new Set(courts.map((c) => c.sport))];
+    await this.prisma.venue.update({ where: { id: venueId }, data: { sports } });
+  }
+
   async createCourt(user: AuthUser, venueId: string, dto: CreateCourtDto) {
     await this.assertVenue(user, venueId);
     const data = { ...dto };
     if (data.openMinutes != null && data.closeMinutes != null) {
       data.closeMinutes = this.normalizeCourtHours(data.openMinutes, data.closeMinutes);
     }
-    return this.prisma.court.create({ data: { venueId, ...data } });
+    const court = await this.prisma.court.create({ data: { venueId, ...data } });
+    await this.syncVenueSports(venueId);
+    return court;
   }
 
   async updateCourt(user: AuthUser, courtId: string, dto: UpdateCourtDto) {
@@ -270,7 +288,9 @@ export class OwnerService {
         data.closeMinutes ?? court.closeMinutes,
       );
     }
-    return this.prisma.court.update({ where: { id: courtId }, data });
+    const updated = await this.prisma.court.update({ where: { id: courtId }, data });
+    await this.syncVenueSports(court.venueId);
+    return updated;
   }
 
   // ---------------------------------------------------------------- blocks

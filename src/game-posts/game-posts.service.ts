@@ -24,13 +24,13 @@ export class GamePostsService {
     private notifications: NotificationsService,
   ) {}
 
-  list(query: GamePostQueryDto) {
+  async list(query: GamePostQueryDto, userId?: string) {
     const where: Prisma.GamePostWhereInput = { status: 'open' };
     if (query.sport) where.sport = { equals: query.sport, mode: 'insensitive' };
     if (query.city) where.city = { equals: query.city, mode: 'insensitive' };
     where.date = query.date ? parseDateOnly(query.date) : { gte: startOfToday() };
 
-    return this.prisma.gamePost.findMany({
+    const posts = await this.prisma.gamePost.findMany({
       where,
       include: {
         creator: { select: { name: true } },
@@ -39,6 +39,17 @@ export class GamePostsService {
       },
       orderBy: [{ isCurated: 'desc' }, { date: 'asc' }, { startMinutes: 'asc' }],
     });
+    if (!userId || posts.length === 0) {
+      return posts.map((post) => ({ ...post, joined: false }));
+    }
+    // One query for the requester's participations among these posts —
+    // replaces the player web's localStorage joined-tracking.
+    const mine = await this.prisma.gameParticipant.findMany({
+      where: { userId, postId: { in: posts.map((post) => post.id) } },
+      select: { postId: true },
+    });
+    const joinedIds = new Set(mine.map((m) => m.postId));
+    return posts.map((post) => ({ ...post, joined: joinedIds.has(post.id) }));
   }
 
   create(userId: string, dto: CreateGamePostDto) {

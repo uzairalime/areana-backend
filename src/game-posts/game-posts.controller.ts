@@ -11,8 +11,8 @@ export class GamePostsController {
 
   @Public()
   @Get()
-  list(@Query() query: GamePostQueryDto) {
-    return this.games.list(query);
+  list(@Query() query: GamePostQueryDto, @CurrentUser() user?: AuthUser) {
+    return this.games.list(query, user?.id);
   }
 
   @RequirePerm('games.manage')
