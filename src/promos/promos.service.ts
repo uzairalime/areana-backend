@@ -62,10 +62,18 @@ export class PromosService {
     tx?: Prisma.TransactionClient,
   ) {
     const db = tx ?? this.prisma;
-    await db.promoCode.update({
-      where: { id: promoId },
-      data: { usedCount: { increment: 1 } },
-    });
+    // Atomic conditional increment: the WHERE re-checks the cap inside
+    // the same UPDATE, so two simultaneous redemptions of the last use
+    // can't both succeed (the old read-then-increment had a race window).
+    const rows = await db.$queryRaw<{ id: string }[]>`
+      UPDATE "PromoCode"
+      SET "usedCount" = "usedCount" + 1
+      WHERE "id" = ${promoId}
+        AND ("maxUses" IS NULL OR "usedCount" < "maxUses")
+      RETURNING "id"`;
+    if (rows.length === 0) {
+      throw new BadRequestException('Promo code is fully used');
+    }
     return db.promoRedemption.create({
       data: { promoCodeId: promoId, userId, bookingId },
     });

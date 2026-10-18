@@ -352,7 +352,7 @@ export class BookingsService {
       where: { shareCode },
       include: {
         court: { select: { name: true, sport: true } },
-        venue: { select: { name: true, address: true, city: true } },
+        venue: { select: { name: true, address: true, city: true, images: true, photos: true } },
         participants: { select: { name: true, joinedAt: true } },
       },
     });
@@ -367,6 +367,23 @@ export class BookingsService {
     const booking = await this.prisma.booking.findUnique({ where: { shareCode } });
     if (!booking || booking.status === BookingStatus.cancelled) {
       throw new NotFoundException('Booking link is invalid or expired');
+    }
+    // A link for a game that already happened can't take new joiners.
+    if (
+      booking.date < startOfToday() ||
+      (isSameDay(booking.date, startOfToday()) &&
+        booking.endMinutes <= minutesSinceMidnight())
+    ) {
+      throw new BadRequestException('This game has already taken place');
+    }
+    // One join per phone number — stops accidental (or spammed) duplicates.
+    if (dto.phone) {
+      const dupe = await this.prisma.bookingParticipant.findFirst({
+        where: { bookingId: booking.id, phone: dto.phone },
+      });
+      if (dupe) {
+        throw new ConflictException('This number has already joined this game');
+      }
     }
     let name = dto.name;
     if (userId) {

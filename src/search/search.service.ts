@@ -66,7 +66,7 @@ export class SearchService {
           },
         },
       },
-      take: 50,
+      take: 200,
     });
 
     const results: any[] = [];
@@ -90,6 +90,8 @@ export class SearchService {
         b.courts.reduce((s: number, c: any) => s + c.availableSlots.length, 0) -
         a.courts.reduce((s: number, c: any) => s + c.availableSlots.length, 0),
     );
-    return { date: q.date, results };
+    // Cap the payload at the 50 best-covered venues (scan widened above
+    // so growing cities don't silently truncate before sorting).
+    return { date: q.date, results: results.slice(0, 50) };
   }
 }

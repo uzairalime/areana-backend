@@ -11,6 +11,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { User, UserStatus } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
+import { createHash } from 'crypto';
 import { PrismaService } from '../common/prisma';
 import { MailService } from './mail.service';
 import { ReferralsService } from '../promos/referrals.service';
@@ -25,6 +26,11 @@ import {
 const OTP_TTL_MS = 10 * 60 * 1000;
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_MAX_PER_HOUR = 5;
+const OTP_IP_MAX_PER_HOUR = 30;
+
+function hashToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
 
 function randomCode(prefix: string): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -44,7 +50,7 @@ export class AuthService {
   ) {}
 
   // --- player: passwordless email OTP ---
-  async requestOtp(dto: RequestOtpDto) {
+  async requestOtp(dto: RequestOtpDto, ip?: string) {
     const email = dto.email.toLowerCase().trim();
 
     const recent = await this.prisma.otpCode.count({
@@ -56,6 +62,19 @@ export class AuthService {
         HttpStatus.TOO_MANY_REQUESTS,
       );
     }
+    // Per-IP cap as well: the per-email cap alone lets one machine spray
+    // codes across many addresses.
+    if (ip) {
+      const recentIp = await this.prisma.otpCode.count({
+        where: { ip, createdAt: { gte: new Date(Date.now() - 3600_000) } },
+      });
+      if (recentIp >= OTP_IP_MAX_PER_HOUR) {
+        throw new HttpException(
+          'Too many codes requested. Try again later.',
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+    }
 
     const code = String(Math.floor(100000 + Math.random() * 900000));
     await this.prisma.otpCode.create({
@@ -63,6 +82,7 @@ export class AuthService {
         email,
         codeHash: await bcrypt.hash(code, 10),
         expiresAt: new Date(Date.now() + OTP_TTL_MS),
+        ip: ip ?? undefined,
       },
     });
     await this.mail.sendOtp(email, code);
@@ -128,7 +148,7 @@ export class AuthService {
   }
 
   async refresh(dto: RefreshDto) {
-    let payload: { sub: string };
+    let payload: { sub: string; sid?: string };
     try {
       payload = await this.jwt.verifyAsync(dto.refreshToken, {
         secret: this.config.get('jwt.refreshSecret'),
@@ -140,7 +160,51 @@ export class AuthService {
     if (!user || user.status !== UserStatus.active) {
       throw new UnauthorizedException('Invalid refresh token');
     }
+    // Session-backed rotation: the presented token must be the live,
+    // unrevoked session token. Anything else (an old rotated token, a
+    // logged-out one) is treated as reuse — kill every session.
+    const session = payload.sid
+      ? await this.prisma.refreshSession.findUnique({ where: { id: payload.sid } })
+      : null;
+    if (
+      !session ||
+      session.userId !== user.id ||
+      session.revokedAt ||
+      session.expiresAt <= new Date() ||
+      session.tokenHash !== hashToken(dto.refreshToken)
+    ) {
+      if (session) {
+        await this.prisma.refreshSession.updateMany({
+          where: { userId: user.id, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+      }
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+    await this.prisma.refreshSession.update({
+      where: { id: session.id },
+      data: { revokedAt: new Date() },
+    });
     return this.issueTokens(user);
+  }
+
+  /** Revokes the session behind a refresh token (best-effort, idempotent). */
+  async logout(refreshToken: string) {
+    try {
+      const payload = await this.jwt.verifyAsync<{ sub: string; sid?: string }>(
+        refreshToken,
+        { secret: this.config.get('jwt.refreshSecret'), ignoreExpiration: true },
+      );
+      if (payload.sid) {
+        await this.prisma.refreshSession.updateMany({
+          where: { id: payload.sid, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+      }
+    } catch {
+      /* an unverifiable token has no live session to revoke */
+    }
+    return { ok: true };
   }
 
   // --- owner self-registration (needs super admin approval) ---
@@ -194,16 +258,31 @@ export class AuthService {
   private async issueTokens(user: User) {
     const role = await this.prisma.role.findUniqueOrThrow({ where: { id: user.roleId } });
     const payload = { sub: user.id, email: user.email, roleId: user.roleId, roleName: role.name };
+    const refreshTtl: number = this.config.get('jwt.refreshTtl');
+    const session = await this.prisma.refreshSession.create({
+      data: {
+        userId: user.id,
+        tokenHash: 'pending',
+        expiresAt: new Date(Date.now() + refreshTtl * 1000),
+      },
+    });
     const [accessToken, refreshToken] = await Promise.all([
       this.jwt.signAsync(payload, {
         secret: this.config.get('jwt.accessSecret'),
         expiresIn: this.config.get('jwt.accessTtl'),
       }),
-      this.jwt.signAsync(payload, {
-        secret: this.config.get('jwt.refreshSecret'),
-        expiresIn: this.config.get('jwt.refreshTtl'),
-      }),
+      this.jwt.signAsync(
+        { ...payload, sid: session.id },
+        {
+          secret: this.config.get('jwt.refreshSecret'),
+          expiresIn: refreshTtl,
+        },
+      ),
     ]);
+    await this.prisma.refreshSession.update({
+      where: { id: session.id },
+      data: { tokenHash: hashToken(refreshToken) },
+    });
     return {
       accessToken,
       refreshToken,

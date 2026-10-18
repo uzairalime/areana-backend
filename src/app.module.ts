@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import configuration, { validationSchema } from './config';
 import { PrismaModule } from './common/prisma';
 import { JwtAuthGuard, PermGuard } from './common/auth';
@@ -29,6 +30,7 @@ import { HealthModule } from './health/health.module';
 
 @Module({
   imports: [
+    ThrottlerModule.forRoot([{ ttl: 60000, limit: 300 }]),
     ConfigModule.forRoot({ isGlobal: true, load: [configuration], validationSchema }),
     PrismaModule, // @Global
     NotificationsModule, // @Global (email + push)
@@ -55,6 +57,7 @@ import { HealthModule } from './health/health.module';
     HealthModule,
   ],
   providers: [
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_GUARD, useClass: PermGuard },
   ],

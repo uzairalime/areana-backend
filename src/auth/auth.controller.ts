@@ -1,4 +1,5 @@
-import { Body, Controller, Get, Post } from '@nestjs/common';
+import { Body, Controller, Get, Ip, Post } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser, Public } from '../common/auth';
 import { AuthService } from './auth.service';
@@ -11,15 +12,17 @@ import {
 } from './dto';
 
 @ApiTags('auth')
+@Throttle({ default: { limit: 30, ttl: 60000 } })
 @Controller('auth')
 export class AuthController {
   constructor(private auth: AuthService) {}
 
   // --- players: passwordless email OTP ---
   @Public()
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @Post('request-otp')
-  requestOtp(@Body() dto: RequestOtpDto) {
-    return this.auth.requestOtp(dto);
+  requestOtp(@Body() dto: RequestOtpDto, @Ip() ip: string) {
+    return this.auth.requestOtp(dto, ip);
   }
 
   @Public()
@@ -34,6 +37,13 @@ export class AuthController {
     return this.auth.refresh(dto);
   }
 
+  /** Revokes the refresh session behind the given refresh token. */
+  @Public()
+  @Post('logout')
+  logout(@Body() dto: RefreshDto) {
+    return this.auth.logout(dto.refreshToken);
+  }
+
   // --- arena owners self-register (super admin approves) ---
   @Public()
   @Post('owner/register')
@@ -43,6 +53,7 @@ export class AuthController {
 
   // --- owner / staff / super_admin login (web panels) ---
   @Public()
+  @Throttle({ default: { limit: 10, ttl: 60000 } })
   @Post('staff/login')
   staffLogin(@Body() dto: StaffLoginDto) {
     return this.auth.staffLogin(dto);

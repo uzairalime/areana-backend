@@ -28,7 +28,24 @@ export class GamePostsService {
     const where: Prisma.GamePostWhereInput = { status: 'open' };
     if (query.sport) where.sport = { equals: query.sport, mode: 'insensitive' };
     if (query.city) where.city = { equals: query.city, mode: 'insensitive' };
-    where.date = query.date ? parseDateOnly(query.date) : { gte: startOfToday() };
+    // Date filter: future days wholesale; for today, only games that
+    // haven't started yet (a 6pm game shouldn't list as open at 9pm).
+    const today = startOfToday();
+    const nowMin = minutesSinceMidnight();
+    if (query.date) {
+      const d = parseDateOnly(query.date);
+      where.date = d;
+      if (isSameDay(d, today)) where.startMinutes = { gt: nowMin };
+    } else {
+      where.AND = [
+        {
+          OR: [
+            { date: { gt: today } },
+            { date: today, startMinutes: { gt: nowMin } },
+          ],
+        },
+      ];
+    }
 
     const posts = await this.prisma.gamePost.findMany({
       where,

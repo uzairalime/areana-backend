@@ -82,6 +82,8 @@ model User {
   curatedPosts      GamePost[]       @relation("CuratedPosts")
   referralsMade     Referral[]       @relation("Referrer")
   referralsReceived Referral[]       @relation("Referee")
+  refreshSessions RefreshSession[]
+
 }
 
 model OtpCode {
@@ -91,9 +93,24 @@ model OtpCode {
   expiresAt  DateTime
   attempts   Int       @default(0)
   consumedAt DateTime?
+  ip         String?
   createdAt  DateTime  @default(now())
 
   @@index([email])
+  @@index([ip])
+}
+
+/** Server-side refresh-token sessions: rotation + reuse detection. */
+model RefreshSession {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
 }
 
 model DeviceToken {
