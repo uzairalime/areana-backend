@@ -168,9 +168,9 @@ export class NotificationsService {
 
   async notifyGameJoin(creatorId: string, playerName: string, sport: string) {
     await this.pushToUser(creatorId, {
-      title: 'Someone joined your game',
-      body: `${playerName} joined your ${sport} game.`,
-      data: { type: 'game_join' },
+      title: 'New join request',
+      body: `${playerName} asked to join your ${sport} game — accept or decline it from the Games board.`,
+      data: { type: 'game_join_request' },
     });
   }
 }

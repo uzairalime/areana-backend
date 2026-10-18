@@ -428,6 +428,8 @@ model GameParticipant {
   userId   String?
   name     String
   phone    String?
+  /** pending = join requested, awaiting the host; joined = accepted. */
+  status   String   @default("joined")
   joinedAt DateTime @default(now())
 
   @@index([postId])

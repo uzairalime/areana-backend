@@ -328,7 +328,9 @@ export class BookingsService {
             playersNeeded: true,
             squadSize: true,
             status: true,
-            _count: { select: { participants: true } },
+            _count: {
+              select: { participants: { where: { status: 'joined' } } },
+            },
           },
         },
         _count: { select: { participants: true } },

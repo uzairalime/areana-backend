@@ -44,6 +44,26 @@ export class GamePostsController {
   }
 
   @RequirePerm('games.manage')
+  @Post(':id/requests/:participantId/accept')
+  acceptRequest(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Param('participantId') participantId: string,
+  ) {
+    return this.games.acceptRequest(id, user.id, participantId);
+  }
+
+  @RequirePerm('games.manage')
+  @Post(':id/requests/:participantId/reject')
+  rejectRequest(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Param('participantId') participantId: string,
+  ) {
+    return this.games.rejectRequest(id, user.id, participantId);
+  }
+
+  @RequirePerm('games.manage')
   @Post(':id/leave')
   leave(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.games.leave(id, user.id);

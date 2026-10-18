@@ -52,21 +52,36 @@ export class GamePostsService {
       include: {
         creator: { select: { name: true } },
         venue: { select: { id: true, name: true, address: true, city: true } },
-        _count: { select: { participants: true } },
+        _count: { select: { participants: { where: { status: 'joined' } } } },
       },
       orderBy: [{ isCurated: 'desc' }, { date: 'asc' }, { startMinutes: 'asc' }],
     });
     if (!userId || posts.length === 0) {
-      return posts.map((post) => ({ ...post, joined: false }));
+      return posts.map((post) => ({ ...post, joined: false, joinState: 'none' as const, pendingCount: 0 }));
     }
     // One query for the requester's participations among these posts —
     // replaces the player web's localStorage joined-tracking.
     const mine = await this.prisma.gameParticipant.findMany({
       where: { userId, postId: { in: posts.map((post) => post.id) } },
-      select: { postId: true },
+      select: { postId: true, status: true },
     });
-    const joinedIds = new Set(mine.map((m) => m.postId));
-    return posts.map((post) => ({ ...post, joined: joinedIds.has(post.id) }));
+    const stateByPost = new Map(mine.map((m) => [m.postId, m.status]));
+    // Pending-request counts (the host's inbox pressure on their cards).
+    const pending = await this.prisma.gameParticipant.groupBy({
+      by: ['postId'],
+      where: { postId: { in: posts.map((post) => post.id) }, status: 'pending' },
+      _count: true,
+    });
+    const pendingByPost = new Map(pending.map((r) => [r.postId, r._count]));
+    return posts.map((post) => {
+      const state = stateByPost.get(post.id);
+      return {
+        ...post,
+        joined: state === 'joined',
+        joinState: state === 'joined' ? 'joined' : state === 'pending' ? 'pending' : 'none',
+        pendingCount: pendingByPost.get(post.id) ?? 0,
+      };
+    });
   }
 
   /** One post with its squad — who is playing, not just how many. */
@@ -78,18 +93,38 @@ export class GamePostsService {
         venue: { select: { id: true, name: true, address: true, city: true } },
         participants: {
           orderBy: { joinedAt: 'asc' },
-          select: { name: true, joinedAt: true, userId: true },
+          select: { id: true, name: true, phone: true, joinedAt: true, userId: true, status: true },
         },
       },
     });
     if (!post) throw new NotFoundException('Game not found');
     const { participants, ...rest } = post;
+    const squad = participants.filter((x) => x.status === 'joined');
+    const myRow = userId ? participants.find((x) => x.userId === userId) : undefined;
     return {
       ...rest,
       date: post.date,
-      participants: participants.map((x) => ({ name: x.name, joinedAt: x.joinedAt })),
-      joined: userId ? participants.some((x) => x.userId === userId) : false,
-      _count: { participants: participants.length },
+      participants: squad.map((x) => ({ name: x.name, joinedAt: x.joinedAt })),
+      // Only the host sees who is asking to join.
+      pendingRequests:
+        userId === post.creatorId
+          ? participants
+              .filter((x) => x.status === 'pending')
+              .map((x) => ({
+                id: x.id,
+                name: x.name,
+                phone: x.phone,
+                joinedAt: x.joinedAt,
+              }))
+          : undefined,
+      joined: myRow?.status === 'joined',
+      joinState:
+        myRow?.status === 'joined'
+          ? 'joined'
+          : myRow?.status === 'pending'
+            ? 'pending'
+            : 'none',
+      _count: { participants: squad.length },
     };
   }
 
@@ -194,7 +229,7 @@ export class GamePostsService {
   async update(postId: string, userId: string, dto: UpdateGamePostDto) {
     const post = await this.prisma.gamePost.findUnique({
       where: { id: postId },
-      include: { _count: { select: { participants: true } } },
+      include: { _count: { select: { participants: { where: { status: 'joined' } } } } },
     });
     if (!post) throw new NotFoundException('Game not found');
     if (post.creatorId !== userId) {
@@ -231,7 +266,9 @@ export class GamePostsService {
       await tx.$queryRaw`SELECT "id" FROM "GamePost" WHERE "id" = ${postId} FOR UPDATE`;
       const post = await tx.gamePost.findUnique({
         where: { id: postId },
-        include: { _count: { select: { participants: true } } },
+        include: {
+          _count: { select: { participants: { where: { status: 'joined' } } } },
+        },
       });
       if (!post) throw new NotFoundException('Game not found');
       if (post.creatorId === user.id) {
@@ -250,12 +287,20 @@ export class GamePostsService {
       const existing = await tx.gameParticipant.findFirst({
         where: { postId, userId: user.id },
       });
-      if (existing) throw new ConflictException('You have already joined this game');
+      if (existing) {
+        throw new ConflictException(
+          existing.status === 'pending'
+            ? 'You have already asked to join this game'
+            : 'You have already joined this game',
+        );
+      }
       if (post._count.participants >= post.playersNeeded) {
         throw new ConflictException('This game is full');
       }
       // Identity comes from the account, never from the request body —
       // a joiner can't appear in the squad under someone else's name.
+      // Joining is a REQUEST: the host (booking owner) accepts players
+      // in — the row sits 'pending' until then and takes no spot.
       const me = await tx.user.findUnique({
         where: { id: user.id },
         select: { name: true, phone: true },
@@ -266,14 +311,9 @@ export class GamePostsService {
           userId: user.id,
           name: me?.name || 'Player',
           phone: me?.phone,
+          status: 'pending',
         },
       });
-      if (post._count.participants + 1 >= post.playersNeeded) {
-        await tx.gamePost.update({
-          where: { id: postId },
-          data: { status: 'full' },
-        });
-      }
       return { participant, post };
     });
 
@@ -283,6 +323,99 @@ export class GamePostsService {
         .catch(() => {});
     }
     return result.participant;
+  }
+
+  /** Host accepts a pending request into the squad. */
+  async acceptRequest(postId: string, hostId: string, participantId: string) {
+    const result = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "GamePost" WHERE "id" = ${postId} FOR UPDATE`;
+      const post = await tx.gamePost.findUnique({
+        where: { id: postId },
+        include: {
+          _count: { select: { participants: { where: { status: 'joined' } } } },
+        },
+      });
+      if (!post) throw new NotFoundException('Game not found');
+      if (post.creatorId !== hostId) {
+        throw new ForbiddenException('Only the host can accept players');
+      }
+      const row = await tx.gameParticipant.findUnique({
+        where: { id: participantId },
+      });
+      if (!row || row.postId !== postId || row.status !== 'pending') {
+        throw new NotFoundException('Request not found');
+      }
+      if (post._count.participants >= post.playersNeeded) {
+        throw new ConflictException('This game is full');
+      }
+      const accepted = await tx.gameParticipant.update({
+        where: { id: participantId },
+        data: { status: 'joined' },
+      });
+      let declined: { userId: string | null; name: string }[] = [];
+      if (post._count.participants + 1 >= post.playersNeeded) {
+        await tx.gamePost.update({
+          where: { id: postId },
+          data: { status: 'full' },
+        });
+        // Squad complete — the remaining requests are declined kindly.
+        declined = await tx.gameParticipant.findMany({
+          where: { postId, status: 'pending', id: { not: participantId } },
+          select: { userId: true, name: true },
+        });
+        await tx.gameParticipant.deleteMany({
+          where: { postId, status: 'pending' },
+        });
+      }
+      return { post, accepted, declined };
+    });
+
+    if (result.accepted.userId) {
+      await this.notifications
+        .pushToUser(result.accepted.userId, {
+          title: "You're in!",
+          body: `The host accepted you into the ${result.post.sport} game. See you on the field.`,
+          data: { type: 'game_request_accepted' },
+        })
+        .catch(() => {});
+    }
+    for (const d of result.declined) {
+      if (!d.userId) continue;
+      await this.notifications
+        .pushToUser(d.userId, {
+          title: 'Game filled up',
+          body: `The ${result.post.sport} game filled before the host could accept your request.`,
+          data: { type: 'game_request_declined' },
+        })
+        .catch(() => {});
+    }
+    return result.accepted;
+  }
+
+  /** Host declines a pending request. */
+  async rejectRequest(postId: string, hostId: string, participantId: string) {
+    const post = await this.prisma.gamePost.findUnique({ where: { id: postId } });
+    if (!post) throw new NotFoundException('Game not found');
+    if (post.creatorId !== hostId) {
+      throw new ForbiddenException('Only the host can decline players');
+    }
+    const row = await this.prisma.gameParticipant.findUnique({
+      where: { id: participantId },
+    });
+    if (!row || row.postId !== postId || row.status !== 'pending') {
+      throw new NotFoundException('Request not found');
+    }
+    await this.prisma.gameParticipant.delete({ where: { id: participantId } });
+    if (row.userId) {
+      await this.notifications
+        .pushToUser(row.userId, {
+          title: 'Request declined',
+          body: `The host couldn't add you to the ${post.sport} game this time.`,
+          data: { type: 'game_request_declined' },
+        })
+        .catch(() => {});
+    }
+    return { message: 'Request declined' };
   }
 
   async leave(postId: string, userId: string) {

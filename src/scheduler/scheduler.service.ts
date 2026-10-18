@@ -74,7 +74,10 @@ export class SchedulerService {
         startMinutes: { gt: nowMin, lte: nowMin + 120 },
       },
       include: {
-        participants: { select: { userId: true } },
+        participants: {
+          where: { status: 'joined' },
+          select: { userId: true },
+        },
         venue: { select: { name: true } },
       },
     });
