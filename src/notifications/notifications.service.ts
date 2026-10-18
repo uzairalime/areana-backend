@@ -166,10 +166,14 @@ export class NotificationsService {
     });
   }
 
-  async notifyGameJoin(creatorId: string, playerName: string, sport: string) {
+  async notifyGameJoin(creatorId: string, playerName: string, sport: string, pricePerPlayer?: number | null) {
     await this.pushToUser(creatorId, {
       title: 'New join request',
-      body: `${playerName} asked to join your ${sport} game — accept or decline it from the Games board.`,
+      body:
+        `${playerName} asked to join your ${sport} game — accept or decline it from the Games board.` +
+        (pricePerPlayer
+          ? ` Their share is Rs ${pricePerPlayer}, paid to you at the venue.`
+          : ''),
       data: { type: 'game_join_request' },
     });
   }

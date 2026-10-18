@@ -24,6 +24,48 @@ export class GamePostsService {
     private notifications: NotificationsService,
   ) {}
 
+  /**
+   * Money view of a post, from its linked booking: the net court fee and
+   * each player's share of it. Joining players must see this BEFORE they
+   * join — nobody should discover at the venue that they owe money.
+   * Curated posts have no booking, so both fields are null there.
+   */
+  private priceView(post: {
+    squadSize: number | null;
+    playersNeeded: number;
+    booking?: { totalPrice: unknown; discountAmount: unknown } | null;
+  }): { courtFee: number | null; pricePerPlayer: number | null } {
+    if (!post.booking) return { courtFee: null, pricePerPlayer: null };
+    const courtFee = Math.max(
+      0,
+      Number(post.booking.totalPrice) - Number(post.booking.discountAmount),
+    );
+    // The fee splits across the FULL squad: the host's group (squadSize)
+    // plus everyone who joins (playersNeeded). squadSize is always sent
+    // by the booking flows; the +1 fallback counts a lone host.
+    const squad =
+      post.squadSize != null
+        ? post.squadSize + post.playersNeeded
+        : post.playersNeeded + 1;
+    return {
+      courtFee,
+      pricePerPlayer: squad > 0 ? Math.round(courtFee / squad) : null,
+    };
+  }
+
+  /** Price view for one post, freshly read (used by notifications). */
+  private async priceForPost(postId: string) {
+    const post = await this.prisma.gamePost.findUnique({
+      where: { id: postId },
+      include: {
+        booking: { select: { totalPrice: true, discountAmount: true } },
+        _count: { select: { participants: { where: { status: 'joined' } } } },
+      },
+    });
+    if (!post) return { courtFee: null, pricePerPlayer: null };
+    return this.priceView(post);
+  }
+
   async list(query: GamePostQueryDto, userId?: string) {
     const where: Prisma.GamePostWhereInput = { status: 'open' };
     if (query.sport) where.sport = { equals: query.sport, mode: 'insensitive' };
@@ -52,12 +94,22 @@ export class GamePostsService {
       include: {
         creator: { select: { name: true } },
         venue: { select: { id: true, name: true, address: true, city: true } },
+        booking: { select: { totalPrice: true, discountAmount: true } },
         _count: { select: { participants: { where: { status: 'joined' } } } },
       },
       orderBy: [{ isCurated: 'desc' }, { date: 'asc' }, { startMinutes: 'asc' }],
     });
     if (!userId || posts.length === 0) {
-      return posts.map((post) => ({ ...post, joined: false, joinState: 'none' as const, pendingCount: 0 }));
+      return posts.map((post) => {
+        const { booking: _booking, ...rest } = post;
+        return {
+          ...rest,
+          ...this.priceView(post),
+          joined: false,
+          joinState: 'none' as const,
+          pendingCount: 0,
+        };
+      });
     }
     // One query for the requester's participations among these posts —
     // replaces the player web's localStorage joined-tracking.
@@ -75,8 +127,10 @@ export class GamePostsService {
     const pendingByPost = new Map(pending.map((r) => [r.postId, r._count]));
     return posts.map((post) => {
       const state = stateByPost.get(post.id);
+      const { booking: _booking, ...rest } = post;
       return {
-        ...post,
+        ...rest,
+        ...this.priceView(post),
         joined: state === 'joined',
         joinState: state === 'joined' ? 'joined' : state === 'pending' ? 'pending' : 'none',
         pendingCount: pendingByPost.get(post.id) ?? 0,
@@ -91,6 +145,7 @@ export class GamePostsService {
       include: {
         creator: { select: { name: true } },
         venue: { select: { id: true, name: true, address: true, city: true } },
+        booking: { select: { totalPrice: true, discountAmount: true } },
         participants: {
           orderBy: { joinedAt: 'asc' },
           select: { id: true, name: true, phone: true, joinedAt: true, userId: true, status: true },
@@ -98,7 +153,7 @@ export class GamePostsService {
       },
     });
     if (!post) throw new NotFoundException('Game not found');
-    const { participants, ...rest } = post;
+    const { participants, booking: _booking, ...rest } = post;
     const squad = participants.filter((x) => x.status === 'joined');
     const myRow = userId ? participants.find((x) => x.userId === userId) : undefined;
     // Host decision support: who is asking — reliability at a glance.
@@ -135,6 +190,7 @@ export class GamePostsService {
     }
     return {
       ...rest,
+      ...this.priceView(post),
       date: post.date,
       participants: squad.map((x) => ({ name: x.name, joinedAt: x.joinedAt })),
       // Only the host sees who is asking to join.
@@ -305,6 +361,7 @@ export class GamePostsService {
       const post = await tx.gamePost.findUnique({
         where: { id: postId },
         include: {
+          booking: { select: { totalPrice: true, discountAmount: true } },
           _count: { select: { participants: { where: { status: 'joined' } } } },
         },
       });
@@ -378,8 +435,9 @@ export class GamePostsService {
     });
 
     if (result.post.creatorId !== user.id && result.participant.status === 'pending') {
+      const { pricePerPlayer } = this.priceView(result.post);
       await this.notifications
-        .notifyGameJoin(result.post.creatorId, result.participant.name, result.post.sport)
+        .notifyGameJoin(result.post.creatorId, result.participant.name, result.post.sport, pricePerPlayer)
         .catch(() => {});
     }
     return result.participant;
@@ -438,10 +496,13 @@ export class GamePostsService {
     });
 
     if (result.accepted.userId) {
+      const { pricePerPlayer } = await this.priceForPost(postId);
       await this.notifications
         .pushToUser(result.accepted.userId, {
           title: "You're in!",
-          body: `The host accepted you into the ${result.post.sport} game. See you on the field.`,
+          body: pricePerPlayer
+            ? `The host accepted you into the ${result.post.sport} game. You pay Rs ${pricePerPlayer} at the venue — your share of the court fee.`
+            : `The host accepted you into the ${result.post.sport} game. See you on the field.`,
           data: { type: 'game_request_accepted' },
         })
         .catch(() => {});

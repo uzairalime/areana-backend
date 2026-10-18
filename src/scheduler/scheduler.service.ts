@@ -79,18 +79,37 @@ export class SchedulerService {
           select: { userId: true },
         },
         venue: { select: { name: true } },
+        booking: { select: { totalPrice: true, discountAmount: true } },
       },
     });
     for (const g of games) {
       const hh = String(Math.floor(g.startMinutes / 60)).padStart(2, '0');
       const mm = String(g.startMinutes % 60).padStart(2, '0');
+      // Joiners owe their share at the venue — say so while there's
+      // still time to bring cash. The host collects; they get no line.
+      let pricePerPlayer: number | null = null;
+      if (g.booking) {
+        const fee = Math.max(
+          0,
+          Number(g.booking.totalPrice) - Number(g.booking.discountAmount),
+        );
+        const squad =
+          g.squadSize != null
+            ? g.squadSize + g.playersNeeded
+            : g.playersNeeded + 1;
+        if (squad > 0) pricePerPlayer = Math.round(fee / squad);
+      }
       const targets = new Set<string>([g.creatorId]);
       for (const p of g.participants) if (p.userId) targets.add(p.userId);
       for (const uid of targets) {
         await this.notifications
           .pushToUser(uid, {
             title: 'Game reminder',
-            body: `Your ${g.sport} game starts at ${hh}:${mm}${g.venue ? ` at ${g.venue.name}` : ` in ${g.city}`}. See you there!`,
+            body:
+              `Your ${g.sport} game starts at ${hh}:${mm}${g.venue ? ` at ${g.venue.name}` : ` in ${g.city}`}. See you there!` +
+              (uid !== g.creatorId && pricePerPlayer
+                ? ` Bring Rs ${pricePerPlayer} — your share of the court fee, paid at the venue.`
+                : ''),
             data: { type: 'game_reminder' },
           })
           .catch(() => {});
