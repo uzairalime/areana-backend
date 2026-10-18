@@ -920,29 +920,35 @@ export class OwnerService {
         data: { status: 'approved', decidedAt: new Date() },
       }),
     ]);
-    // The old slot just freed up — ping anyone waitlisted for it.
-    const freed = await this.prisma.slotWaitlist.findMany({
-      where: {
-        courtId: req.booking.courtId,
-        date: req.booking.date,
-        startMinutes: req.booking.startMinutes,
-        notifiedAt: null,
-      },
-    });
-    for (const w of freed) {
-      await this.notifications
-        .pushToUser(w.userId, {
-          title: 'A slot just opened up',
-          body: `A slot you were waiting on is free again on ${req.booking.date.toISOString().slice(0, 10)} — first come, first served.`,
-          data: { type: 'slot_opened' },
-        })
-        .catch(() => {});
-    }
-    if (freed.length > 0) {
-      await this.prisma.slotWaitlist.updateMany({
-        where: { id: { in: freed.map((w) => w.id) } },
-        data: { notifiedAt: new Date() },
+    // The old slot just freed up — ping its waitlist (whole old range).
+    for (
+      let s = req.booking.startMinutes;
+      s < req.booking.endMinutes;
+      s += court.slotMinutes
+    ) {
+      const freed = await this.prisma.slotWaitlist.findMany({
+        where: {
+          courtId: req.booking.courtId,
+          date: req.booking.date,
+          startMinutes: s,
+          notifiedAt: null,
+        },
       });
+      for (const w of freed) {
+        await this.notifications
+          .pushToUser(w.userId, {
+            title: 'A slot just opened up',
+            body: `A slot you were waiting on is free again on ${req.booking.date.toISOString().slice(0, 10)} — first come, first served.`,
+            data: { type: 'slot_opened' },
+          })
+          .catch(() => {});
+      }
+      if (freed.length > 0) {
+        await this.prisma.slotWaitlist.updateMany({
+          where: { id: { in: freed.map((w) => w.id) } },
+          data: { notifiedAt: new Date() },
+        });
+      }
     }
     // A linked game post follows its booking to the new time, and the
     // squad hears about the move.

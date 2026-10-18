@@ -3,6 +3,7 @@ import { ApiBearerAuth, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestj
 import { IsOptional, IsString } from 'class-validator';
 import { AuthUser, CurrentUser, RequirePerm } from '../common/auth';
 import { PrismaService } from '../common/prisma';
+import { BookingsService } from '../bookings/bookings.service';
 
 class UpdateMeDto {
   @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
@@ -19,7 +20,10 @@ class DeviceTokenDto {
 @ApiBearerAuth()
 @Controller('users')
 export class UsersController {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private bookings: BookingsService,
+  ) {}
 
   @Get('me')
   getMe(@CurrentUser() user: AuthUser) {
@@ -43,6 +47,15 @@ export class UsersController {
   @Delete('me')
   async deleteMe(@CurrentUser() user: AuthUser) {
     const id = user.id;
+    // Leave nothing live behind: future bookings are cancelled (venue
+    // owners told), hosted games come down, and squad spots are given
+    // back — then the profile itself is anonymized below.
+    await this.bookings.cancelFutureBookings(
+      id,
+      'because the player deleted their account',
+    );
+    await this.bookings.exitGames(id);
+    await this.bookings.deleteHostedPosts(id);
     await this.prisma.$transaction([
       this.prisma.refreshSession.updateMany({
         where: { userId: id, revokedAt: null },

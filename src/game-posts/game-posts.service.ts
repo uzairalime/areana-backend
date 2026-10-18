@@ -101,6 +101,38 @@ export class GamePostsService {
     const { participants, ...rest } = post;
     const squad = participants.filter((x) => x.status === 'joined');
     const myRow = userId ? participants.find((x) => x.userId === userId) : undefined;
+    // Host decision support: who is asking — reliability at a glance.
+    let reliability = new Map<string, { noShowCount: number; gamesPlayed: number }>();
+    if (userId === post.creatorId) {
+      const pendingUserIds = [
+        ...new Set(
+          participants
+            .filter((x) => x.status === 'pending' && x.userId)
+            .map((x) => x.userId!),
+        ),
+      ];
+      if (pendingUserIds.length > 0) {
+        const users = await this.prisma.user.findMany({
+          where: { id: { in: pendingUserIds } },
+          select: { id: true, noShowCount: true },
+        });
+        const played = await this.prisma.booking.groupBy({
+          by: ['userId'],
+          where: { userId: { in: pendingUserIds }, status: 'completed' },
+          _count: true,
+        });
+        const playedByUser = new Map(played.map((r) => [r.userId, r._count]));
+        reliability = new Map(
+          users.map((u) => [
+            u.id,
+            {
+              noShowCount: u.noShowCount,
+              gamesPlayed: playedByUser.get(u.id) ?? 0,
+            },
+          ]),
+        );
+      }
+    }
     return {
       ...rest,
       date: post.date,
@@ -115,6 +147,12 @@ export class GamePostsService {
                 name: x.name,
                 phone: x.phone,
                 joinedAt: x.joinedAt,
+                noShowCount: x.userId
+                  ? (reliability.get(x.userId)?.noShowCount ?? 0)
+                  : 0,
+                gamesPlayed: x.userId
+                  ? (reliability.get(x.userId)?.gamesPlayed ?? 0)
+                  : 0,
               }))
           : undefined,
       joined: myRow?.status === 'joined',
@@ -299,8 +337,24 @@ export class GamePostsService {
       }
       // Identity comes from the account, never from the request body —
       // a joiner can't appear in the squad under someone else's name.
-      // Joining is a REQUEST: the host (booking owner) accepts players
-      // in — the row sits 'pending' until then and takes no spot.
+      // Joining a player-hosted game is a REQUEST: the host accepts
+      // players in, and the row sits 'pending' (no spot) until then.
+      // Curated games are the platform's own — instant join, no host
+      // is standing by to approve anything.
+      if (!post.isCurated) {
+        const pendingMine = await tx.gameParticipant.count({
+          where: {
+            userId: user.id,
+            status: 'pending',
+            post: { date: { gte: startOfToday() } },
+          },
+        });
+        if (pendingMine >= 10) {
+          throw new BadRequestException(
+            'You already have 10 join requests waiting — let hosts respond or withdraw some first',
+          );
+        }
+      }
       const me = await tx.user.findUnique({
         where: { id: user.id },
         select: { name: true, phone: true },
@@ -311,13 +365,19 @@ export class GamePostsService {
           userId: user.id,
           name: me?.name || 'Player',
           phone: me?.phone,
-          status: 'pending',
+          status: post.isCurated ? 'joined' : 'pending',
         },
       });
+      if (post.isCurated && post._count.participants + 1 >= post.playersNeeded) {
+        await tx.gamePost.update({
+          where: { id: postId },
+          data: { status: 'full' },
+        });
+      }
       return { participant, post };
     });
 
-    if (result.post.creatorId !== user.id) {
+    if (result.post.creatorId !== user.id && result.participant.status === 'pending') {
       await this.notifications
         .notifyGameJoin(result.post.creatorId, result.participant.name, result.post.sport)
         .catch(() => {});
@@ -338,6 +398,13 @@ export class GamePostsService {
       if (!post) throw new NotFoundException('Game not found');
       if (post.creatorId !== hostId) {
         throw new ForbiddenException('Only the host can accept players');
+      }
+      const nowA = new Date();
+      if (
+        post.date < startOfToday() ||
+        (isSameDay(post.date, nowA) && post.startMinutes <= minutesSinceMidnight(nowA))
+      ) {
+        throw new BadRequestException('This game has already started');
       }
       const row = await tx.gameParticipant.findUnique({
         where: { id: participantId },

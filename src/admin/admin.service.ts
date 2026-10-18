@@ -154,29 +154,36 @@ export class AdminService {
           }
           await this.prisma.gamePost.delete({ where: { id: post.id } });
         }
-        // Freed slot: ping its waitlist.
-        const waiting = await this.prisma.slotWaitlist.findMany({
-          where: {
-            courtId: b.courtId,
-            date: b.date,
-            startMinutes: b.startMinutes,
-            notifiedAt: null,
-          },
+        // Freed slots: ping the waitlist for every slot in the range.
+        const freedCourt = await this.prisma.court.findUnique({
+          where: { id: b.courtId },
+          select: { slotMinutes: true },
         });
-        for (const w of waiting) {
-          await this.notifications
-            .pushToUser(w.userId, {
-              title: 'A slot just opened up',
-              body: `A slot you were waiting on is free again on ${b.date.toISOString().slice(0, 10)} — first come, first served.`,
-              data: { type: 'slot_opened' },
-            })
-            .catch(() => {});
-        }
-        if (waiting.length > 0) {
-          await this.prisma.slotWaitlist.updateMany({
-            where: { id: { in: waiting.map((w) => w.id) } },
-            data: { notifiedAt: new Date() },
+        const step = freedCourt?.slotMinutes ?? 60;
+        for (let s = b.startMinutes; s < b.endMinutes; s += step) {
+          const waiting = await this.prisma.slotWaitlist.findMany({
+            where: {
+              courtId: b.courtId,
+              date: b.date,
+              startMinutes: s,
+              notifiedAt: null,
+            },
           });
+          for (const w of waiting) {
+            await this.notifications
+              .pushToUser(w.userId, {
+                title: 'A slot just opened up',
+                body: `A slot you were waiting on is free again on ${b.date.toISOString().slice(0, 10)} — first come, first served.`,
+                data: { type: 'slot_opened' },
+              })
+              .catch(() => {});
+          }
+          if (waiting.length > 0) {
+            await this.prisma.slotWaitlist.updateMany({
+              where: { id: { in: waiting.map((w) => w.id) } },
+              data: { notifiedAt: new Date() },
+            });
+          }
         }
         if (b.venue.owner?.email) {
           await this.notifications
@@ -198,6 +205,37 @@ export class AdminService {
           data: { type: 'account_suspended' },
         })
         .catch(() => {});
+      // Pull them out of everyone else's games as well.
+      const participations = await this.prisma.gameParticipant.findMany({
+        where: { userId: id },
+        include: {
+          post: { select: { id: true, creatorId: true, sport: true, status: true } },
+        },
+      });
+      if (participations.length > 0) {
+        await this.prisma.gameParticipant.deleteMany({ where: { userId: id } });
+        const hosts = new Map<string, string>();
+        for (const row of participations) {
+          if (row.status === 'joined' && row.post.creatorId !== id) {
+            hosts.set(row.post.creatorId, row.post.sport);
+            if (row.post.status === 'full') {
+              await this.prisma.gamePost.update({
+                where: { id: row.post.id },
+                data: { status: 'open' },
+              });
+            }
+          }
+        }
+        for (const [hostId, sport] of hosts) {
+          await this.notifications
+            .pushToUser(hostId, {
+              title: 'Squad update',
+              body: `A player left your ${sport} game — their spot is open again.`,
+              data: { type: 'game_roster_changed' },
+            })
+            .catch(() => {});
+        }
+      }
       await this.prisma.refreshSession.updateMany({
         where: { userId: id, revokedAt: null },
         data: { revokedAt: new Date() },
@@ -418,16 +456,26 @@ export class AdminService {
   }
 
   // ------------------------------------------------------------- broadcast
-  /** How many active players a broadcast would target (city optional). */
+  /**
+   * Broadcast reach, honestly: `audience` is every active player, but a
+   * push only lands on players who have a device token (the app) —
+   * `reachable` counts exactly those.
+   */
   async broadcastAudience(city?: string) {
-    const audience = await this.prisma.user.count({
-      where: {
-        status: UserStatus.active,
-        role: { name: 'player' },
-        ...(city ? { city: { equals: city, mode: 'insensitive' } } : {}),
-      },
+    const playerWhere = {
+      status: UserStatus.active,
+      role: { name: 'player' },
+      ...(city
+        ? { city: { equals: city, mode: 'insensitive' as const } }
+        : {}),
+    };
+    const audience = await this.prisma.user.count({ where: playerWhere });
+    const tokenRows = await this.prisma.deviceToken.findMany({
+      where: { user: playerWhere },
+      select: { userId: true },
+      distinct: ['userId'],
     });
-    return { audience };
+    return { audience, reachable: tokenRows.length };
   }
 
   async sendBroadcast(actorId: string, title: string, body: string, city?: string) {

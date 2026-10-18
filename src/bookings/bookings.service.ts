@@ -290,9 +290,9 @@ export class BookingsService {
       await this.cleanupGamePost(b.id, 'The host cancelled their booking, so this game is off.');
       const full = await this.prisma.booking.findUnique({
         where: { id: b.id },
-        select: { courtId: true, date: true, startMinutes: true },
+        select: { courtId: true, date: true, startMinutes: true, endMinutes: true },
       });
-      if (full) await this.notifyWaitlist(full.courtId, full.date, full.startMinutes);
+      if (full) await this.notifyWaitlist(full);
     }
     return { cancelled: res.count };
   }
@@ -356,7 +356,7 @@ export class BookingsService {
       data: { status: BookingStatus.cancelled },
     });
     await this.cleanupGamePost(bookingId, 'The host cancelled their booking, so this game is off.');
-    await this.notifyWaitlist(booking.courtId, booking.date, booking.startMinutes);
+    await this.notifyWaitlist(booking);
     return updated;
   }
 
@@ -418,30 +418,49 @@ export class BookingsService {
    * When a booked slot frees up (cancellation, reschedule-away), tell
    * everyone waitlisted for exactly that slot — first come, first served.
    */
-  async notifyWaitlist(courtId: string, date: Date, startMinutes: number) {
-    const entries = await this.prisma.slotWaitlist.findMany({
-      where: { courtId, date, startMinutes, notifiedAt: null },
-    });
-    if (entries.length === 0) return;
+  async notifyWaitlist(booking: {
+    courtId: string;
+    date: Date;
+    startMinutes: number;
+    endMinutes: number;
+  }) {
     const court = await this.prisma.court.findUnique({
-      where: { id: courtId },
+      where: { id: booking.courtId },
       include: { venue: { select: { name: true } } },
     });
-    const hh = String(Math.floor(startMinutes / 60) % 24).padStart(2, '0');
-    const mm = String(startMinutes % 60).padStart(2, '0');
-    for (const e of entries) {
-      await this.notifications
-        .pushToUser(e.userId, {
-          title: 'A slot just opened up',
-          body: `${court?.venue.name ?? 'A venue'} · ${court?.name ?? 'Court'} on ${date.toISOString().slice(0, 10)} at ${hh}:${mm} is free again — grab it before someone else does.`,
-          data: { type: 'slot_opened' },
-        })
-        .catch(() => {});
+    if (!court) return;
+    // Every slot in the freed range — a 2-hour cancellation frees two
+    // waitlist slots, not just the first.
+    for (
+      let s = booking.startMinutes;
+      s < booking.endMinutes;
+      s += court.slotMinutes
+    ) {
+      const entries = await this.prisma.slotWaitlist.findMany({
+        where: {
+          courtId: booking.courtId,
+          date: booking.date,
+          startMinutes: s,
+          notifiedAt: null,
+        },
+      });
+      if (entries.length === 0) continue;
+      const hh = String(Math.floor(s / 60) % 24).padStart(2, '0');
+      const mm = String(s % 60).padStart(2, '0');
+      for (const e of entries) {
+        await this.notifications
+          .pushToUser(e.userId, {
+            title: 'A slot just opened up',
+            body: `${court.venue.name} · ${court.name} on ${booking.date.toISOString().slice(0, 10)} at ${hh}:${mm} is free again — grab it before someone else does.`,
+            data: { type: 'slot_opened' },
+          })
+          .catch(() => {});
+      }
+      await this.prisma.slotWaitlist.updateMany({
+        where: { id: { in: entries.map((e) => e.id) } },
+        data: { notifiedAt: new Date() },
+      });
     }
-    await this.prisma.slotWaitlist.updateMany({
-      where: { id: { in: entries.map((e) => e.id) } },
-      data: { notifiedAt: new Date() },
-    });
   }
 
   async joinShared(shareCode: string, dto: JoinSharedDto, userId?: string) {
@@ -652,22 +671,21 @@ export class BookingsService {
    * gets an email. (Owner suspensions deliberately do NOT use this —
    * their bookings stand and venues pause; see round-3 policy.)
    */
-  async suspendPlayerWithCascade(userId: string) {
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { status: UserStatus.suspended },
-    });
-    const today = startOfToday();
+  /**
+   * Cancel every future booking of a player, with the full wake: linked
+   * game posts deleted + squads notified, freed slots pinged to their
+   * waitlists, venue owners emailed. Shared by suspension + deletion.
+   * Returns how many bookings were cancelled.
+   */
+  async cancelFutureBookings(userId: string, ownerNote: string) {
     const future = await this.prisma.booking.findMany({
       where: {
         userId,
-        date: { gte: today },
+        date: { gte: startOfToday() },
         status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
       },
       include: {
-        venue: {
-          select: { name: true, owner: { select: { email: true } } },
-        },
+        venue: { select: { name: true, owner: { select: { email: true } } } },
       },
     });
     for (const b of future) {
@@ -675,28 +693,116 @@ export class BookingsService {
         where: { id: b.id },
         data: { status: BookingStatus.cancelled },
       });
-      await this.cleanupGamePost(b.id, "The host's account was suspended, so this game is off.");
-      const fullB = await this.prisma.booking.findUnique({
-        where: { id: b.id },
-        select: { courtId: true, date: true, startMinutes: true },
-      });
-      if (fullB) await this.notifyWaitlist(fullB.courtId, fullB.date, fullB.startMinutes);
+      await this.cleanupGamePost(b.id, 'This game is off — the host is no longer on Areana.');
+      await this.notifyWaitlist(b);
       if (b.venue.owner?.email) {
         await this.notifications
           .notifyOwnerNewBooking(
             b.venue.owner.email,
             b.venue.name,
-            `A booking on ${b.date.toISOString().slice(0, 10)} was cancelled because the player's account was suspended.`,
+            `A booking on ${b.date.toISOString().slice(0, 10)} was cancelled ${ownerNote}.`,
           )
           .catch(() => {});
       }
     }
+    return future.length;
+  }
+
+  /**
+   * Pull a player out of every game they joined or asked to join:
+   * squad spots reopen (full games go back to open) and hosts hear
+   * about it. Used by suspension and account deletion.
+   */
+  async exitGames(userId: string) {
+    const rows = await this.prisma.gameParticipant.findMany({
+      where: { userId },
+      include: {
+        post: {
+          select: {
+            id: true,
+            creatorId: true,
+            sport: true,
+            status: true,
+            date: true,
+            startMinutes: true,
+          },
+        },
+      },
+    });
+    if (rows.length === 0) return;
+    await this.prisma.gameParticipant.deleteMany({ where: { userId } });
+    const byPost = new Map<string, { post: (typeof rows)[number]['post']; wasJoined: boolean }>();
+    for (const r of rows) {
+      const cur = byPost.get(r.post.id);
+      byPost.set(r.post.id, {
+        post: r.post,
+        wasJoined: (cur?.wasJoined ?? false) || r.status === 'joined',
+      });
+    }
+    const now = new Date();
+    for (const { post, wasJoined } of byPost.values()) {
+      if (!wasJoined) continue;
+      const started =
+        post.date < startOfToday() ||
+        (isSameDay(post.date, now) && post.startMinutes <= minutesSinceMidnight(now));
+      if (post.status === 'full' && !started) {
+        await this.prisma.gamePost.update({
+          where: { id: post.id },
+          data: { status: 'open' },
+        });
+      }
+      if (post.creatorId !== userId) {
+        await this.notifications
+          .pushToUser(post.creatorId, {
+            title: 'Squad update',
+            body: `A player left your ${post.sport} game — their spot is open again.`,
+            data: { type: 'game_roster_changed' },
+          })
+          .catch(() => {});
+      }
+    }
+  }
+
+  /** Delete any game posts the player still hosts (squads notified). */
+  async deleteHostedPosts(userId: string) {
+    const posts = await this.prisma.gamePost.findMany({
+      where: { creatorId: userId },
+      select: { id: true, sport: true },
+    });
+    for (const post of posts) {
+      const squad = await this.prisma.gameParticipant.findMany({
+        where: { postId: post.id, userId: { not: null } },
+        select: { userId: true },
+      });
+      for (const s of squad) {
+        await this.notifications
+          .pushToUser(s.userId!, {
+            title: 'Game cancelled',
+            body: `The ${post.sport} game you were in was removed — the host left Areana.`,
+            data: { type: 'game_cancelled' },
+          })
+          .catch(() => {});
+      }
+      await this.prisma.gamePost.delete({ where: { id: post.id } });
+    }
+  }
+
+  async suspendPlayerWithCascade(userId: string) {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { status: UserStatus.suspended },
+    });
+    const cancelledCount = await this.cancelFutureBookings(
+      userId,
+      "because the player's account was suspended",
+    );
+    await this.exitGames(userId);
     await this.notifications
       .pushToUser(userId, {
         title: 'Account suspended',
         body:
-          future.length > 0
-            ? `Your Areana account has been suspended and your ${future.length} upcoming booking${future.length === 1 ? ' was' : 's were'} cancelled.`
+          cancelledCount > 0
+            ? `Your Areana account has been suspended and your ${cancelledCount} upcoming booking${cancelledCount === 1 ? ' was' : 's were'} cancelled.`
             : 'Your Areana account has been suspended.',
         data: { type: 'account_suspended' },
       })
@@ -720,7 +826,7 @@ export class BookingsService {
       data: { status: BookingStatus.cancelled },
     });
     await this.cleanupGamePost(bookingId, 'The venue cancelled the booking, so this game is off.');
-    await this.notifyWaitlist(booking.courtId, booking.date, booking.startMinutes);
+    await this.notifyWaitlist(booking);
     return updated;
   }
 
