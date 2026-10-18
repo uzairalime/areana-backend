@@ -18,6 +18,16 @@ export class QueryVenuesDto {
   @IsString()
   q?: string;
 
+  @ApiPropertyOptional({ example: 'AstroTurf', description: 'Court surface (matches an active court)' })
+  @IsOptional()
+  @IsString()
+  surface?: string;
+
+  @ApiPropertyOptional({ enum: ['rating', 'price_asc', 'price_desc', 'name'], default: 'rating' })
+  @IsOptional()
+  @IsString()
+  sort?: string;
+
   @ApiPropertyOptional({ default: 1 })
   @IsOptional()
   @Type(() => Number)

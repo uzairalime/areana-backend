@@ -22,6 +22,13 @@ export class VenuesController {
     return this.venues.cities();
   }
 
+  /** Distinct court surfaces across approved venues (for filter dropdowns). */
+  @Public()
+  @Get('surfaces')
+  surfaces() {
+    return this.venues.surfaces();
+  }
+
   @Public()
   @Get(':id')
   getById(@Param('id') id: string) {

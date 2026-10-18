@@ -9,7 +9,7 @@ export class VenuesService {
 
   // Public listing — only approved venues are visible to players.
   async list(query: QueryVenuesDto) {
-    const { q, city, sport, page = 1, limit = 20 } = query;
+    const { q, city, sport, surface, sort, page = 1, limit = 20 } = query;
     // A suspended owner's venues are paused: hidden from players and
     // unbookable until the owner is reactivated (no state to unwind —
     // the owner's status is the single switch).
@@ -20,6 +20,11 @@ export class VenuesService {
     };
     if (city) where.city = { equals: city, mode: 'insensitive' };
     if (sport) where.sports = { has: sport };
+    if (surface) {
+      where.courts = {
+        some: { isActive: true, surface: { equals: surface, mode: 'insensitive' } },
+      };
+    }
     if (q) {
       where.OR = [
         { name: { contains: q, mode: 'insensitive' } },
@@ -27,25 +32,32 @@ export class VenuesService {
       ];
     }
 
-    const [total, data] = await Promise.all([
-      this.prisma.venue.count({ where }),
-      this.prisma.venue.findMany({
-        where,
-        include: {
-          _count: { select: { courts: true } },
-          badges: { include: { badge: true }, orderBy: { badge: { tier: 'desc' } } },
-          courts: {
-            where: { isActive: true },
-            select: {
-              pricePerHour: true,
-              priceWindows: { select: { pricePerHour: true } },
-            },
+    // Price sorts need the computed fromPrice, so they page in memory
+    // over the (bounded) matching set; the rest page in the database.
+    const priceSort = sort === 'price_asc' || sort === 'price_desc';
+    const orderBy: Prisma.VenueOrderByWithRelationInput =
+      sort === 'name' ? { name: 'asc' } : { rating: 'desc' };
+    const findArgs: Prisma.VenueFindManyArgs = {
+      where,
+      include: {
+        _count: { select: { courts: true } },
+        badges: { include: { badge: true }, orderBy: { badge: { tier: 'desc' } } },
+        courts: {
+          where: { isActive: true },
+          select: {
+            pricePerHour: true,
+            priceWindows: { select: { pricePerHour: true } },
           },
         },
-        orderBy: { rating: 'desc' },
-        skip: (page - 1) * limit,
-        take: limit,
-      }),
+      },
+      orderBy,
+      ...(priceSort
+        ? { take: 500 }
+        : { skip: (page - 1) * limit, take: limit }),
+    };
+    const [total, data] = await Promise.all([
+      this.prisma.venue.count({ where }),
+      this.prisma.venue.findMany(findArgs),
     ]);
     // fromPrice = the cheapest hour a player could actually pay at this
     // venue: the minimum over active courts of (base rate, any special
@@ -66,7 +78,39 @@ export class VenuesService {
         fromPrice: rates.length ? Math.min(...rates) : null,
       };
     });
+    if (priceSort) {
+      const dir = sort === 'price_asc' ? 1 : -1;
+      shaped.sort(
+        (a: any, b: any) =>
+          ((a.fromPrice ?? Number.MAX_SAFE_INTEGER) -
+            (b.fromPrice ?? Number.MAX_SAFE_INTEGER)) *
+          dir,
+      );
+      return {
+        total,
+        page,
+        limit,
+        data: shaped.slice((page - 1) * limit, page * limit),
+      };
+    }
     return { total, page, limit, data: shaped };
+  }
+
+  /** Distinct court surfaces across approved venues (for the filter dock). */
+  async surfaces(): Promise<string[]> {
+    const rows = await this.prisma.court.findMany({
+      where: {
+        isActive: true,
+        surface: { not: null },
+        venue: { status: VenueStatus.approved, archivedAt: null, owner: { status: UserStatus.active } },
+      },
+      select: { surface: true },
+      distinct: ['surface'],
+    });
+    return rows
+      .map((r) => r.surface)
+      .filter((x): x is string => !!x && x.trim().length > 0)
+      .sort((a, b) => a.localeCompare(b));
   }
 
   /** Distinct cities with at least one approved venue, A-Z. */

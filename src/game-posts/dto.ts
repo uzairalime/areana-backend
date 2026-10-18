@@ -55,6 +55,12 @@ export class CreateGamePostDto {
   @Max(50)
   playersNeeded: number;
 
+  @ApiPropertyOptional({ example: 'Intermediate', description: 'Skill level shown on the board (e.g. Casual, Intermediate, Competitive)' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  level?: string;
+
   @ApiPropertyOptional({ example: 'Need a goalkeeper' })
   @IsOptional()
   @IsString()
@@ -76,6 +82,12 @@ export class UpdateGamePostDto {
   @Min(1)
   @Max(50)
   squadSize?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  level?: string;
 
   @ApiPropertyOptional()
   @IsOptional()

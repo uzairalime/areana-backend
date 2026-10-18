@@ -94,17 +94,35 @@ export class GamePostsService {
       include: {
         creator: { select: { name: true } },
         venue: { select: { id: true, name: true, address: true, city: true } },
-        booking: { select: { totalPrice: true, discountAmount: true } },
+        booking: {
+          select: {
+            totalPrice: true,
+            discountAmount: true,
+            court: { select: { name: true, size: true } },
+          },
+        },
+        participants: {
+          where: { status: 'joined' },
+          orderBy: { joinedAt: 'asc' },
+          take: 4,
+          select: { name: true },
+        },
         _count: { select: { participants: { where: { status: 'joined' } } } },
       },
       orderBy: [{ isCurated: 'desc' }, { date: 'asc' }, { startMinutes: 'asc' }],
     });
     if (!userId || posts.length === 0) {
       return posts.map((post) => {
-        const { booking: _booking, ...rest } = post;
+        const { booking: _booking, participants: preview, ...rest } = post;
         return {
           ...rest,
           ...this.priceView(post),
+          squadNames: [
+            post.creator.name,
+            ...preview.map((x) => x.name),
+          ],
+          courtName: post.booking?.court?.name ?? null,
+          courtSize: post.booking?.court?.size ?? null,
           joined: false,
           joinState: 'none' as const,
           pendingCount: 0,
@@ -127,10 +145,13 @@ export class GamePostsService {
     const pendingByPost = new Map(pending.map((r) => [r.postId, r._count]));
     return posts.map((post) => {
       const state = stateByPost.get(post.id);
-      const { booking: _booking, ...rest } = post;
+      const { booking: _booking, participants: preview, ...rest } = post;
       return {
         ...rest,
         ...this.priceView(post),
+        squadNames: [post.creator.name, ...preview.map((x) => x.name)],
+        courtName: post.booking?.court?.name ?? null,
+        courtSize: post.booking?.court?.size ?? null,
         joined: state === 'joined',
         joinState: state === 'joined' ? 'joined' : state === 'pending' ? 'pending' : 'none',
         pendingCount: pendingByPost.get(post.id) ?? 0,
@@ -145,7 +166,13 @@ export class GamePostsService {
       include: {
         creator: { select: { name: true } },
         venue: { select: { id: true, name: true, address: true, city: true } },
-        booking: { select: { totalPrice: true, discountAmount: true } },
+        booking: {
+          select: {
+            totalPrice: true,
+            discountAmount: true,
+            court: { select: { name: true, size: true } },
+          },
+        },
         participants: {
           orderBy: { joinedAt: 'asc' },
           select: { id: true, name: true, phone: true, joinedAt: true, userId: true, status: true },
@@ -191,6 +218,9 @@ export class GamePostsService {
     return {
       ...rest,
       ...this.priceView(post),
+      squadNames: [post.creator.name, ...squad.map((x) => x.name)],
+      courtName: post.booking?.court?.name ?? null,
+      courtSize: post.booking?.court?.size ?? null,
       date: post.date,
       participants: squad.map((x) => ({ name: x.name, joinedAt: x.joinedAt })),
       // Only the host sees who is asking to join.
@@ -270,6 +300,7 @@ export class GamePostsService {
           startMinutes: booking.startMinutes,
           playersNeeded: dto.playersNeeded,
           squadSize: dto.squadSize ?? null,
+          level: dto.level?.trim() || null,
           note: dto.note,
         },
       });
@@ -312,6 +343,7 @@ export class GamePostsService {
         startMinutes: dto.startMinutes,
         playersNeeded: dto.playersNeeded,
         squadSize: dto.squadSize ?? null,
+        level: dto.level?.trim() || null,
         note: dto.note,
         isCurated: true,
         curatedById: user.id,
@@ -343,6 +375,7 @@ export class GamePostsService {
           ? { playersNeeded: dto.playersNeeded }
           : {}),
         ...(dto.squadSize !== undefined ? { squadSize: dto.squadSize } : {}),
+        ...(dto.level !== undefined ? { level: dto.level?.trim() || null } : {}),
         ...(dto.note !== undefined ? { note: dto.note } : {}),
         // Keep open/full honest after the numbers move.
         ...(post.status !== 'closed'
