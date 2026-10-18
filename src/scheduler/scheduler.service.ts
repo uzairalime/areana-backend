@@ -65,6 +65,30 @@ export class SchedulerService {
     }
   }
 
+  /**
+   * Nightly housekeeping: auth tables grow on every login/refresh/OTP —
+   * drop expired sessions, week-old revocations and day-old OTP rows.
+   */
+  @Cron('0 3 * * *')
+  async pruneAuthData() {
+    const now = new Date();
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 3600_000);
+    const dayAgo = new Date(now.getTime() - 24 * 3600_000);
+    const sessions = await this.prisma.refreshSession.deleteMany({
+      where: {
+        OR: [{ expiresAt: { lt: now } }, { revokedAt: { lt: weekAgo } }],
+      },
+    });
+    const otps = await this.prisma.otpCode.deleteMany({
+      where: { expiresAt: { lt: dayAgo } },
+    });
+    if (sessions.count > 0 || otps.count > 0) {
+      this.logger.log(
+        `Pruned ${sessions.count} refresh sessions, ${otps.count} OTP rows`,
+      );
+    }
+  }
+
   /** Nightly: complete past bookings, pay out referral rewards, recompute badges. */
   @Cron('0 2 * * *')
   async nightly() {

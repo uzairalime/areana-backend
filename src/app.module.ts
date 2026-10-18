@@ -30,7 +30,13 @@ import { HealthModule } from './health/health.module';
 
 @Module({
   imports: [
-    ThrottlerModule.forRoot([{ ttl: 60000, limit: 300 }]),
+    // NOTE (scaling): the default throttler store is in-memory per
+    // process — correct for the single-container VPS deployment. If the
+    // API ever runs 2+ instances, swap in a shared (Redis) store or the
+    // limits multiply per instance. THROTTLE_LIMIT tunes without a deploy.
+    ThrottlerModule.forRoot([
+      { ttl: 60000, limit: parseInt(process.env.THROTTLE_LIMIT ?? '300', 10) },
+    ]),
     ConfigModule.forRoot({ isGlobal: true, load: [configuration], validationSchema }),
     PrismaModule, // @Global
     NotificationsModule, // @Global (email + push)

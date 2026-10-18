@@ -10,6 +10,15 @@ async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
   const config = app.get(ConfigService);
 
+  // Behind a reverse proxy (production VPS: nginx/Caddy), Express must
+  // trust X-Forwarded-For or every visitor shares the proxy's IP — which
+  // would pool the rate limits and the per-IP OTP cap across all users.
+  // Set TRUST_PROXY=1 in production only; off in local dev.
+  const trustProxy = process.env.TRUST_PROXY;
+  if (trustProxy) {
+    app.set('trust proxy', trustProxy === 'true' ? true : Number(trustProxy) || trustProxy);
+  }
+
   app.setGlobalPrefix('api');
   app.useGlobalPipes(
     new ValidationPipe({ whitelist: true, transform: true, forbidNonWhitelisted: false }),
