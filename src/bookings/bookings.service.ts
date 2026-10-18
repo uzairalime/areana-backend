@@ -273,15 +273,22 @@ export class BookingsService {
   }
 
   async cancelRecurringSeries(userId: string, recurrenceId: string) {
-    const res = await this.prisma.booking.updateMany({
+    const affected = await this.prisma.booking.findMany({
       where: {
         recurrenceId,
         userId,
         status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
         date: { gte: startOfToday() },
       },
+      select: { id: true },
+    });
+    const res = await this.prisma.booking.updateMany({
+      where: { id: { in: affected.map((b) => b.id) } },
       data: { status: BookingStatus.cancelled },
     });
+    for (const b of affected) {
+      await this.cleanupGamePost(b.id, 'The host cancelled their booking, so this game is off.');
+    }
     return { cancelled: res.count };
   }
 
@@ -310,6 +317,15 @@ export class BookingsService {
         // images/photos power the venue photo on the player's booking
         // cards — without them the cards rendered placeholders forever.
         venue: { select: { name: true, address: true, city: true, lat: true, lng: true, images: true, photos: true } },
+        gamePost: {
+          select: {
+            id: true,
+            playersNeeded: true,
+            squadSize: true,
+            status: true,
+            _count: { select: { participants: true } },
+          },
+        },
         _count: { select: { participants: true } },
       },
       orderBy: [{ date: 'asc' }, { startMinutes: 'asc' }],
@@ -328,10 +344,12 @@ export class BookingsService {
       (isSameDay(booking.date, now) && booking.startMinutes <= minutesSinceMidnight(now));
     if (started) throw new BadRequestException('Cannot cancel a slot that already started');
 
-    return this.prisma.booking.update({
+    const updated = await this.prisma.booking.update({
       where: { id: bookingId },
       data: { status: BookingStatus.cancelled },
     });
+    await this.cleanupGamePost(bookingId, 'The host cancelled their booking, so this game is off.');
+    return updated;
   }
 
   // ------------------------------------------------------------------ share
@@ -361,6 +379,31 @@ export class BookingsService {
     }
     const { checkInCode: _c, ...safe } = booking as any;
     return safe;
+  }
+
+  /**
+   * A game post lives and dies with its booking: when the booking is
+   * cancelled, delete the post and tell everyone who joined it.
+   */
+  async cleanupGamePost(bookingId: string, reason: string) {
+    const post = await this.prisma.gamePost.findUnique({
+      where: { bookingId },
+    });
+    if (!post) return;
+    const squad = await this.prisma.gameParticipant.findMany({
+      where: { postId: post.id, userId: { not: null } },
+      select: { userId: true },
+    });
+    for (const s of squad) {
+      await this.notifications
+        .pushToUser(s.userId!, {
+          title: 'Game cancelled',
+          body: reason,
+          data: { type: 'game_cancelled' },
+        })
+        .catch(() => {});
+    }
+    await this.prisma.gamePost.delete({ where: { id: post.id } });
   }
 
   async joinShared(shareCode: string, dto: JoinSharedDto, userId?: string) {
@@ -594,6 +637,7 @@ export class BookingsService {
         where: { id: b.id },
         data: { status: BookingStatus.cancelled },
       });
+      await this.cleanupGamePost(b.id, "The host's account was suspended, so this game is off.");
       if (b.venue.owner?.email) {
         await this.notifications
           .notifyOwnerNewBooking(
@@ -628,10 +672,12 @@ export class BookingsService {
     if (!UPCOMING.includes(booking.status)) {
       throw new BadRequestException('Only upcoming bookings can be cancelled');
     }
-    return this.prisma.booking.update({
+    const updated = await this.prisma.booking.update({
       where: { id: bookingId },
       data: { status: BookingStatus.cancelled },
     });
+    await this.cleanupGamePost(bookingId, 'The venue cancelled the booking, so this game is off.');
+    return updated;
   }
 
   private async getPending(bookingId: string) {

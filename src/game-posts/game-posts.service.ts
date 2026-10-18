@@ -14,7 +14,7 @@ import {
   parseDateOnly,
   startOfToday,
 } from '../common/date.util';
-import { CreateGamePostDto, GamePostQueryDto, JoinGamePostDto } from './dto';
+import { CreateGamePostDto, GamePostQueryDto, UpdateGamePostDto } from './dto';
 import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
@@ -93,7 +93,67 @@ export class GamePostsService {
     };
   }
 
-  create(userId: string, dto: CreateGamePostDto) {
+  /**
+   * Players post ONLY from their own confirmed bookings: venue, court,
+   * sport, date and start time all derive from the booking, so a post is
+   * always a real booked court. Super admins keep a free-form path for
+   * curated posts (venue still validated when one is attached).
+   */
+  async create(user: AuthUser, dto: CreateGamePostDto) {
+    if (dto.bookingId) {
+      const booking = await this.prisma.booking.findUnique({
+        where: { id: dto.bookingId },
+        include: {
+          venue: { select: { city: true } },
+          court: { select: { sport: true } },
+        },
+      });
+      if (!booking || booking.userId !== user.id) {
+        throw new NotFoundException('Booking not found');
+      }
+      if (booking.status !== 'confirmed') {
+        throw new BadRequestException(
+          'You can find players once this booking is confirmed',
+        );
+      }
+      const now = new Date();
+      if (
+        booking.date < startOfToday() ||
+        (isSameDay(booking.date, now) &&
+          booking.startMinutes <= minutesSinceMidnight(now))
+      ) {
+        throw new BadRequestException('This booking has already started');
+      }
+      const existing = await this.prisma.gamePost.findUnique({
+        where: { bookingId: booking.id },
+      });
+      if (existing) {
+        throw new ConflictException('This booking already has a game post');
+      }
+      return this.prisma.gamePost.create({
+        data: {
+          creatorId: user.id,
+          bookingId: booking.id,
+          venueId: booking.venueId,
+          sport: booking.court.sport,
+          city: booking.venue.city,
+          date: booking.date,
+          startMinutes: booking.startMinutes,
+          playersNeeded: dto.playersNeeded,
+          squadSize: dto.squadSize ?? null,
+          note: dto.note,
+        },
+      });
+    }
+
+    if (user.roleName !== 'super_admin') {
+      throw new BadRequestException(
+        'Games are posted from your bookings — book a court first, then find players from the booking',
+      );
+    }
+    if (!dto.sport || !dto.city || !dto.date || dto.startMinutes === undefined) {
+      throw new BadRequestException('sport, city, date and startMinutes are required');
+    }
     const date = parseDateOnly(dto.date);
     const now = new Date();
     if (date < startOfToday()) {
@@ -102,74 +162,127 @@ export class GamePostsService {
     if (isSameDay(date, now) && dto.startMinutes <= minutesSinceMidnight(now)) {
       throw new BadRequestException('That start time has already passed today');
     }
+    let city = dto.city;
+    if (dto.venueId) {
+      const venue = await this.prisma.venue.findUnique({
+        where: { id: dto.venueId },
+        include: { owner: { select: { status: true } } },
+      });
+      if (!venue || venue.status !== 'approved' || venue.owner.status !== 'active') {
+        throw new BadRequestException('That venue is not bookable right now');
+      }
+      city = venue.city;
+    }
     return this.prisma.gamePost.create({
       data: {
-        creatorId: userId,
+        creatorId: user.id,
         sport: dto.sport,
-        city: dto.city,
+        city,
         venueId: dto.venueId,
         date,
         startMinutes: dto.startMinutes,
         playersNeeded: dto.playersNeeded,
+        squadSize: dto.squadSize ?? null,
         note: dto.note,
+        isCurated: true,
+        curatedById: user.id,
       },
     });
   }
 
-  async join(postId: string, user: AuthUser, dto: JoinGamePostDto) {
+  /** Host edits: squad numbers and note only — time follows the booking. */
+  async update(postId: string, userId: string, dto: UpdateGamePostDto) {
     const post = await this.prisma.gamePost.findUnique({
       where: { id: postId },
       include: { _count: { select: { participants: true } } },
     });
     if (!post) throw new NotFoundException('Game not found');
-    if (post.creatorId === user.id) {
-      throw new BadRequestException("You created this game — you're already hosting it");
+    if (post.creatorId !== userId) {
+      throw new ForbiddenException('Only the host can edit this game');
     }
-    if (post.status !== 'open') throw new BadRequestException('This game is no longer open');
-
-    const now = new Date();
-    if (
-      post.date < startOfToday() ||
-      (isSameDay(post.date, now) && post.startMinutes <= minutesSinceMidnight(now))
-    ) {
-      throw new BadRequestException('This game has already started');
+    const joined = post._count.participants;
+    if (dto.playersNeeded !== undefined && dto.playersNeeded < joined) {
+      throw new BadRequestException(
+        `${joined} players have already joined — players needed can't go below that`,
+      );
     }
-
-    const existing = await this.prisma.gameParticipant.findFirst({
-      where: { postId, userId: user.id },
-    });
-    if (existing) throw new ConflictException('You have already joined this game');
-    if (post._count.participants >= post.playersNeeded) {
-      throw new ConflictException('This game is full');
-    }
-
-    const me = await this.prisma.user.findUnique({
-      where: { id: user.id },
-      select: { name: true, phone: true },
-    });
-    const participant = await this.prisma.gameParticipant.create({
+    const needed = dto.playersNeeded ?? post.playersNeeded;
+    return this.prisma.gamePost.update({
+      where: { id: postId },
       data: {
-        postId,
-        userId: user.id,
-        name: dto.name || me?.name || 'Player',
-        phone: dto.phone || me?.phone,
+        ...(dto.playersNeeded !== undefined
+          ? { playersNeeded: dto.playersNeeded }
+          : {}),
+        ...(dto.squadSize !== undefined ? { squadSize: dto.squadSize } : {}),
+        ...(dto.note !== undefined ? { note: dto.note } : {}),
+        // Keep open/full honest after the numbers move.
+        ...(post.status !== 'closed'
+          ? { status: joined >= needed ? 'full' : 'open' }
+          : {}),
       },
     });
+  }
 
-    if (post._count.participants + 1 >= post.playersNeeded) {
-      await this.prisma.gamePost.update({
+  async join(postId: string, user: AuthUser) {
+    // Transaction + row lock: the count check and the insert must be
+    // atomic, otherwise two players racing for the last spot both pass
+    // the check and the game overfills.
+    const result = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "GamePost" WHERE "id" = ${postId} FOR UPDATE`;
+      const post = await tx.gamePost.findUnique({
         where: { id: postId },
-        data: { status: 'full' },
+        include: { _count: { select: { participants: true } } },
       });
-    }
+      if (!post) throw new NotFoundException('Game not found');
+      if (post.creatorId === user.id) {
+        throw new BadRequestException("You created this game — you're already hosting it");
+      }
+      if (post.status !== 'open') {
+        throw new BadRequestException('This game is no longer open');
+      }
+      const now = new Date();
+      if (
+        post.date < startOfToday() ||
+        (isSameDay(post.date, now) && post.startMinutes <= minutesSinceMidnight(now))
+      ) {
+        throw new BadRequestException('This game has already started');
+      }
+      const existing = await tx.gameParticipant.findFirst({
+        where: { postId, userId: user.id },
+      });
+      if (existing) throw new ConflictException('You have already joined this game');
+      if (post._count.participants >= post.playersNeeded) {
+        throw new ConflictException('This game is full');
+      }
+      // Identity comes from the account, never from the request body —
+      // a joiner can't appear in the squad under someone else's name.
+      const me = await tx.user.findUnique({
+        where: { id: user.id },
+        select: { name: true, phone: true },
+      });
+      const participant = await tx.gameParticipant.create({
+        data: {
+          postId,
+          userId: user.id,
+          name: me?.name || 'Player',
+          phone: me?.phone,
+        },
+      });
+      if (post._count.participants + 1 >= post.playersNeeded) {
+        await tx.gamePost.update({
+          where: { id: postId },
+          data: { status: 'full' },
+        });
+      }
+      return { participant, post };
+    });
 
-    // Notify the game creator (not when they join their own game).
-    if (post.creatorId !== user.id) {
+    if (result.post.creatorId !== user.id) {
       await this.notifications
-        .notifyGameJoin(post.creatorId, participant.name, post.sport)
+        .notifyGameJoin(result.post.creatorId, result.participant.name, result.post.sport)
         .catch(() => {});
     }
-    return participant;
+    return result.participant;
   }
 
   async leave(postId: string, userId: string) {
@@ -178,11 +291,20 @@ export class GamePostsService {
     });
     if (!participant) throw new NotFoundException('You have not joined this game');
     await this.prisma.gameParticipant.delete({ where: { id: participant.id } });
-    // Reopen the game if it had filled up.
-    await this.prisma.gamePost.updateMany({
-      where: { id: postId, status: 'full' },
-      data: { status: 'open' },
-    });
+    // Reopen the game if it had filled up — unless it already started,
+    // in which case its status no longer matters.
+    const post = await this.prisma.gamePost.findUnique({ where: { id: postId } });
+    const started =
+      post &&
+      (post.date < startOfToday() ||
+        (isSameDay(post.date, new Date()) &&
+          post.startMinutes <= minutesSinceMidnight()));
+    if (!started) {
+      await this.prisma.gamePost.updateMany({
+        where: { id: postId, status: 'full' },
+        data: { status: 'open' },
+      });
+    }
     return { message: 'Left the game' };
   }
 
@@ -191,6 +313,20 @@ export class GamePostsService {
     if (!post) throw new NotFoundException('Game not found');
     if (post.creatorId !== userId) {
       throw new ForbiddenException('Only the creator can delete this game');
+    }
+    // Tell the squad before it vanishes — they may be travelling to it.
+    const squad = await this.prisma.gameParticipant.findMany({
+      where: { postId, userId: { not: null } },
+      select: { userId: true },
+    });
+    for (const s of squad) {
+      await this.notifications
+        .pushToUser(s.userId!, {
+          title: 'Game cancelled',
+          body: `The ${post.sport} game you joined was removed by its host.`,
+          data: { type: 'game_cancelled' },
+        })
+        .catch(() => {});
     }
     await this.prisma.gamePost.delete({ where: { id: postId } });
     return { message: 'Game deleted' };

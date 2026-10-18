@@ -307,6 +307,7 @@ model Booking {
   updatedAt      DateTime      @updatedAt
 
   participants     BookingParticipant[]
+  gamePost         GamePost?
   reviews          Review[]
   reschedules      RescheduleRequest[]
   disputes         Dispute[]
@@ -386,8 +387,12 @@ model GamePost {
   date          DateTime  @db.Date
   startMinutes  Int
   playersNeeded Int
+  squadSize     Int?
   note          String?
   status        String    @default("open") // open | full | closed
+  reminderSent  Boolean   @default(false)
+  bookingId     String?   @unique
+  booking       Booking?  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   isCurated     Boolean   @default(false)
   curatedById   String?
   curatedBy     User?     @relation("CuratedPosts", fields: [curatedById], references: [id])

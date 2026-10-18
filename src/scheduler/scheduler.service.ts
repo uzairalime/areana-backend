@@ -63,6 +63,40 @@ export class SchedulerService {
       await this.notifications.notifyBookingReminder(b.userId, b.venue.name, `${hh}:${mm}`);
       await this.prisma.booking.update({ where: { id: b.id }, data: { reminderSent: true } });
     }
+
+    // Game posts starting within 2 hours: remind the host and everyone
+    // who joined — board games previously had no reminder at all.
+    const games = await this.prisma.gamePost.findMany({
+      where: {
+        status: { in: ['open', 'full'] },
+        date: today,
+        reminderSent: false,
+        startMinutes: { gt: nowMin, lte: nowMin + 120 },
+      },
+      include: {
+        participants: { select: { userId: true } },
+        venue: { select: { name: true } },
+      },
+    });
+    for (const g of games) {
+      const hh = String(Math.floor(g.startMinutes / 60)).padStart(2, '0');
+      const mm = String(g.startMinutes % 60).padStart(2, '0');
+      const targets = new Set<string>([g.creatorId]);
+      for (const p of g.participants) if (p.userId) targets.add(p.userId);
+      for (const uid of targets) {
+        await this.notifications
+          .pushToUser(uid, {
+            title: 'Game reminder',
+            body: `Your ${g.sport} game starts at ${hh}:${mm}${g.venue ? ` at ${g.venue.name}` : ` in ${g.city}`}. See you there!`,
+            data: { type: 'game_reminder' },
+          })
+          .catch(() => {});
+      }
+      await this.prisma.gamePost.update({
+        where: { id: g.id },
+        data: { reminderSent: true },
+      });
+    }
   }
 
   /**

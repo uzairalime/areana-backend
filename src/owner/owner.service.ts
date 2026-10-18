@@ -12,6 +12,7 @@ import { PrismaService } from '../common/prisma';
 import { BookingsService } from '../bookings/bookings.service';
 import { StorageService } from '../storage/storage.service';
 import { ReviewsService } from '../reviews/reviews.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { parseDateOnly, startOfToday } from '../common/date.util';
 import { CourtsService, toYmd } from '../courts/courts.service';
 import {
@@ -37,6 +38,7 @@ export class OwnerService {
     private courtsSvc: CourtsService,
     private storage: StorageService,
     private reviewOps: ReviewsService,
+    private notifications: NotificationsService,
   ) {}
 
   // ------------------------------------------------------------ access scope
@@ -901,6 +903,32 @@ export class OwnerService {
         data: { status: 'approved', decidedAt: new Date() },
       }),
     ]);
+    // A linked game post follows its booking to the new time, and the
+    // squad hears about the move.
+    const post = await this.prisma.gamePost.findUnique({
+      where: { bookingId: req.bookingId },
+    });
+    if (post) {
+      await this.prisma.gamePost.update({
+        where: { id: post.id },
+        data: { date: req.requestedDate, startMinutes },
+      });
+      const squad = await this.prisma.gameParticipant.findMany({
+        where: { postId: post.id, userId: { not: null } },
+        select: { userId: true },
+      });
+      const hh = String(Math.floor(startMinutes / 60)).padStart(2, '0');
+      const mm = String(startMinutes % 60).padStart(2, '0');
+      for (const s of squad) {
+        await this.notifications
+          .pushToUser(s.userId!, {
+            title: 'Game time moved',
+            body: `Your ${post.sport} game moved to ${req.requestedDate.toISOString().slice(0, 10)} at ${hh}:${mm}.`,
+            data: { type: 'game_rescheduled' },
+          })
+          .catch(() => {});
+      }
+    }
     return booking;
   }
 

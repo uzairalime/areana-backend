@@ -1,14 +1,35 @@
-import { IsInt, IsOptional, IsString, Matches, Min } from 'class-validator';
+import { IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class CreateGamePostDto {
-  @ApiProperty({ example: 'Football' })
+  /**
+   * Player path: post FROM one of your confirmed bookings — venue, court,
+   * sport, date and time are all derived from the booking. The free-form
+   * fields below exist only for super-admin (curated) posts.
+   */
+  @ApiPropertyOptional({ description: 'Your confirmed booking to post from' })
+  @IsOptional()
   @IsString()
-  sport: string;
+  bookingId?: string;
+
+  @ApiPropertyOptional({ example: 6, description: 'How many players you already have (incl. you)' })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  squadSize?: number;
+
+  @ApiProperty({ example: 'Football' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  sport?: string;
 
   @ApiProperty({ example: 'Lahore' })
+  @IsOptional()
   @IsString()
-  city: string;
+  @MaxLength(40)
+  city?: string;
 
   @ApiPropertyOptional({ example: 'clx...' })
   @IsOptional()
@@ -16,23 +37,50 @@ export class CreateGamePostDto {
   venueId?: string;
 
   @ApiProperty({ example: '2026-10-10' })
+  @IsOptional()
   @IsString()
   @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'date must be YYYY-MM-DD' })
-  date: string;
+  date?: string;
 
   @ApiProperty({ example: 1080 })
+  @IsOptional()
   @IsInt()
   @Min(0)
-  startMinutes: number;
+  @Max(1800)
+  startMinutes?: number;
 
   @ApiProperty({ example: 3 })
   @IsInt()
   @Min(1)
+  @Max(50)
   playersNeeded: number;
 
   @ApiPropertyOptional({ example: 'Need a goalkeeper' })
   @IsOptional()
   @IsString()
+  @MaxLength(280)
+  note?: string;
+}
+
+export class UpdateGamePostDto {
+  @ApiPropertyOptional({ example: 4 })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  playersNeeded?: number;
+
+  @ApiPropertyOptional({ example: 6 })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  squadSize?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  @MaxLength(280)
   note?: string;
 }
 

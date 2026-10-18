@@ -114,6 +114,26 @@ export class AdminService {
           where: { id: b.id },
           data: { status: BookingStatus.cancelled },
         });
+        // A linked game post dies with its booking; tell its squad.
+        const post = await this.prisma.gamePost.findUnique({
+          where: { bookingId: b.id },
+        });
+        if (post) {
+          const squad = await this.prisma.gameParticipant.findMany({
+            where: { postId: post.id, userId: { not: null } },
+            select: { userId: true },
+          });
+          for (const s of squad) {
+            await this.notifications
+              .pushToUser(s.userId!, {
+                title: 'Game cancelled',
+                body: "The host's account was suspended, so this game is off.",
+                data: { type: 'game_cancelled' },
+              })
+              .catch(() => {});
+          }
+          await this.prisma.gamePost.delete({ where: { id: post.id } });
+        }
         if (b.venue.owner?.email) {
           await this.notifications
             .notifyOwnerNewBooking(
