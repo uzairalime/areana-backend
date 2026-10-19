@@ -151,7 +151,7 @@ export class OnboardArenaDto {
   @IsOptional()
   @IsString()
   planId?: string;
-  @ApiPropertyOptional({ description: 'Approve immediately: venue goes live and the free trial starts' })
+  @ApiPropertyOptional({ description: 'Submit for approval (pending) instead of leaving a draft; the venue goes live via the approve action once readiness requirements (photos etc.) are met' })
   @IsOptional()
   @IsBoolean()
   approveNow?: boolean;

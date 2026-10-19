@@ -17,6 +17,11 @@ import { parseDateOnly, startOfToday } from '../common/date.util';
 import { CourtsService, toYmd } from '../courts/courts.service';
 import { PlansService } from '../plans/plans.service';
 import {
+  photoEntriesOf,
+  venueReadiness,
+  withSportTag,
+} from '../venues/venue-readiness';
+import {
   BookingsQueryDto,
   CreateBlockDto,
   CreateClosureDto,
@@ -197,12 +202,17 @@ export class OwnerService {
   }
 
   async submitVenue(user: AuthUser, venueId: string) {
-    await this.assertVenue(user, venueId);
+    const venue = await this.assertVenue(user, venueId);
     if (!user.permissions.includes('venues.manage')) {
       throw new ForbiddenException('Only the owner can submit a venue');
     }
     const courts = await this.prisma.court.count({ where: { venueId, isActive: true } });
-    if (courts === 0) throw new BadRequestException('Add at least one court before submitting');
+    const readiness = venueReadiness(venue, courts);
+    if (!readiness.ready) {
+      throw new BadRequestException(
+        `This venue isn't ready to submit yet: ${readiness.missing.join('; ')}`,
+      );
+    }
     return this.prisma.venue.update({
       where: { id: venueId },
       data: { status: VenueStatus.pending },
@@ -215,19 +225,31 @@ export class OwnerService {
    * here (gradient placeholder in the apps) and gain a blurhash only if
    * re-uploaded. `images` (plain URLs) stays the order source of truth.
    */
-  private photoEntries(venue: { images: string[]; photos: unknown }): { url: string; blurhash?: string; width?: number; height?: number }[] {
-    const stored = Array.isArray(venue.photos) ? (venue.photos as { url: string }[]) : [];
-    const byUrl = new Map(stored.map((x) => [x.url, x]));
-    return venue.images.map((url) => byUrl.get(url) ?? { url });
+  private photoEntries(venue: { images: string[]; photos: unknown }) {
+    return photoEntriesOf(venue);
   }
 
-  async addVenueImage(user: AuthUser, venueId: string, file: Express.Multer.File) {
+  async addVenueImage(user: AuthUser, venueId: string, file: Express.Multer.File, sport?: string) {
     const venue = await this.assertVenue(user, venueId);
     const photo = await this.storage.saveVenueImage(venueId, file);
-    const entries = [...this.photoEntries(venue), photo];
+    const entries = [
+      ...this.photoEntries(venue),
+      { ...photo, sport: sport && sport.trim() ? sport.trim() : undefined },
+    ];
     return this.prisma.venue.update({
       where: { id: venueId },
       data: { images: entries.map((e) => e.url), photos: entries },
+    });
+  }
+
+  /** Tag (or untag) one photo with a sport — every sport a venue offers
+   * needs at least one tagged photo before the venue can go live. */
+  async tagVenueImage(user: AuthUser, venueId: string, url: string, sport: string | null) {
+    const venue = await this.assertVenue(user, venueId);
+    const entries = withSportTag(this.photoEntries(venue), url, sport);
+    return this.prisma.venue.update({
+      where: { id: venueId },
+      data: { photos: entries },
     });
   }
 

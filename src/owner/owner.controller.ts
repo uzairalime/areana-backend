@@ -106,8 +106,21 @@ export class OwnerController {
     @CurrentUser() user: AuthUser,
     @Param('id') id: string,
     @UploadedFile() file: Express.Multer.File,
+    @Body('sport') sport?: string,
   ) {
-    return this.owner.addVenueImage(user, id, file);
+    return this.owner.addVenueImage(user, id, file, sport);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
+  @Patch('venues/:id/images/tag')
+  tagImage(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body('url') url: string,
+    @Body('sport') sport: string | null,
+  ) {
+    return this.owner.tagVenueImage(user, id, url, sport ?? null);
   }
 
   @RequirePerm('venues.manage')

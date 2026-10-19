@@ -17,6 +17,11 @@ import { StorageService } from '../storage/storage.service';
 import { PlansService } from '../plans/plans.service';
 import type { CreatePlanDto, UpdatePlanDto } from '../plans/dto';
 import type { OnboardArenaDto } from './dto';
+import {
+  photoEntriesOf,
+  venueReadiness,
+  withSportTag,
+} from '../venues/venue-readiness';
 import { CreateRoleDto, CreateUserDto, UpdateRoleDto } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 
@@ -305,15 +310,34 @@ export class AdminService {
     });
   }
 
-  pendingVenues() {
-    return this.prisma.venue.findMany({
+  async pendingVenues() {
+    const venues = await this.prisma.venue.findMany({
       where: { status: VenueStatus.pending },
       include: { owner: { select: { name: true, email: true, phone: true } } },
       orderBy: { createdAt: 'desc' },
     });
+    const out = [];
+    for (const v of venues) {
+      const courts = await this.prisma.court.count({
+        where: { venueId: v.id, isActive: true },
+      });
+      out.push({ ...v, readiness: venueReadiness(v, courts) });
+    }
+    return out;
   }
 
   async approveVenue(actorId: string, venueId: string) {
+    const existing = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!existing) throw new NotFoundException('Venue not found');
+    const courts = await this.prisma.court.count({
+      where: { venueId, isActive: true },
+    });
+    const readiness = venueReadiness(existing, courts);
+    if (!readiness.ready) {
+      throw new BadRequestException(
+        `This venue isn't ready to go live: ${readiness.missing.join('; ')}`,
+      );
+    }
     const venue = await this.prisma.venue.update({
       where: { id: venueId },
       data: { status: VenueStatus.approved },
@@ -369,7 +393,10 @@ export class AdminService {
           lng: dto.lng,
           sports,
           amenities: dto.amenities ?? [],
-          status: dto.approveNow ? VenueStatus.approved : VenueStatus.draft,
+          // approveNow submits the venue for approval (pending) — it goes
+          // live through the normal approve action once the photo and
+          // readiness requirements are met, like every other venue.
+          status: dto.approveNow ? VenueStatus.pending : VenueStatus.draft,
           planId: dto.planId ?? null,
         },
       });
@@ -403,10 +430,6 @@ export class AdminService {
       return { user, venue, courts };
     });
 
-    if (dto.approveNow) {
-      // Starts the billing clock on the chosen (or default) plan.
-      await this.plans.startBilling(result.venue.id);
-    }
     await this.audit(actorId, 'venue.onboard', 'venue', result.venue.id);
     const fresh = await this.prisma.venue.findUnique({
       where: { id: result.venue.id },
@@ -433,7 +456,11 @@ export class AdminService {
     });
     const out = [];
     for (const v of venues) {
-      out.push({ venue: v, billing: await this.plans.billingSummary(v) });
+      out.push({
+        venue: v,
+        billing: await this.plans.billingSummary(v),
+        readiness: venueReadiness(v, v.courts.filter((c) => c.isActive).length),
+      });
     }
     return out;
   }
@@ -451,7 +478,50 @@ export class AdminService {
       },
     });
     if (!venue) throw new NotFoundException('Venue not found');
-    return { venue, billing: await this.plans.billingSummary(venue) };
+    return {
+      venue,
+      billing: await this.plans.billingSummary(venue),
+      readiness: venueReadiness(
+        venue,
+        venue.courts.filter((c) => c.isActive).length,
+      ),
+    };
+  }
+
+  // ---------------------------------------------------------- venue images
+  async addVenueImage(venueId: string, file: Express.Multer.File, sport?: string) {
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue) throw new NotFoundException('Venue not found');
+    const photo = await this.storage.saveVenueImage(venueId, file);
+    const entries = [
+      ...photoEntriesOf(venue),
+      { ...photo, sport: sport && sport.trim() ? sport.trim() : undefined },
+    ];
+    return this.prisma.venue.update({
+      where: { id: venueId },
+      data: { images: entries.map((e) => e.url), photos: entries },
+    });
+  }
+
+  async tagVenueImage(venueId: string, url: string, sport: string | null) {
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue) throw new NotFoundException('Venue not found');
+    const entries = withSportTag(photoEntriesOf(venue), url, sport);
+    return this.prisma.venue.update({
+      where: { id: venueId },
+      data: { photos: entries },
+    });
+  }
+
+  async removeVenueImage(venueId: string, url: string) {
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue) throw new NotFoundException('Venue not found');
+    await this.storage.deleteImage(url);
+    const entries = photoEntriesOf(venue).filter((e) => e.url !== url);
+    return this.prisma.venue.update({
+      where: { id: venueId },
+      data: { images: entries.map((e) => e.url), photos: entries },
+    });
   }
 
   // ------------------------------------------------------------------ plans

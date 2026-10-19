@@ -209,6 +209,37 @@ export class AdminController {
     return this.admin.venueDetailAdmin(id);
   }
 
+  @ApiTags('admin · venues')
+  @RequirePerm('venues.onboard')
+  @Post('venues/:id/images')
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('image'))
+  addVenueImage(
+    @Param('id') id: string,
+    @UploadedFile() file: Express.Multer.File,
+    @Body('sport') sport?: string,
+  ) {
+    return this.admin.addVenueImage(id, file, sport);
+  }
+
+  @ApiTags('admin · venues')
+  @RequirePerm('venues.onboard')
+  @Patch('venues/:id/images/tag')
+  tagVenueImage(
+    @Param('id') id: string,
+    @Body('url') url: string,
+    @Body('sport') sport: string | null,
+  ) {
+    return this.admin.tagVenueImage(id, url, sport ?? null);
+  }
+
+  @ApiTags('admin · venues')
+  @RequirePerm('venues.onboard')
+  @Delete('venues/:id/images')
+  removeVenueImage(@Param('id') id: string, @Body('url') url: string) {
+    return this.admin.removeVenueImage(id, url);
+  }
+
   // ------------------------------------------------------------------ promos
   @ApiTags('admin · promos')
   @Get('promos')
