@@ -115,3 +115,49 @@ export class AnalyticsQueryDto {
   @ApiPropertyOptional({ example: 30 }) @IsOptional() @Type(() => Number) @IsInt() @Min(1) days?: number = 30;
   @ApiPropertyOptional({ enum: ['day', 'week', 'month'] }) @IsOptional() @IsIn(['day', 'week', 'month']) granularity?: 'day' | 'week' | 'month' = 'day';
 }
+
+// --------------------------------------------------------------- onboarding
+export class OnboardCourtDto {
+  @ApiProperty() @IsString() name: string;
+  @ApiProperty() @IsString() sport: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() size?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() surface?: string;
+  @ApiPropertyOptional() @IsOptional() @IsBoolean() indoor?: boolean;
+  @ApiProperty() @IsNumber() @Min(0) pricePerHour: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(0) openMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(0) closeMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(15) slotMinutes?: number;
+}
+
+export class OnboardArenaDto {
+  // owner account
+  @ApiProperty() @IsString() ownerName: string;
+  @ApiProperty() @IsString() ownerEmail: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() ownerPhone?: string;
+  @ApiProperty({ description: 'Initial password for the owner login' })
+  @IsString()
+  ownerPassword: string;
+  // venue
+  @ApiProperty() @IsString() venueName: string;
+  @ApiProperty() @IsString() address: string;
+  @ApiProperty() @IsString() city: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() venuePhone?: string;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() lat?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() lng?: number;
+  @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) sports?: string[];
+  @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) amenities?: string[];
+  // plan + go-live
+  @ApiPropertyOptional({ description: 'Plan to put the venue on; default plan when omitted' })
+  @IsOptional()
+  @IsString()
+  planId?: string;
+  @ApiPropertyOptional({ description: 'Approve immediately: venue goes live and the free trial starts' })
+  @IsOptional()
+  @IsBoolean()
+  approveNow?: boolean;
+  // courts
+  @ApiPropertyOptional({ type: [OnboardCourtDto] })
+  @IsOptional()
+  @IsArray()
+  courts?: OnboardCourtDto[];
+}

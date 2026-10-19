@@ -16,6 +16,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { StorageService } from '../storage/storage.service';
 import { PlansService } from '../plans/plans.service';
 import type { CreatePlanDto, UpdatePlanDto } from '../plans/dto';
+import type { OnboardArenaDto } from './dto';
 import { CreateRoleDto, CreateUserDto, UpdateRoleDto } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 
@@ -322,6 +323,135 @@ export class AdminService {
     await this.plans.startBilling(venueId);
     await this.audit(actorId, 'venue.approve', 'venue', venueId);
     return venue;
+  }
+
+  // ------------------------------------------------------------- onboarding
+  /**
+   * Full arena onboarding from the admin panel: creates the owner login,
+   * the venue, its courts and (optionally) approves it on a chosen plan.
+   * Gated by the 'venues.onboard' permission — super admin (wildcard) or
+   * any role the super admin grants it to.
+   */
+  async onboardArena(actorId: string, dto: OnboardArenaDto) {
+    const email = dto.ownerEmail.toLowerCase().trim();
+    const exists = await this.prisma.user.findUnique({ where: { email } });
+    if (exists) throw new ConflictException('An account with this email already exists');
+    const ownerRole = await this.prisma.role.findFirst({ where: { name: 'owner' } });
+    if (!ownerRole) {
+      throw new BadRequestException('Owner role is missing — run npm run db:seed first');
+    }
+    if (dto.planId) {
+      const plan = await this.prisma.plan.findUnique({ where: { id: dto.planId } });
+      if (!plan) throw new NotFoundException('Plan not found');
+    }
+    const courtSports = [...new Set((dto.courts ?? []).map((c) => c.sport))];
+    const sports = dto.sports && dto.sports.length > 0 ? dto.sports : courtSports;
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: {
+          email,
+          name: dto.ownerName,
+          phone: dto.ownerPhone,
+          passwordHash: await bcrypt.hash(dto.ownerPassword, 10),
+          roleId: ownerRole.id,
+          status: UserStatus.active,
+        },
+      });
+      const venue = await tx.venue.create({
+        data: {
+          ownerId: user.id,
+          name: dto.venueName,
+          address: dto.address,
+          city: dto.city,
+          phone: dto.venuePhone,
+          lat: dto.lat,
+          lng: dto.lng,
+          sports,
+          amenities: dto.amenities ?? [],
+          status: dto.approveNow ? VenueStatus.approved : VenueStatus.draft,
+          planId: dto.planId ?? null,
+        },
+      });
+      // Same default staff-role allowances the owner panel grants.
+      const allowed = await tx.role.findMany({ where: { scope: 'arena' } });
+      if (allowed.length > 0) {
+        await tx.venueAllowedRole.createMany({
+          data: allowed.map((r) => ({ venueId: venue.id, roleId: r.id })),
+          skipDuplicates: true,
+        });
+      }
+      const courts = [];
+      for (const c of dto.courts ?? []) {
+        courts.push(
+          await tx.court.create({
+            data: {
+              venueId: venue.id,
+              name: c.name,
+              sport: c.sport,
+              size: c.size,
+              surface: c.surface,
+              indoor: c.indoor ?? false,
+              pricePerHour: c.pricePerHour,
+              openMinutes: c.openMinutes ?? 360,
+              closeMinutes: c.closeMinutes ?? 1380,
+              slotMinutes: c.slotMinutes ?? 60,
+            },
+          }),
+        );
+      }
+      return { user, venue, courts };
+    });
+
+    if (dto.approveNow) {
+      // Starts the billing clock on the chosen (or default) plan.
+      await this.plans.startBilling(result.venue.id);
+    }
+    await this.audit(actorId, 'venue.onboard', 'venue', result.venue.id);
+    const fresh = await this.prisma.venue.findUnique({
+      where: { id: result.venue.id },
+      include: { plan: true, courts: true },
+    });
+    const { passwordHash: _p, ...safeOwner } = result.user;
+    return {
+      owner: safeOwner,
+      venue: fresh,
+      courts: result.courts,
+      billing: fresh ? await this.plans.billingSummary(fresh) : null,
+    };
+  }
+
+  /** Every venue (any status) with owner, courts, plan and billing. */
+  async listVenuesAdmin() {
+    const venues = await this.prisma.venue.findMany({
+      include: {
+        owner: { select: { id: true, name: true, email: true, phone: true, status: true } },
+        plan: true,
+        courts: { orderBy: { name: 'asc' } },
+      },
+      orderBy: [{ name: 'asc' }],
+    });
+    const out = [];
+    for (const v of venues) {
+      out.push({ venue: v, billing: await this.plans.billingSummary(v) });
+    }
+    return out;
+  }
+
+  async venueDetailAdmin(venueId: string) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      include: {
+        owner: { select: { id: true, name: true, email: true, phone: true, status: true, createdAt: true } },
+        plan: true,
+        courts: {
+          orderBy: { name: 'asc' },
+          include: { _count: { select: { bookings: true } } },
+        },
+      },
+    });
+    if (!venue) throw new NotFoundException('Venue not found');
+    return { venue, billing: await this.plans.billingSummary(venue) };
   }
 
   // ------------------------------------------------------------------ plans

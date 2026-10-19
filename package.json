@@ -46,6 +46,7 @@
   "scripts": {
     "build": "nest build",
     "db:seed": "ts-node prisma/seed.ts",
+    "db:seed:demo": "ts-node prisma/seed-demo.ts",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",

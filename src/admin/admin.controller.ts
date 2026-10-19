@@ -21,6 +21,7 @@ import {
   UpdatePromoDto,
   UpdateRoleDto,
   UpdateSettingsDto,
+  OnboardArenaDto,
 } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 import { PLAN_FEATURES } from '../plans/plans.service';
@@ -181,6 +182,31 @@ export class AdminController {
   @Patch('venues/:id/staff-roles')
   setVenueStaffRoles(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: SetStaffRolesDto) {
     return this.admin.setVenueStaffRoles(u.id, id, dto.roleIds);
+  }
+
+  // ------------------------------------------------- venues & onboarding
+  // These three routes relax the class-level '*' to the venues.onboard
+  // permission: the super admin (wildcard) always passes, and any role
+  // granted venues.onboard in the Roles page can onboard arenas too.
+  @ApiTags('admin · venues')
+  @RequirePerm('venues.onboard')
+  @Get('venues')
+  listVenuesAdmin() {
+    return this.admin.listVenuesAdmin();
+  }
+
+  @ApiTags('admin · venues')
+  @RequirePerm('venues.onboard')
+  @Post('venues/onboard')
+  onboardArena(@CurrentUser() u: AuthUser, @Body() dto: OnboardArenaDto) {
+    return this.admin.onboardArena(u.id, dto);
+  }
+
+  @ApiTags('admin · venues')
+  @RequirePerm('venues.onboard')
+  @Get('venues/:id')
+  venueDetailAdmin(@Param('id') id: string) {
+    return this.admin.venueDetailAdmin(id);
   }
 
   // ------------------------------------------------------------------ promos

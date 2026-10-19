@@ -21,6 +21,8 @@ export const PERMISSIONS = {
   'customers.read': 'View customer list',
   'staff.manage': 'Create and manage team logins',
   'reviews.reply': 'Reply to reviews',
+  // platform operations
+  'venues.onboard': 'Onboard arenas from the admin panel (create owner, venue and courts) and view all venues',
   // super admin (wildcard)
   '*': 'All permissions',
 } as const;
