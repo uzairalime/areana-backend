@@ -151,6 +151,19 @@ model Venue {
   minAdvanceMinutes Int         @default(120)
   maxAdvanceDays    Int         @default(14)
   archivedAt        DateTime?
+  /// Subscription plan (Basic / Normal / Premium / a specialized custom
+  /// plan). Null = the platform default plan applies.
+  planId            String?
+  plan              Plan?     @relation(fields: [planId], references: [id])
+  /// Billing clock: starts at first approval. Free until anchor +
+  /// plan.freeMonths (or freeUntilOverride); then yearly periods.
+  billingStartAt    DateTime?
+  billingPaidUntil  DateTime?
+  freeUntilOverride DateTime?
+  /// Materialized by the nightly billing sweep: an overdue venue is
+  /// paused on public surfaces exactly like a suspended owner's venue.
+  billingPaused     Boolean   @default(false)
+  billingDueNotifiedFor DateTime?
   status            VenueStatus @default(draft)
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
@@ -558,6 +571,27 @@ model AuditLog {
   createdAt DateTime @default(now())
 
   @@index([entity, entityId])
+}
+
+/// Subscription plans for venues. Features are keys from the plan
+/// feature catalog (src/plans/plans.service.ts); limits are null =
+/// unlimited. A plan with isCustom = true is a specialized plan built
+/// for one specific arena by the super admin.
+model Plan {
+  id          String   @id @default(cuid())
+  name        String
+  priceYearly Int      @default(0)
+  freeMonths  Int      @default(3)
+  features    Json     @default("[]")
+  maxVenues   Int?
+  maxCourts   Int?
+  maxStaff    Int?
+  isDefault   Boolean  @default(false)
+  isCustom    Boolean  @default(false)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  venues      Venue[]
 }
 
 model Setting {

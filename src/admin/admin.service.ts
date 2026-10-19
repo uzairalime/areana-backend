@@ -14,6 +14,8 @@ import { DisputesService } from '../disputes/disputes.service';
 import { SuggestionsService } from '../suggestions/suggestions.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { StorageService } from '../storage/storage.service';
+import { PlansService } from '../plans/plans.service';
+import type { CreatePlanDto, UpdatePlanDto } from '../plans/dto';
 import { CreateRoleDto, CreateUserDto, UpdateRoleDto } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 
@@ -26,6 +28,7 @@ export class AdminService {
     private suggestions: SuggestionsService,
     private notifications: NotificationsService,
     private storage: StorageService,
+    private plans: PlansService,
   ) {}
 
   private audit(actorId: string, action: string, entity: string, entityId: string) {
@@ -314,8 +317,82 @@ export class AdminService {
       where: { id: venueId },
       data: { status: VenueStatus.approved },
     });
+    // First approval starts the plan billing clock (default plan,
+    // free period first) — see PlansService.
+    await this.plans.startBilling(venueId);
     await this.audit(actorId, 'venue.approve', 'venue', venueId);
     return venue;
+  }
+
+  // ------------------------------------------------------------------ plans
+  listPlans() {
+    return this.plans.listPlans();
+  }
+
+  async createPlan(actorId: string, dto: CreatePlanDto) {
+    const plan = await this.plans.createPlan(dto);
+    await this.audit(actorId, 'plan.create', 'plan', plan.id);
+    return plan;
+  }
+
+  async updatePlan(actorId: string, id: string, dto: UpdatePlanDto) {
+    const plan = await this.plans.updatePlan(id, dto);
+    await this.audit(actorId, 'plan.update', 'plan', id);
+    return plan;
+  }
+
+  async deletePlan(actorId: string, id: string) {
+    const result = await this.plans.deletePlan(id);
+    await this.audit(actorId, 'plan.delete', 'plan', id);
+    return result;
+  }
+
+  /** All approved venues with their plan + billing state (Plans page). */
+  async listVenueBilling() {
+    const venues = await this.prisma.venue.findMany({
+      where: { status: VenueStatus.approved },
+      include: {
+        plan: true,
+        owner: { select: { id: true, name: true, email: true } },
+      },
+      orderBy: { name: 'asc' },
+    });
+    const out = [];
+    for (const v of venues) {
+      out.push({ venue: v, billing: await this.plans.billingSummary(v) });
+    }
+    return out;
+  }
+
+  async venueBilling(venueId: string) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      include: {
+        plan: true,
+        owner: { select: { id: true, name: true, email: true } },
+      },
+    });
+    if (!venue) throw new NotFoundException('Venue not found');
+    const billing = await this.plans.billingSummary(venue);
+    return { venue, billing };
+  }
+
+  async assignVenuePlan(actorId: string, venueId: string, planId: string, restartBilling = false) {
+    const venue = await this.plans.assignPlan(venueId, planId, restartBilling);
+    await this.audit(actorId, 'venue.plan.assign', 'venue', venueId);
+    return { venue, billing: await this.plans.billingSummary(venue) };
+  }
+
+  async extendVenueFree(actorId: string, venueId: string, months: number) {
+    const venue = await this.plans.extendFree(venueId, months);
+    await this.audit(actorId, 'venue.billing.extend_free', 'venue', venueId);
+    return { venue, billing: await this.plans.billingSummary(venue) };
+  }
+
+  async markVenuePaid(actorId: string, venueId: string) {
+    const venue = await this.plans.markPaid(venueId);
+    await this.audit(actorId, 'venue.billing.mark_paid', 'venue', venueId);
+    return { venue, billing: await this.plans.billingSummary(venue) };
   }
 
   async rejectVenue(actorId: string, venueId: string) {

@@ -16,6 +16,7 @@ export class VenuesService {
     const where: Prisma.VenueWhereInput = {
       status: VenueStatus.approved,
       archivedAt: null,
+      billingPaused: false,
       owner: { status: UserStatus.active },
     };
     if (city) where.city = { equals: city, mode: 'insensitive' };
@@ -102,7 +103,7 @@ export class VenuesService {
       where: {
         isActive: true,
         surface: { not: null },
-        venue: { status: VenueStatus.approved, archivedAt: null, owner: { status: UserStatus.active } },
+        venue: { status: VenueStatus.approved, archivedAt: null, billingPaused: false, owner: { status: UserStatus.active } },
       },
       select: { surface: true },
       distinct: ['surface'],
@@ -125,7 +126,7 @@ export class VenuesService {
 
   async getById(id: string) {
     const venue = await this.prisma.venue.findFirst({
-      where: { id, status: VenueStatus.approved, archivedAt: null, owner: { status: UserStatus.active } },
+      where: { id, status: VenueStatus.approved, archivedAt: null, billingPaused: false, owner: { status: UserStatus.active } },
       include: {
         courts: { where: { isActive: true }, orderBy: { pricePerHour: 'asc' } },
         badges: { include: { badge: true }, orderBy: { badge: { tier: 'desc' } } },

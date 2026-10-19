@@ -33,6 +33,7 @@ export class WaitlistService {
         venue: {
           status: VenueStatus.approved,
           archivedAt: null,
+          billingPaused: false,
           owner: { status: UserStatus.active },
         },
       },

@@ -49,6 +49,12 @@ export class OwnerController {
     return this.owner.dashboard(user, venueId, date);
   }
 
+  @ApiTags('owner · billing')
+  @Get('billing')
+  billing(@CurrentUser() user: AuthUser) {
+    return this.owner.billing(user);
+  }
+
   // ---------------------------------------------------------------- venues
   @ApiTags('owner · venues & courts')
   @Get('venues')

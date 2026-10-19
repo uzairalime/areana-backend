@@ -5,6 +5,7 @@ import { PrismaService } from '../common/prisma';
 import { minutesSinceMidnight, startOfToday } from '../common/date.util';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ReferralsService } from '../promos/referrals.service';
+import { PlansService } from '../plans/plans.service';
 
 @Injectable()
 export class SchedulerService {
@@ -14,6 +15,7 @@ export class SchedulerService {
     private prisma: PrismaService,
     private notifications: NotificationsService,
     private referrals: ReferralsService,
+    private plans: PlansService,
   ) {}
 
   private async setting(key: string, fallback: string): Promise<string> {
@@ -125,6 +127,17 @@ export class SchedulerService {
    * Nightly housekeeping: auth tables grow on every login/refresh/OTP —
    * drop expired sessions, week-old revocations and day-old OTP rows.
    */
+  /** Venue plan billing: pause overdue venues, remind on due dates. */
+  @Cron('30 0 * * *')
+  async billingSweep() {
+    const result = await this.plans.sweepBilling();
+    if (result.paused > 0 || result.resumed > 0) {
+      this.logger.log(
+        `Billing sweep: ${result.checked} venues, ${result.paused} paused, ${result.resumed} resumed`,
+      );
+    }
+  }
+
   @Cron('0 3 * * *')
   async pruneAuthData() {
     const now = new Date();

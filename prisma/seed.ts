@@ -95,8 +95,25 @@ async function main() {
     });
   }
 
+  // Subscription plans: venues pay a yearly flat fee per plan, first
+  // freeMonths free; the super admin adjusts everything in the panel,
+  // so seed only creates them when missing.
+  const planSeed = [
+    { name: 'Basic', priceYearly: 18000, freeMonths: 3, features: [] as string[], maxVenues: 1, maxCourts: 2, maxStaff: 0, isDefault: false, isCustom: false, sortOrder: 1 },
+    { name: 'Normal', priceYearly: 36000, freeMonths: 3, features: ['peak_pricing', 'advanced_availability', 'staff_accounts', 'customers_insight'], maxVenues: 3, maxCourts: null, maxStaff: 3, isDefault: true, isCustom: false, sortOrder: 2 },
+    { name: 'Premium', priceYearly: 60000, freeMonths: 3, features: ['peak_pricing', 'advanced_availability', 'staff_accounts', 'customers_insight', 'featured_placement'], maxVenues: null, maxCourts: null, maxStaff: null, isDefault: false, isCustom: false, sortOrder: 3 },
+  ];
+  for (const planData of planSeed) {
+    const existing = await prisma.plan.findFirst({
+      where: { name: planData.name, isCustom: false },
+    });
+    if (!existing) await prisma.plan.create({ data: planData });
+  }
+  console.log('Plans seeded');
+
   const settings: Record<string, string> = {
     commissionPct: '10',
+    billingGraceDays: '14',
     pendingExpiryHours: '2',
     noShowStrikeLimit: '3',
     referralWelcomePct: '15',

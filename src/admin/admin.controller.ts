@@ -23,6 +23,8 @@ import {
   UpdateSettingsDto,
 } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
+import { PLAN_FEATURES } from '../plans/plans.service';
+import { AssignPlanDto, CreatePlanDto, ExtendFreeDto, UpdatePlanDto } from '../plans/dto';
 
 @ApiBearerAuth()
 @RequirePerm('*') // super admin only — the whole panel lives behind this
@@ -198,6 +200,67 @@ export class AdminController {
   @Patch('promos/:id')
   updatePromo(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: UpdatePromoDto) {
     return this.admin.updatePromo(u.id, id, dto);
+  }
+
+  // ------------------------------------------------------------------ plans
+  @ApiTags('admin · plans')
+  @Get('plans/features')
+  planFeatures() {
+    return PLAN_FEATURES;
+  }
+
+  @ApiTags('admin · plans')
+  @Get('plans')
+  listPlans() {
+    return this.admin.listPlans();
+  }
+
+  @ApiTags('admin · plans')
+  @Post('plans')
+  createPlan(@CurrentUser() u: AuthUser, @Body() dto: CreatePlanDto) {
+    return this.admin.createPlan(u.id, dto);
+  }
+
+  @ApiTags('admin · plans')
+  @Patch('plans/:id')
+  updatePlan(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: UpdatePlanDto) {
+    return this.admin.updatePlan(u.id, id, dto);
+  }
+
+  @ApiTags('admin · plans')
+  @Delete('plans/:id')
+  deletePlan(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.admin.deletePlan(u.id, id);
+  }
+
+  @ApiTags('admin · plans')
+  @Get('plans/venues')
+  listVenueBilling() {
+    return this.admin.listVenueBilling();
+  }
+
+  @ApiTags('admin · plans')
+  @Get('venues/:id/billing')
+  venueBilling(@Param('id') id: string) {
+    return this.admin.venueBilling(id);
+  }
+
+  @ApiTags('admin · plans')
+  @Post('venues/:id/plan')
+  assignVenuePlan(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: AssignPlanDto) {
+    return this.admin.assignVenuePlan(u.id, id, dto.planId, dto.restartBilling ?? false);
+  }
+
+  @ApiTags('admin · plans')
+  @Post('venues/:id/billing/extend-free')
+  extendVenueFree(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: ExtendFreeDto) {
+    return this.admin.extendVenueFree(u.id, id, dto.months);
+  }
+
+  @ApiTags('admin · plans')
+  @Post('venues/:id/billing/mark-paid')
+  markVenuePaid(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.admin.markVenuePaid(u.id, id);
   }
 
   // ------------------------------------------------------------------ badges

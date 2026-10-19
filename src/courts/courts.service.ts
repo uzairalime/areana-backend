@@ -137,7 +137,7 @@ export class CourtsService {
       where: {
         id: courtId,
         isActive: true,
-        venue: { status: VenueStatus.approved, archivedAt: null, owner: { status: UserStatus.active } },
+        venue: { status: VenueStatus.approved, archivedAt: null, billingPaused: false, owner: { status: UserStatus.active } },
       },
       include: { venue: true },
     });

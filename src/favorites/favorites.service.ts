@@ -24,7 +24,7 @@ export class FavoritesService {
       // Paused venues (owner suspended) disappear from favorites too.
       where: {
         userId,
-        venue: { status: VenueStatus.approved, archivedAt: null, owner: { status: UserStatus.active } },
+        venue: { status: VenueStatus.approved, archivedAt: null, billingPaused: false, owner: { status: UserStatus.active } },
       },
       include: { venue: { select: venueSummary } },
       orderBy: { createdAt: 'desc' },

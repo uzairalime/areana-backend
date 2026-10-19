@@ -15,6 +15,7 @@ import { ReviewsService } from '../reviews/reviews.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { parseDateOnly, startOfToday } from '../common/date.util';
 import { CourtsService, toYmd } from '../courts/courts.service';
+import { PlansService } from '../plans/plans.service';
 import {
   BookingsQueryDto,
   CreateBlockDto,
@@ -39,6 +40,7 @@ export class OwnerService {
     private storage: StorageService,
     private reviewOps: ReviewsService,
     private notifications: NotificationsService,
+    private plans: PlansService,
   ) {}
 
   // ------------------------------------------------------------ access scope
@@ -133,6 +135,15 @@ export class OwnerService {
   }
 
   async createVenue(user: AuthUser, dto: CreateVenueDto) {
+    const limit = await this.plans.venueLimitForOwner(user.id);
+    if (limit !== null) {
+      const count = await this.prisma.venue.count({ where: { ownerId: user.id } });
+      if (count >= limit) {
+        throw new ForbiddenException(
+          `Your plan allows ${limit} venue(s). Ask Areana about upgrading to add more.`,
+        );
+      }
+    }
     const venue = await this.prisma.venue.create({
       data: {
         ownerId: user.id,
@@ -305,6 +316,15 @@ export class OwnerService {
 
   async createCourt(user: AuthUser, venueId: string, dto: CreateCourtDto) {
     await this.assertVenue(user, venueId);
+    const plan = await this.plans.planForVenueId(venueId);
+    if (plan?.maxCourts != null) {
+      const count = await this.prisma.court.count({ where: { venueId } });
+      if (count >= plan.maxCourts) {
+        throw new ForbiddenException(
+          `Your plan allows ${plan.maxCourts} court(s) per venue. Ask Areana about upgrading.`,
+        );
+      }
+    }
     const data = { ...dto };
     if (data.openMinutes != null && data.closeMinutes != null) {
       data.closeMinutes = this.normalizeCourtHours(data.openMinutes, data.closeMinutes);
@@ -447,7 +467,8 @@ export class OwnerService {
    * prices were snapshotted at booking time.
    */
   async createPriceWindow(user: AuthUser, courtId: string, dto: CreatePriceWindowDto) {
-    await this.assertCourt(user, courtId);
+    const court = await this.assertCourt(user, courtId);
+    await this.plans.requireFeature(court.venueId, 'peak_pricing');
     if (dto.weekdays.length === 0 || dto.weekdays.some((d) => d < 0 || d > 6)) {
       throw new BadRequestException('weekdays must be a non-empty list of 0 (Sun) – 6 (Sat)');
     }
@@ -513,6 +534,10 @@ export class OwnerService {
    */
   async setWeeklyHours(user: AuthUser, courtId: string, dto: SetWeeklyHoursDto) {
     const court = await this.assertCourt(user, courtId);
+    // Split shifts (more than one window in a day) are a plan feature.
+    if (dto.days.some((d) => d.windows.length > 1)) {
+      await this.plans.requireFeature(court.venueId, 'advanced_availability');
+    }
     for (const day of dto.days) {
       if (day.weekday < 0 || day.weekday > 6) {
         throw new BadRequestException('weekday must be 0 (Sun) – 6 (Sat)');
@@ -608,7 +633,8 @@ export class OwnerService {
    * next 60 days (or the block's own range) that overlap it.
    */
   async createRecurringBlock(user: AuthUser, courtId: string, dto: CreateRecurringBlockDto) {
-    await this.assertCourt(user, courtId);
+    const court = await this.assertCourt(user, courtId);
+    await this.plans.requireFeature(court.venueId, 'advanced_availability');
     if (dto.weekdays.length === 0 || dto.weekdays.some((d) => d < 0 || d > 6)) {
       throw new BadRequestException('weekdays must be a non-empty list of 0 (Sun) – 6 (Sat)');
     }
@@ -1014,6 +1040,16 @@ export class OwnerService {
 
   async createStaff(user: AuthUser, venueId: string, dto: CreateStaffDto) {
     await this.assertVenue(user, venueId);
+    await this.plans.requireFeature(venueId, 'staff_accounts');
+    const plan = await this.plans.planForVenueId(venueId);
+    if (plan?.maxStaff != null) {
+      const seats = await this.prisma.venueStaff.count({ where: { venueId } });
+      if (seats >= plan.maxStaff) {
+        throw new ForbiddenException(
+          `Your plan allows ${plan.maxStaff} staff seat(s) per venue. Ask Areana about upgrading.`,
+        );
+      }
+    }
     // The role must be one the super admin allowed for this arena.
     const allowed = await this.prisma.venueAllowedRole.findUnique({
       where: { venueId_roleId: { venueId, roleId: dto.roleId } },
@@ -1103,6 +1139,12 @@ export class OwnerService {
   // --------------------------------------------------------------- customers
   async customers(user: AuthUser, venueId?: string) {
     const ids = venueId ? [(await this.assertVenue(user, venueId)).id] : await this.venueIds(user);
+    const featureSets = await Promise.all(ids.map((id) => this.plans.featuresForVenue(id)));
+    if (!featureSets.some((f) => f.includes('customers_insight'))) {
+      throw new ForbiddenException(
+        "Your current plan doesn't include Customers & player history. Ask Areana about upgrading your plan.",
+      );
+    }
     const bookings = await this.prisma.booking.findMany({
       where: { venueId: { in: ids }, userId: { not: null } },
       select: {
@@ -1138,6 +1180,27 @@ export class OwnerService {
   }
 
   // ---------------------------------------------------------------- reviews
+  /** Plan + billing state for every venue the user operates. */
+  async billing(user: AuthUser) {
+    const ids = await this.venueIds(user);
+    const venues = await this.prisma.venue.findMany({
+      where: { id: { in: ids } },
+      include: { plan: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    const out = [];
+    for (const v of venues) {
+      const billing = await this.plans.billingSummary(v);
+      out.push({
+        venue: { id: v.id, name: v.name, city: v.city, status: v.status },
+        planName: billing.planName,
+        billing,
+        features: await this.plans.featuresForVenue(v.id),
+      });
+    }
+    return out;
+  }
+
   async reviews(user: AuthUser, venueId?: string) {
     const ids = venueId ? [(await this.assertVenue(user, venueId)).id] : await this.venueIds(user);
     return this.prisma.review.findMany({

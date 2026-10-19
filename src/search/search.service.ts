@@ -30,6 +30,7 @@ export class SearchService {
       where: {
         status: VenueStatus.approved,
         archivedAt: null,
+        billingPaused: false,
         owner: { status: UserStatus.active },
         ...(q.city ? { city: { equals: q.city, mode: 'insensitive' } } : {}),
         courts: {
