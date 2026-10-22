@@ -606,6 +606,8 @@ model AuditLog {
   action    String
   entity    String
   entityId  String
+  /// Optional human-readable detail (e.g. which fields an edit changed).
+  details   String?
   createdAt DateTime @default(now())
 
   @@index([entity, entityId])

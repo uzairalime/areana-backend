@@ -198,7 +198,9 @@ export class OwnerService {
       (dto.lng !== undefined && dto.lng !== current.lng);
     const data: Prisma.VenueUpdateInput = { ...dto };
     if (dto.sports !== undefined) {
-      data.sports = await this.sports.normalizeSports(dto.sports);
+      data.sports = await this.sports.normalizeSports(dto.sports, {
+        grandfathered: current.sports,
+      });
     }
     let backToPending = false;
     if (identityChanged && current.status === VenueStatus.approved) {
@@ -336,11 +338,17 @@ export class OwnerService {
    * reality the moment courts changed.
    */
   private async syncVenueSports(venueId: string) {
-    const courts = await this.prisma.court.findMany({
-      where: { venueId, isActive: true },
-      select: { sport: true },
-    });
-    const sports = [...new Set(courts.map((c) => c.sport))];
+    const [courts, venue] = await Promise.all([
+      this.prisma.court.findMany({
+        where: { venueId, isActive: true },
+        select: { sport: true },
+      }),
+      this.prisma.venue.findUnique({ where: { id: venueId }, select: { sports: true } }),
+    ]);
+    // Union, never shrink: a sport the venue already lists (e.g. one the
+    // admin set, or whose court was deactivated) must not silently vanish
+    // because a court was added or edited.
+    const sports = [...new Set([...(venue?.sports ?? []), ...courts.map((c) => c.sport)])];
     await this.prisma.venue.update({ where: { id: venueId }, data: { sports } });
   }
 

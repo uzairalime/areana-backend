@@ -1,4 +1,4 @@
-import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Min, ValidateNested } from 'class-validator';
+import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, Min, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -7,8 +7,8 @@ export class CreateVenueDto {
   @ApiProperty() @IsString() address: string;
   @ApiProperty() @IsString() city: string;
   @ApiPropertyOptional() @IsOptional() @IsString() phone?: string;
-  @ApiPropertyOptional() @IsOptional() @IsNumber() lat?: number;
-  @ApiPropertyOptional() @IsOptional() @IsNumber() lng?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-90) @Max(90) lat?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-180) @Max(180) lng?: number;
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsString({ each: true }) sports?: string[];
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsString({ each: true }) amenities?: string[];
 }
@@ -21,8 +21,8 @@ export class UpdateVenueDto {
   // CreateVenueDto always had lat/lng but Update did not — the global
   // ValidationPipe whitelist silently STRIPPED them, so editing a
   // venue's coordinates in the panel never persisted.
-  @ApiPropertyOptional() @IsOptional() @IsNumber() lat?: number;
-  @ApiPropertyOptional() @IsOptional() @IsNumber() lng?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-90) @Max(90) lat?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-180) @Max(180) lng?: number;
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsString({ each: true }) sports?: string[];
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsString({ each: true }) amenities?: string[];
   @ApiPropertyOptional() @IsOptional() autoAccept?: boolean;

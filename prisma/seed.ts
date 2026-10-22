@@ -132,9 +132,13 @@ async function main() {
     'Hockey',
     'Squash',
   ];
-  for (const [i, name] of DEFAULT_SPORTS.entries()) {
-    const exists = await prisma.sport.findFirst({ where: { name } });
-    if (!exists) await prisma.sport.create({ data: { name, sortOrder: i } });
+  // Defaults are a starting point ONLY: once the catalog exists it is
+  // fully admin-managed, so re-seeding must never resurrect a sport the
+  // admin renamed or removed.
+  if ((await prisma.sport.count()) === 0) {
+    for (const [i, name] of DEFAULT_SPORTS.entries()) {
+      await prisma.sport.create({ data: { name, sortOrder: i } });
+    }
   }
   console.log('Sports seeded');
 

@@ -7,6 +7,7 @@ import {
   IsNumber,
   IsOptional,
   IsString,
+  Max,
   Min,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
@@ -142,8 +143,8 @@ export class OnboardArenaDto {
   @ApiProperty() @IsString() address: string;
   @ApiProperty() @IsString() city: string;
   @ApiPropertyOptional() @IsOptional() @IsString() venuePhone?: string;
-  @ApiPropertyOptional() @IsOptional() @IsNumber() lat?: number;
-  @ApiPropertyOptional() @IsOptional() @IsNumber() lng?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-90) @Max(90) lat?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-180) @Max(180) lng?: number;
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) sports?: string[];
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) amenities?: string[];
   // plan + go-live
@@ -168,8 +169,8 @@ export class AdminUpdateVenueDto {
   @ApiPropertyOptional() @IsOptional() @IsString() address?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() city?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() phone?: string;
-  @ApiPropertyOptional() @IsOptional() @IsNumber() lat?: number;
-  @ApiPropertyOptional() @IsOptional() @IsNumber() lng?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-90) @Max(90) lat?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-180) @Max(180) lng?: number;
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) sports?: string[];
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) amenities?: string[];
   @ApiPropertyOptional() @IsOptional() @IsBoolean() autoAccept?: boolean;

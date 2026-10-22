@@ -39,8 +39,16 @@ export class AdminService {
     private sports: SportsService,
   ) {}
 
-  private audit(actorId: string, action: string, entity: string, entityId: string) {
-    return this.prisma.auditLog.create({ data: { actorId, action, entity, entityId } });
+  private audit(
+    actorId: string,
+    action: string,
+    entity: string,
+    entityId: string,
+    details?: string,
+  ) {
+    return this.prisma.auditLog.create({
+      data: { actorId, action, entity, entityId, details },
+    });
   }
 
   // ---------------------------------------------------------------- users
@@ -719,9 +727,30 @@ export class AdminService {
     if (dto.autoAccept !== undefined) data.autoAccept = dto.autoAccept;
     if (dto.minAdvanceMinutes !== undefined) data.minAdvanceMinutes = dto.minAdvanceMinutes;
     if (dto.maxAdvanceDays !== undefined) data.maxAdvanceDays = dto.maxAdvanceDays;
-    if (dto.sports !== undefined) data.sports = await this.sports.normalizeSports(dto.sports);
+    if (dto.sports !== undefined)
+      data.sports = await this.sports.normalizeSports(dto.sports, {
+        grandfathered: venue.sports,
+      });
+    const changed = Object.keys(data).filter(
+      (k) => JSON.stringify((venue as Record<string, unknown>)[k]) !== JSON.stringify((data as Record<string, unknown>)[k]),
+    );
     const updated = await this.prisma.venue.update({ where: { id: venueId }, data });
-    await this.audit(actorId, 'venue.edit', 'venue', venueId);
+    await this.audit(
+      actorId,
+      'venue.edit',
+      'venue',
+      venueId,
+      changed.length ? `changed: ${changed.join(', ')}` : 'no field changes',
+    );
+    if (changed.length > 0) {
+      await this.notifications
+        .pushToUser(venue.ownerId, {
+          title: 'Arena details updated',
+          body: `Areana admin updated "${venue.name}" (${changed.join(', ')}).`,
+          data: { type: 'venue_edited', venueId },
+        })
+        .catch(() => {});
+    }
     const activeCourts = await this.prisma.court.count({ where: { venueId, isActive: true } });
     return { ...updated, readiness: venueReadiness(updated, activeCourts) };
   }
@@ -832,11 +861,15 @@ export class AdminService {
 
   // ---------------------------------------------------------- courts (admin-managed)
   private async syncVenueSports(venueId: string) {
-    const courts = await this.prisma.court.findMany({
-      where: { venueId, isActive: true },
-      select: { sport: true },
-    });
-    const sports = [...new Set(courts.map((c) => c.sport))];
+    const [courts, venue] = await Promise.all([
+      this.prisma.court.findMany({
+        where: { venueId, isActive: true },
+        select: { sport: true },
+      }),
+      this.prisma.venue.findUnique({ where: { id: venueId }, select: { sports: true } }),
+    ]);
+    // Union, never shrink (same rule as the owner flow).
+    const sports = [...new Set([...(venue?.sports ?? []), ...courts.map((c) => c.sport)])];
     await this.prisma.venue.update({ where: { id: venueId }, data: { sports } });
   }
 
@@ -866,6 +899,11 @@ export class AdminService {
   ) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
+    const open0 = dto.openMinutes ?? 360;
+    const close0 = dto.closeMinutes ?? 1380;
+    if (close0 - open0 < 60 || close0 - open0 > 1200) {
+      throw new BadRequestException('Court hours must span between 1 and 20 hours');
+    }
     const sport = await this.sports.normalizeSport(dto.sport);
     const court = await this.prisma.court.create({
       data: {
@@ -883,7 +921,14 @@ export class AdminService {
       },
     });
     await this.syncVenueSports(venueId);
-    await this.audit(actorId, 'court.create', 'court', court.id);
+    await this.audit(actorId, 'court.create', 'court', court.id, `${court.name} at venue ${venueId}`);
+    await this.notifications
+      .pushToUser(venue.ownerId, {
+        title: 'New court added',
+        body: `Areana admin added "${court.name}" (${court.sport}) to "${venue.name}".`,
+        data: { type: 'court_created', venueId },
+      })
+      .catch(() => {});
     return court;
   }
 
@@ -903,31 +948,92 @@ export class AdminService {
       isActive?: boolean;
     },
   ) {
-    const court = await this.prisma.court.findUnique({ where: { id: courtId } });
+    const court = await this.prisma.court.findUnique({
+      where: { id: courtId },
+      include: { venue: { select: { name: true, ownerId: true } } },
+    });
     if (!court) throw new NotFoundException('Court not found');
     const data: Prisma.CourtUpdateInput = { ...dto };
-    if (dto.sport !== undefined) data.sport = await this.sports.normalizeSport(dto.sport);
+    if (dto.sport !== undefined)
+      data.sport = await this.sports.normalizeSport(dto.sport, court.sport);
+    const newOpen = dto.openMinutes ?? court.openMinutes;
+    const newClose = dto.closeMinutes ?? court.closeMinutes;
+    if (newClose - newOpen < 60 || newClose - newOpen > 1200) {
+      throw new BadRequestException('Court hours must span between 1 and 20 hours');
+    }
+    if (dto.openMinutes !== undefined || dto.closeMinutes !== undefined) {
+      // Shrinking hours must not strand confirmed upcoming bookings.
+      const stranded = await this.prisma.booking.count({
+        where: {
+          courtId,
+          status: BookingStatus.confirmed,
+          date: { gte: startOfToday() },
+          OR: [{ startMinutes: { lt: newOpen } }, { endMinutes: { gt: newClose } }],
+        },
+      });
+      if (stranded > 0) {
+        throw new ConflictException(
+          `${stranded} upcoming booking(s) fall outside the new hours — move or cancel them first`,
+        );
+      }
+    }
     const updated = await this.prisma.court.update({ where: { id: courtId }, data });
     await this.syncVenueSports(court.venueId);
-    await this.audit(actorId, 'court.update', 'court', courtId);
+    await this.audit(
+      actorId,
+      'court.update',
+      'court',
+      courtId,
+      `${court.name}: ${Object.keys(dto).join(', ')}`,
+    );
+    await this.notifications
+      .pushToUser(court.venue.ownerId, {
+        title: 'Court updated',
+        body: `Areana admin updated "${court.name}" at "${court.venue.name}".`,
+        data: { type: 'court_updated', venueId: court.venueId },
+      })
+      .catch(() => {});
     return updated;
   }
 
   async deleteCourt(actorId: string, courtId: string) {
-    const court = await this.prisma.court.findUnique({ where: { id: courtId } });
+    const court = await this.prisma.court.findUnique({
+      where: { id: courtId },
+      include: { venue: { select: { name: true, ownerId: true } } },
+    });
     if (!court) throw new NotFoundException('Court not found');
-    const bookings = await this.prisma.booking.count({ where: { courtId } });
-    if (bookings > 0) {
+    const live = await this.prisma.booking.count({
+      where: { courtId, status: { not: BookingStatus.cancelled } },
+    });
+    if (live > 0) {
       throw new ConflictException(
-        `This court has ${bookings} booking(s) — deactivate it instead of deleting it`,
+        `This court has ${live} booking(s) on record — deactivate it instead of deleting it`,
+      );
+    }
+    const disputed = await this.prisma.dispute.count({
+      where: { booking: { courtId, status: BookingStatus.cancelled } },
+    });
+    if (disputed > 0) {
+      throw new ConflictException(
+        'This court has cancelled bookings with disputes on record — it cannot be deleted',
       );
     }
     await this.prisma.$transaction(async (tx) => {
+      // Only cancelled bookings can remain at this point; they carry no
+      // disputes (checked above) and are removed with the court.
+      await tx.booking.deleteMany({ where: { courtId, status: BookingStatus.cancelled } });
       await tx.slotWaitlist.deleteMany({ where: { courtId } });
       await tx.court.delete({ where: { id: courtId } });
     });
     await this.syncVenueSports(court.venueId);
-    await this.audit(actorId, 'court.delete', 'court', courtId);
+    await this.audit(actorId, 'court.delete', 'court', courtId, court.name);
+    await this.notifications
+      .pushToUser(court.venue.ownerId, {
+        title: 'Court removed',
+        body: `Areana admin removed "${court.name}" from "${court.venue.name}".`,
+        data: { type: 'court_deleted', venueId: court.venueId },
+      })
+      .catch(() => {});
     return { deleted: true };
   }
 

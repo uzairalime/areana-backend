@@ -68,7 +68,34 @@ export class SportsService {
     if (dto.icon !== undefined) data.icon = dto.icon?.trim() || null;
     if (dto.sortOrder !== undefined) data.sortOrder = dto.sortOrder;
     if (dto.isActive !== undefined) data.isActive = dto.isActive;
-    return this.prisma.sport.update({ where: { id }, data });
+    const renamed = data.name !== undefined && data.name !== sport.name;
+    const updated = await this.prisma.sport.update({ where: { id }, data });
+    if (renamed) {
+      // Cascade the rename everywhere the old name lives, so existing
+      // arenas/courts/photo tags keep working under the new spelling.
+      const oldName = sport.name;
+      const newName = data.name as string;
+      await this.prisma.court.updateMany({ where: { sport: oldName }, data: { sport: newName } });
+      const venues = await this.prisma.venue.findMany({
+        where: { sports: { has: oldName } },
+        select: { id: true, sports: true, photos: true },
+      });
+      for (const v of venues) {
+        const photos = Array.isArray(v.photos)
+          ? (v.photos as Record<string, unknown>[]).map((e) =>
+              e && e.sport === oldName ? { ...e, sport: newName } : e,
+            )
+          : v.photos;
+        await this.prisma.venue.update({
+          where: { id: v.id },
+          data: {
+            sports: v.sports.map((s) => (s === oldName ? newName : s)),
+            photos: photos as never,
+          },
+        });
+      }
+    }
+    return updated;
   }
 
   async remove(id: string) {
@@ -87,8 +114,17 @@ export class SportsService {
     return { deleted: true };
   }
 
-  /** Map free-text names to the catalog's canonical spelling; unknown or inactive sports are rejected. */
-  async normalizeSports(names: string[]): Promise<string[]> {
+  /**
+   * Map free-text names to the catalog's canonical spelling. Unknown
+   * sports are rejected; INACTIVE sports are rejected too — unless the
+   * name is grandfathered (already in use by the entity being edited),
+   * so deactivating a sport never locks an owner out of saving an
+   * unrelated change to their own arena.
+   */
+  async normalizeSports(
+    names: string[],
+    opts?: { grandfathered?: string[] },
+  ): Promise<string[]> {
     const clean = [...new Set(names.map((n) => n.trim()).filter(Boolean))];
     if (clean.length === 0) return [];
     const catalog = await this.prisma.sport.findMany({
@@ -96,21 +132,42 @@ export class SportsService {
       select: { name: true },
     });
     const byLower = new Map(catalog.map((s) => [s.name.toLowerCase(), s.name]));
+    const grand = new Map(
+      (opts?.grandfathered ?? []).map((g) => [g.toLowerCase(), g] as const),
+    );
     const out: string[] = [];
     for (const n of clean) {
       const hit = byLower.get(n.toLowerCase());
-      if (!hit) {
+      if (hit) {
+        out.push(hit);
+        continue;
+      }
+      const kept = grand.get(n.toLowerCase());
+      if (kept) {
+        out.push(kept);
+        continue;
+      }
+      // Distinguish "not in the catalog at all" from "deactivated".
+      const any = await this.prisma.sport.findFirst({
+        where: { name: { equals: n, mode: 'insensitive' } },
+        select: { name: true, isActive: true },
+      });
+      if (any && !any.isActive) {
         throw new BadRequestException(
-          `"${n}" is not in the sports catalog — sports are managed by the super admin`,
+          `"${any.name}" has been deactivated by the super admin and can't be newly selected`,
         );
       }
-      out.push(hit);
+      throw new BadRequestException(
+        `"${n}" is not in the sports catalog — sports are managed by the super admin`,
+      );
     }
     return out;
   }
 
-  async normalizeSport(name: string): Promise<string> {
-    const [hit] = await this.normalizeSports([name]);
+  async normalizeSport(name: string, grandfathered?: string): Promise<string> {
+    const [hit] = await this.normalizeSports([name], {
+      grandfathered: grandfathered ? [grandfathered] : undefined,
+    });
     if (!hit) throw new BadRequestException(`"${name}" is not in the sports catalog`);
     return hit;
   }
