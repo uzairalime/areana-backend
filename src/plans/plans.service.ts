@@ -440,6 +440,24 @@ export class PlansService {
   }
 
   /** Effective plan for a venue id (own plan, else the default plan). */
+  /** The court cap that actually applies to a venue: admin override wins, else the plan's maxCourts. */
+  async effectiveCourtLimit(venueId: string): Promise<{
+    limit: number | null;
+    source: 'override' | 'plan';
+    override: number | null;
+  }> {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { planId: true, courtLimitOverride: true },
+    });
+    if (!venue) return { limit: null, source: 'plan', override: null };
+    if (venue.courtLimitOverride !== null && venue.courtLimitOverride !== undefined) {
+      return { limit: venue.courtLimitOverride, source: 'override', override: venue.courtLimitOverride };
+    }
+    const plan = await this.effectivePlan(venue);
+    return { limit: plan?.maxCourts ?? null, source: 'plan', override: null };
+  }
+
   async planForVenueId(venueId: string) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },

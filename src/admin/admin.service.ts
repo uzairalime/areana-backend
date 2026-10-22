@@ -658,12 +658,14 @@ export class AdminService {
         current: courtCurrentMap.get(c.id) ?? 0,
       },
     }));
+    const courtLimit = await this.plans.effectiveCourtLimit(venueId);
     const billing = await this.plans.billingSummary(venue);
     const seatPlan =
       venue.plan ??
       (await this.prisma.plan.findFirst({ where: { isDefault: true } }));
     return {
       venue: { ...venue, courts },
+      courtLimit,
       billing,
       readiness: venueReadiness(
         venue,
@@ -692,6 +694,27 @@ export class AdminService {
    * Any non-'none' state hides the venue from players everywhere. A
    * reason is mandatory and is shown to the owner, who is notified.
    */
+  /** Set (or clear, with null) a per-arena court cap that overrides the plan. */
+  async setCourtLimit(actorId: string, venueId: string, limit: number | null) {
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue) throw new NotFoundException('Venue not found');
+    if (limit !== null && (!Number.isInteger(limit) || limit < 1 || limit > 500)) {
+      throw new BadRequestException('Court limit must be between 1 and 500, or empty for the plan default');
+    }
+    await this.prisma.venue.update({
+      where: { id: venueId },
+      data: { courtLimitOverride: limit },
+    });
+    await this.audit(
+      actorId,
+      'venue.court_limit',
+      'venue',
+      venueId,
+      limit === null ? 'limit: plan default' : `limit: ${limit}`,
+    );
+    return this.plans.effectiveCourtLimit(venueId);
+  }
+
   /**
    * Super-admin edit of ANY arena's data. Unlike owner edits, an admin
    * edit never sends a live venue back to pending — the admin IS the

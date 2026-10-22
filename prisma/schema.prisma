@@ -178,6 +178,9 @@ model Venue {
   /// paused on public surfaces exactly like a suspended owner's venue.
   billingPaused     Boolean   @default(false)
   billingDueNotifiedFor DateTime?
+  /// Per-arena court cap set by the super admin. Null = the plan's
+  /// maxCourts applies. Overrides the plan when set.
+  courtLimitOverride Int?
   /// Super-admin moderation: none | paused | blocked | disabled. Any
   /// non-'none' state hides the venue from players everywhere (same
   /// plumbing as billingPaused); the reason is shown to the owner.

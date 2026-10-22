@@ -203,3 +203,12 @@ export class AdminUpdateCourtDto {
   @ApiPropertyOptional() @IsOptional() @IsInt() slotMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() isActive?: boolean;
 }
+
+
+export class SetCourtLimitDto {
+  @ApiPropertyOptional({ description: 'Max courts the owner may create at this arena; null = use the plan default' })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  limit?: number | null;
+}

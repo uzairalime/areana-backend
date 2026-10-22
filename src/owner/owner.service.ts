@@ -354,12 +354,12 @@ export class OwnerService {
 
   async createCourt(user: AuthUser, venueId: string, dto: CreateCourtDto) {
     await this.assertVenue(user, venueId);
-    const plan = await this.plans.planForVenueId(venueId);
-    if (plan?.maxCourts != null) {
+    const { limit } = await this.plans.effectiveCourtLimit(venueId);
+    if (limit !== null) {
       const count = await this.prisma.court.count({ where: { venueId } });
-      if (count >= plan.maxCourts) {
+      if (count >= limit) {
         throw new ForbiddenException(
-          `Your plan allows ${plan.maxCourts} court(s) per venue. Ask Areana about upgrading.`,
+          `This arena's court limit is ${limit}. Ask Areana about raising it.`,
         );
       }
     }
