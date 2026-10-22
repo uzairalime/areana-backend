@@ -659,6 +659,7 @@ export class AdminService {
       },
     }));
     const courtLimit = await this.plans.effectiveCourtLimit(venueId);
+    const staffLimit = await this.plans.effectiveStaffLimit(venueId);
     const billing = await this.plans.billingSummary(venue);
     const seatPlan =
       venue.plan ??
@@ -666,6 +667,7 @@ export class AdminService {
     return {
       venue: { ...venue, courts },
       courtLimit,
+      staffLimit,
       billing,
       readiness: venueReadiness(
         venue,
@@ -682,7 +684,7 @@ export class AdminService {
           Number(gmvAgg._sum.totalPrice ?? 0) -
           Number(gmvAgg._sum.discountAmount ?? 0),
         seatsUsed,
-        seatsAllowed: seatPlan?.maxStaff ?? null,
+        seatsAllowed: staffLimit.limit,
       },
       payments,
     };
@@ -713,6 +715,27 @@ export class AdminService {
       limit === null ? 'limit: plan default' : `limit: ${limit}`,
     );
     return this.plans.effectiveCourtLimit(venueId);
+  }
+
+  /** Set (or clear, with null) a per-arena team-seat cap that overrides the plan. */
+  async setStaffLimit(actorId: string, venueId: string, limit: number | null) {
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue) throw new NotFoundException('Venue not found');
+    if (limit !== null && (!Number.isInteger(limit) || limit < 0 || limit > 500)) {
+      throw new BadRequestException('Team seat limit must be between 0 and 500, or empty for the plan default');
+    }
+    await this.prisma.venue.update({
+      where: { id: venueId },
+      data: { staffLimitOverride: limit },
+    });
+    await this.audit(
+      actorId,
+      'venue.staff_limit',
+      'venue',
+      venueId,
+      limit === null ? 'limit: plan default' : `limit: ${limit}`,
+    );
+    return this.plans.effectiveStaffLimit(venueId);
   }
 
   /**

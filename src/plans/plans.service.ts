@@ -458,6 +458,24 @@ export class PlansService {
     return { limit: plan?.maxCourts ?? null, source: 'plan', override: null };
   }
 
+  /** The team-seat cap that actually applies: admin override wins, else the plan's maxStaff. */
+  async effectiveStaffLimit(venueId: string): Promise<{
+    limit: number | null;
+    source: 'override' | 'plan';
+    override: number | null;
+  }> {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { planId: true, staffLimitOverride: true },
+    });
+    if (!venue) return { limit: null, source: 'plan', override: null };
+    if (venue.staffLimitOverride !== null && venue.staffLimitOverride !== undefined) {
+      return { limit: venue.staffLimitOverride, source: 'override', override: venue.staffLimitOverride };
+    }
+    const plan = await this.effectivePlan(venue);
+    return { limit: plan?.maxStaff ?? null, source: 'plan', override: null };
+  }
+
   async planForVenueId(venueId: string) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },

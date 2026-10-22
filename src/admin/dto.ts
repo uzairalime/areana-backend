@@ -212,3 +212,12 @@ export class SetCourtLimitDto {
   @Min(1)
   limit?: number | null;
 }
+
+
+export class SetStaffLimitDto {
+  @ApiPropertyOptional({ description: 'Max team seats at this arena; null = use the plan default' })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  limit?: number | null;
+}

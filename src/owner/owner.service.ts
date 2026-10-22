@@ -1270,13 +1270,20 @@ export class OwnerService {
 
   async createStaff(user: AuthUser, venueId: string, dto: CreateStaffDto) {
     await this.assertVenue(user, venueId);
-    await this.plans.requireFeature(venueId, 'staff_accounts');
-    const plan = await this.plans.planForVenueId(venueId);
-    if (plan?.maxStaff != null) {
+    const staffCap = await this.plans.effectiveStaffLimit(venueId);
+    // An explicit admin override IS the grant — it can seat a team even
+    // on a plan without the staff_accounts feature. Plan-based seating
+    // still requires the feature.
+    if (staffCap.source === 'plan') {
+      await this.plans.requireFeature(venueId, 'staff_accounts');
+    }
+    if (staffCap.limit !== null) {
       const seats = await this.prisma.venueStaff.count({ where: { venueId } });
-      if (seats >= plan.maxStaff) {
+      if (seats >= staffCap.limit) {
         throw new ForbiddenException(
-          `Your plan allows ${plan.maxStaff} staff seat(s) per venue. Ask Areana about upgrading.`,
+          staffCap.source === 'override'
+            ? `This arena's team seat limit is ${staffCap.limit}. Ask Areana about raising it.`
+            : `Your plan allows ${staffCap.limit} staff seat(s) per venue. Ask Areana about upgrading.`,
         );
       }
     }
@@ -1435,7 +1442,7 @@ export class OwnerService {
         billing,
         features: await this.plans.featuresForVenue(v.id),
         seatsUsed: await this.prisma.venueStaff.count({ where: { venueId: v.id } }),
-        seatsAllowed: plan?.maxStaff ?? null,
+        seatsAllowed: (await this.plans.effectiveStaffLimit(v.id)).limit,
         payments: await this.prisma.venuePayment.findMany({
           where: { venueId: v.id },
           orderBy: { createdAt: 'desc' },

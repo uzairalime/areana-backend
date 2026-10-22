@@ -181,6 +181,10 @@ model Venue {
   /// Per-arena court cap set by the super admin. Null = the plan's
   /// maxCourts applies. Overrides the plan when set.
   courtLimitOverride Int?
+  /// Per-arena team-seat cap set by the super admin. Null = the plan's
+  /// maxStaff applies. Setting it also grants staff seats even when the
+  /// plan lacks the staff_accounts feature (explicit admin grant).
+  staffLimitOverride Int?
   /// Super-admin moderation: none | paused | blocked | disabled. Any
   /// non-'none' state hides the venue from players everywhere (same
   /// plumbing as billingPaused); the reason is shown to the owner.

@@ -26,6 +26,7 @@ import {
   AdminCreateCourtDto,
   AdminUpdateCourtDto,
   SetCourtLimitDto,
+  SetStaffLimitDto,
 } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 import { PLAN_FEATURES } from '../plans/plans.service';
@@ -234,6 +235,16 @@ export class AdminController {
     @Body() dto: SetCourtLimitDto,
   ) {
     return this.admin.setCourtLimit(user.id, id, dto.limit ?? null);
+  }
+
+  @ApiTags('admin · venues')
+  @Post('venues/:id/staff-limit')
+  setStaffLimit(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: SetStaffLimitDto,
+  ) {
+    return this.admin.setStaffLimit(user.id, id, dto.limit ?? null);
   }
 
   @ApiTags('admin · venues')
