@@ -161,3 +161,18 @@ export class OnboardArenaDto {
   @IsArray()
   courts?: OnboardCourtDto[];
 }
+
+
+export class AdminUpdateVenueDto {
+  @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() address?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() city?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() phone?: string;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() lat?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() lng?: number;
+  @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) sports?: string[];
+  @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) amenities?: string[];
+  @ApiPropertyOptional() @IsOptional() @IsBoolean() autoAccept?: boolean;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(0) minAdvanceMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) maxAdvanceDays?: number;
+}

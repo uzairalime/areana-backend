@@ -119,6 +119,25 @@ async function main() {
   }
   console.log('Plans seeded');
 
+  // Sports catalog — super-admin managed; seeded once with the defaults.
+  const DEFAULT_SPORTS = [
+    'Football',
+    'Futsal',
+    'Cricket',
+    'Padel',
+    'Tennis',
+    'Badminton',
+    'Basketball',
+    'Volleyball',
+    'Hockey',
+    'Squash',
+  ];
+  for (const [i, name] of DEFAULT_SPORTS.entries()) {
+    const exists = await prisma.sport.findFirst({ where: { name } });
+    if (!exists) await prisma.sport.create({ data: { name, sortOrder: i } });
+  }
+  console.log('Sports seeded');
+
   const settings: Record<string, string> = {
     commissionPct: '10',
     billingGraceDays: '14',

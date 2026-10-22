@@ -23,6 +23,7 @@ import {
   venueReadiness,
   withSportTag,
 } from '../venues/venue-readiness';
+import { SportsService } from '../sports/sports.service';
 import {
   BookingsQueryDto,
   CreateBlockDto,
@@ -48,6 +49,7 @@ export class OwnerService {
     private reviewOps: ReviewsService,
     private notifications: NotificationsService,
     private plans: PlansService,
+    private sports: SportsService,
   ) {}
 
   // ------------------------------------------------------------ access scope
@@ -151,6 +153,7 @@ export class OwnerService {
         );
       }
     }
+    const sports = await this.sports.normalizeSports(dto.sports ?? []);
     const venue = await this.prisma.venue.create({
       data: {
         ownerId: user.id,
@@ -160,7 +163,7 @@ export class OwnerService {
         phone: dto.phone,
         lat: dto.lat,
         lng: dto.lng,
-        sports: dto.sports ?? [],
+        sports,
         amenities: dto.amenities ?? [],
         status: VenueStatus.draft,
       },
@@ -194,6 +197,9 @@ export class OwnerService {
       (dto.lat !== undefined && dto.lat !== current.lat) ||
       (dto.lng !== undefined && dto.lng !== current.lng);
     const data: Prisma.VenueUpdateInput = { ...dto };
+    if (dto.sports !== undefined) {
+      data.sports = await this.sports.normalizeSports(dto.sports);
+    }
     let backToPending = false;
     if (identityChanged && current.status === VenueStatus.approved) {
       data.status = VenueStatus.pending;
@@ -349,7 +355,7 @@ export class OwnerService {
         );
       }
     }
-    const data = { ...dto };
+    const data = { ...dto, sport: await this.sports.normalizeSport(dto.sport) };
     if (data.openMinutes != null && data.closeMinutes != null) {
       data.closeMinutes = this.normalizeCourtHours(data.openMinutes, data.closeMinutes);
     }

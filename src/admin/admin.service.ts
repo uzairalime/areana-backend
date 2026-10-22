@@ -5,7 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { BookingStatus, UserStatus, VenueStatus } from '@prisma/client';
+import { BookingStatus, UserStatus, VenueStatus, type Prisma } from '@prisma/client';
 import { startOfToday } from '../common/date.util';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../common/prisma';
@@ -24,6 +24,7 @@ import {
 } from '../venues/venue-readiness';
 import { CreateRoleDto, CreateUserDto, UpdateRoleDto } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
+import { SportsService } from '../sports/sports.service';
 
 @Injectable()
 export class AdminService {
@@ -35,6 +36,7 @@ export class AdminService {
     private notifications: NotificationsService,
     private storage: StorageService,
     private plans: PlansService,
+    private sports: SportsService,
   ) {}
 
   private audit(actorId: string, action: string, entity: string, entityId: string) {
@@ -389,7 +391,13 @@ export class AdminService {
       if (!plan) throw new NotFoundException('Plan not found');
     }
     const courtSports = [...new Set((dto.courts ?? []).map((c) => c.sport))];
-    const sports = dto.sports && dto.sports.length > 0 ? dto.sports : courtSports;
+    const sports = await this.sports.normalizeSports(
+      dto.sports && dto.sports.length > 0 ? dto.sports : courtSports,
+    );
+    const courtSportByRaw = new Map<string, string>();
+    for (const raw of courtSports) {
+      courtSportByRaw.set(raw, await this.sports.normalizeSport(raw));
+    }
 
     const result = await this.prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
@@ -436,7 +444,7 @@ export class AdminService {
               status: 'approved',
               venueId: venue.id,
               name: c.name,
-              sport: c.sport,
+              sport: courtSportByRaw.get(c.sport) ?? c.sport,
               size: c.size,
               surface: c.surface,
               indoor: c.indoor ?? false,
@@ -676,6 +684,48 @@ export class AdminService {
    * Any non-'none' state hides the venue from players everywhere. A
    * reason is mandatory and is shown to the owner, who is notified.
    */
+  /**
+   * Super-admin edit of ANY arena's data. Unlike owner edits, an admin
+   * edit never sends a live venue back to pending — the admin IS the
+   * approver. Sports are validated against the catalog.
+   */
+  async updateVenue(
+    actorId: string,
+    venueId: string,
+    dto: {
+      name?: string;
+      address?: string;
+      city?: string;
+      phone?: string | null;
+      lat?: number | null;
+      lng?: number | null;
+      sports?: string[];
+      amenities?: string[];
+      autoAccept?: boolean;
+      minAdvanceMinutes?: number;
+      maxAdvanceDays?: number;
+    },
+  ) {
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue) throw new NotFoundException('Venue not found');
+    const data: Prisma.VenueUpdateInput = {};
+    if (dto.name !== undefined) data.name = dto.name;
+    if (dto.address !== undefined) data.address = dto.address;
+    if (dto.city !== undefined) data.city = dto.city;
+    if (dto.phone !== undefined) data.phone = dto.phone;
+    if (dto.lat !== undefined) data.lat = dto.lat;
+    if (dto.lng !== undefined) data.lng = dto.lng;
+    if (dto.amenities !== undefined) data.amenities = dto.amenities;
+    if (dto.autoAccept !== undefined) data.autoAccept = dto.autoAccept;
+    if (dto.minAdvanceMinutes !== undefined) data.minAdvanceMinutes = dto.minAdvanceMinutes;
+    if (dto.maxAdvanceDays !== undefined) data.maxAdvanceDays = dto.maxAdvanceDays;
+    if (dto.sports !== undefined) data.sports = await this.sports.normalizeSports(dto.sports);
+    const updated = await this.prisma.venue.update({ where: { id: venueId }, data });
+    await this.audit(actorId, 'venue.edit', 'venue', venueId);
+    const activeCourts = await this.prisma.court.count({ where: { venueId, isActive: true } });
+    return { ...updated, readiness: venueReadiness(updated, activeCourts) };
+  }
+
   async setVenueModeration(
     actorId: string,
     venueId: string,

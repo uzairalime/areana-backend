@@ -22,6 +22,7 @@ import {
   UpdateRoleDto,
   UpdateSettingsDto,
   OnboardArenaDto,
+  AdminUpdateVenueDto,
 } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 import { PLAN_FEATURES } from '../plans/plans.service';
@@ -220,6 +221,16 @@ export class AdminController {
   @Get('venues/:id')
   venueDetailAdmin(@Param('id') id: string) {
     return this.admin.venueDetailAdmin(id);
+  }
+
+  @ApiTags('admin · venues')
+  @Patch('venues/:id')
+  updateVenue(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: AdminUpdateVenueDto,
+  ) {
+    return this.admin.updateVenue(user.id, id, dto);
   }
 
   @ApiTags('admin · venues')

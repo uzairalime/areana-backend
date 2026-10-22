@@ -28,6 +28,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { StorageModule } from './storage/storage.module';
 import { SchedulerModule } from './scheduler/scheduler.module';
 import { HealthModule } from './health/health.module';
+import { SportsModule } from './sports/sports.module';
 
 @Module({
   imports: [
@@ -63,6 +64,7 @@ import { HealthModule } from './health/health.module';
     StorageModule,
     SchedulerModule,
     HealthModule,
+    SportsModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

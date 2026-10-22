@@ -6,9 +6,10 @@ import { StorageModule } from '../storage/storage.module';
 import { OwnerController } from './owner.controller';
 import { OwnerService } from './owner.service';
 import { PlansModule } from '../plans/plans.module';
+import { SportsModule } from '../sports/sports.module';
 
 @Module({
-  imports: [BookingsModule, StorageModule, ReviewsModule, CourtsModule, PlansModule],
+  imports: [BookingsModule, StorageModule, ReviewsModule, CourtsModule, PlansModule, SportsModule],
   controllers: [OwnerController],
   providers: [OwnerService],
 })
