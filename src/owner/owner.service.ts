@@ -136,11 +136,21 @@ export class OwnerService {
   // ---------------------------------------------------------------- venues
   async listMyVenues(user: AuthUser) {
     const ids = await this.venueIds(user);
-    return this.prisma.venue.findMany({
+    const venues = await this.prisma.venue.findMany({
       where: { id: { in: ids } },
       include: { _count: { select: { courts: true } } },
       orderBy: { createdAt: 'desc' },
     });
+    const out = [];
+    for (const v of venues) {
+      const { limit } = await this.plans.effectiveCourtLimit(v.id);
+      // Rejected courts don't consume quota (matches createCourt).
+      const used = await this.prisma.court.count({
+        where: { venueId: v.id, status: { not: 'rejected' } },
+      });
+      out.push({ ...v, courtLimit: { limit, used } });
+    }
+    return out;
   }
 
   async createVenue(user: AuthUser, dto: CreateVenueDto) {
@@ -354,21 +364,29 @@ export class OwnerService {
 
   async createCourt(user: AuthUser, venueId: string, dto: CreateCourtDto) {
     await this.assertVenue(user, venueId);
-    const { limit } = await this.plans.effectiveCourtLimit(venueId);
-    if (limit !== null) {
-      const count = await this.prisma.court.count({ where: { venueId } });
-      if (count >= limit) {
-        throw new ForbiddenException(
-          `This arena's court limit is ${limit}. Ask Areana about raising it.`,
-        );
-      }
-    }
     const data = { ...dto, sport: await this.sports.normalizeSport(dto.sport) };
     if (data.openMinutes != null && data.closeMinutes != null) {
       data.closeMinutes = this.normalizeCourtHours(data.openMinutes, data.closeMinutes);
     }
-    // New courts need super-admin approval before players can see/book them.
-    const court = await this.prisma.court.create({ data: { venueId, ...data, status: 'pending' } });
+    const { limit } = await this.plans.effectiveCourtLimit(venueId);
+    // The venue row lock serializes creates per arena, so two
+    // simultaneous creates can't both pass the limit check. Rejected
+    // courts don't consume quota.
+    const court = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+      if (limit !== null) {
+        const count = await tx.court.count({
+          where: { venueId, status: { not: 'rejected' } },
+        });
+        if (count >= limit) {
+          throw new ForbiddenException(
+            `This arena's court limit is ${limit}. Ask Areana about raising it.`,
+          );
+        }
+      }
+      // New courts need super-admin approval before players can see/book them.
+      return tx.court.create({ data: { venueId, ...data, status: 'pending' } });
+    });
     await this.syncVenueSports(venueId);
     return court;
   }
@@ -1268,6 +1286,23 @@ export class OwnerService {
     return { deleted: true };
   }
 
+  /** Throws when the arena is at its seat cap. Runs inside the caller's transaction. */
+  private async assertSeatAvailable(
+    tx: Prisma.TransactionClient,
+    venueId: string,
+    staffCap: { limit: number | null; source: 'override' | 'plan' },
+  ) {
+    if (staffCap.limit === null) return;
+    const seats = await tx.venueStaff.count({ where: { venueId } });
+    if (seats >= staffCap.limit) {
+      throw new ForbiddenException(
+        staffCap.source === 'override'
+          ? `This arena's team seat limit is ${staffCap.limit}. Ask Areana about raising it.`
+          : `Your plan allows ${staffCap.limit} staff seat(s) per venue. Ask Areana about upgrading.`,
+      );
+    }
+  }
+
   async createStaff(user: AuthUser, venueId: string, dto: CreateStaffDto) {
     await this.assertVenue(user, venueId);
     const staffCap = await this.plans.effectiveStaffLimit(venueId);
@@ -1277,16 +1312,8 @@ export class OwnerService {
     if (staffCap.source === 'plan') {
       await this.plans.requireFeature(venueId, 'staff_accounts');
     }
-    if (staffCap.limit !== null) {
-      const seats = await this.prisma.venueStaff.count({ where: { venueId } });
-      if (seats >= staffCap.limit) {
-        throw new ForbiddenException(
-          staffCap.source === 'override'
-            ? `This arena's team seat limit is ${staffCap.limit}. Ask Areana about raising it.`
-            : `Your plan allows ${staffCap.limit} staff seat(s) per venue. Ask Areana about upgrading.`,
-        );
-      }
-    }
+    // The seat check itself runs inside the write transaction below,
+    // under the venue row lock — see assertSeatAvailable.
     // The role must be one the super admin allowed for this arena — or a
     // role this owner created for their own team.
     const allowed = await this.prisma.venueAllowedRole.findUnique({
@@ -1320,17 +1347,23 @@ export class OwnerService {
         exists.role.scope === 'arena' &&
         linkCount === 0
       ) {
-        const revived = await this.prisma.user.update({
-          where: { id: exists.id },
-          data: {
-            name: dto.name,
-            passwordHash: await bcrypt.hash(dto.password, 10),
-            roleId: dto.roleId,
-            status: 'active',
-          },
-        });
-        await this.prisma.venueStaff.create({
-          data: { venueId, userId: revived.id },
+        const passwordHash = await bcrypt.hash(dto.password, 10);
+        const revived = await this.prisma.$transaction(async (tx) => {
+          await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+          await this.assertSeatAvailable(tx, venueId, staffCap);
+          const u = await tx.user.update({
+            where: { id: exists.id },
+            data: {
+              name: dto.name,
+              passwordHash,
+              roleId: dto.roleId,
+              status: 'active',
+            },
+          });
+          await tx.venueStaff.create({
+            data: { venueId, userId: u.id },
+          });
+          return u;
         });
         const { passwordHash: _p, ...safe } = revived;
         return safe;
@@ -1338,15 +1371,21 @@ export class OwnerService {
       throw new ConflictException('Email already registered');
     }
 
-    const member = await this.prisma.user.create({
-      data: {
-        email,
-        name: dto.name,
-        passwordHash: await bcrypt.hash(dto.password, 10),
-        roleId: dto.roleId,
-      },
+    const passwordHash = await bcrypt.hash(dto.password, 10);
+    const member = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+      await this.assertSeatAvailable(tx, venueId, staffCap);
+      const m = await tx.user.create({
+        data: {
+          email,
+          name: dto.name,
+          passwordHash,
+          roleId: dto.roleId,
+        },
+      });
+      await tx.venueStaff.create({ data: { venueId, userId: m.id } });
+      return m;
     });
-    await this.prisma.venueStaff.create({ data: { venueId, userId: member.id } });
     const { passwordHash: _p, ...safe } = member;
     return safe;
   }

@@ -714,6 +714,16 @@ export class AdminService {
       venueId,
       limit === null ? 'limit: plan default' : `limit: ${limit}`,
     );
+    void this.notifications
+      .pushToUser(venue.ownerId, {
+        title: 'Court limit updated',
+        body:
+          limit === null
+            ? `Areana reset ${venue.name} to its plan's court limit.`
+            : `Areana set ${venue.name}'s court limit to ${limit}.`,
+        data: { type: 'venue_limit' },
+      })
+      .catch(() => {});
     return this.plans.effectiveCourtLimit(venueId);
   }
 
@@ -735,6 +745,16 @@ export class AdminService {
       venueId,
       limit === null ? 'limit: plan default' : `limit: ${limit}`,
     );
+    void this.notifications
+      .pushToUser(venue.ownerId, {
+        title: 'Team seat limit updated',
+        body:
+          limit === null
+            ? `Areana reset ${venue.name} to its plan's team seat limit.`
+            : `Areana set ${venue.name}'s team seat limit to ${limit}.`,
+        data: { type: 'venue_limit' },
+      })
+      .catch(() => {});
     return this.plans.effectiveStaffLimit(venueId);
   }
 
