@@ -42,7 +42,7 @@ export class AdminService {
   }
 
   // ---------------------------------------------------------------- users
-  async listUsers(q?: string, roleName?: string, status?: string) {
+  async listUsers(q?: string, roleName?: string, status?: string, offset = 0) {
     return this.prisma.user.findMany({
       where: {
         ...(q ? { OR: [{ email: { contains: q, mode: 'insensitive' } }, { name: { contains: q, mode: 'insensitive' } }] } : {}),
@@ -52,6 +52,7 @@ export class AdminService {
       include: { role: { select: { name: true } } },
       orderBy: { createdAt: 'desc' },
       take: 100,
+      skip: Math.max(0, offset),
     });
   }
 
@@ -265,13 +266,32 @@ export class AdminService {
   // ---------------------------------------------------------------- roles
   listRoles() {
     return this.prisma.role.findMany({
-      include: { _count: { select: { users: true } } },
+      include: {
+        _count: { select: { users: true } },
+        owner: { select: { id: true, name: true, email: true } },
+      },
       orderBy: { name: 'asc' },
     });
   }
 
+  /** Enable/disable an owner-created role. Its permissions immediately
+   * stop (or resume) applying to every team member holding it. */
+  async setRoleActive(actorId: string, roleId: string, isActive: boolean) {
+    const role = await this.prisma.role.findUnique({ where: { id: roleId } });
+    if (!role) throw new NotFoundException('Role not found');
+    if (!role.ownerId) {
+      throw new BadRequestException('Only owner-created roles can be disabled here');
+    }
+    const updated = await this.prisma.role.update({
+      where: { id: roleId },
+      data: { isActive },
+    });
+    await this.audit(actorId, isActive ? 'role.enable' : 'role.disable', 'role', roleId);
+    return updated;
+  }
+
   async createRole(actorId: string, dto: CreateRoleDto) {
-    const exists = await this.prisma.role.findUnique({ where: { name: dto.name } });
+    const exists = await this.prisma.role.findFirst({ where: { name: dto.name, ownerId: null } });
     if (exists) throw new ConflictException('Role name taken');
     const role = await this.prisma.role.create({ data: { ...dto, scope: dto.scope as any } });
     await this.audit(actorId, 'role.create', 'role', role.id);
@@ -413,6 +433,7 @@ export class AdminService {
         courts.push(
           await tx.court.create({
             data: {
+              status: 'approved',
               venueId: venue.id,
               name: c.name,
               sport: c.sport,
@@ -444,8 +465,13 @@ export class AdminService {
     };
   }
 
-  /** Every venue (any status) with owner, courts, plan and billing. */
-  async listVenuesAdmin() {
+  /**
+   * Every venue (any status) with owner, courts, plan, billing, readiness
+   * and performance stats. `range` (7d | 30d | all) windows the bookings /
+   * views / clicks; subscription revenue is the all-time ledger total.
+   * `sort`: bookings | views | clicks | revenue | name.
+   */
+  async listVenuesAdmin(opts?: { sort?: string; range?: string }) {
     const venues = await this.prisma.venue.findMany({
       include: {
         owner: { select: { id: true, name: true, email: true, phone: true, status: true } },
@@ -454,14 +480,77 @@ export class AdminService {
       },
       orderBy: [{ name: 'asc' }],
     });
+    const rangeDays = opts?.range === '7d' ? 7 : opts?.range === '30d' ? 30 : null;
+    const since = rangeDays
+      ? new Date(Date.now() - (rangeDays - 1) * 86400000)
+      : null;
+    const sinceDay = since
+      ? new Date(
+          `${new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Karachi' }).format(since)}T00:00:00.000Z`,
+        )
+      : null;
+    const [bookingRows, eventRows, paymentRows] = await Promise.all([
+      this.prisma.booking.groupBy({
+        by: ['venueId'],
+        where: {
+          status: { in: ['confirmed', 'completed'] },
+          ...(since ? { createdAt: { gte: since } } : {}),
+        },
+        _count: true,
+        _sum: { totalPrice: true, discountAmount: true },
+      }),
+      this.prisma.venueEvent.groupBy({
+        by: ['venueId', 'type'],
+        where: sinceDay ? { day: { gte: sinceDay } } : {},
+        _count: true,
+      }),
+      this.prisma.venuePayment.groupBy({ by: ['venueId'], _sum: { amount: true } }),
+    ]);
+    const bookingByVenue = new Map(
+      bookingRows.map((r) => [
+        r.venueId,
+        {
+          bookings: r._count,
+          gmv: Number(r._sum.totalPrice ?? 0) - Number(r._sum.discountAmount ?? 0),
+        },
+      ]),
+    );
+    const eventsByVenue = new Map<string, { views: number; clicks: number }>();
+    for (const r of eventRows) {
+      const cur = eventsByVenue.get(r.venueId) ?? { views: 0, clicks: 0 };
+      if (r.type === 'view') cur.views = r._count;
+      if (r.type === 'click') cur.clicks = r._count;
+      eventsByVenue.set(r.venueId, cur);
+    }
+    const revenueByVenue = new Map(
+      paymentRows.map((r) => [r.venueId, r._sum.amount ?? 0]),
+    );
     const out = [];
     for (const v of venues) {
+      const b = bookingByVenue.get(v.id) ?? { bookings: 0, gmv: 0 };
+      const e = eventsByVenue.get(v.id) ?? { views: 0, clicks: 0 };
       out.push({
         venue: v,
         billing: await this.plans.billingSummary(v),
         readiness: venueReadiness(v, v.courts.filter((c) => c.isActive).length),
+        stats: {
+          bookings: b.bookings,
+          gmv: b.gmv,
+          views: e.views,
+          clicks: e.clicks,
+          subscriptionRevenue: revenueByVenue.get(v.id) ?? 0,
+        },
       });
     }
+    const sort = opts?.sort ?? 'bookings';
+    out.sort((x, y) => {
+      if (sort === 'name') return x.venue.name.localeCompare(y.venue.name);
+      if (sort === 'views') return y.stats.views - x.stats.views;
+      if (sort === 'clicks') return y.stats.clicks - x.stats.clicks;
+      if (sort === 'revenue')
+        return y.stats.subscriptionRevenue - x.stats.subscriptionRevenue;
+      return y.stats.bookings - x.stats.bookings;
+    });
     return out;
   }
 
@@ -478,14 +567,217 @@ export class AdminService {
       },
     });
     if (!venue) throw new NotFoundException('Venue not found');
+    const dayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Karachi',
+    }).format(new Date());
+    const today = new Date(`${dayStr}T00:00:00.000Z`);
+    const [
+      bookingsTotal,
+      bookingsCurrent,
+      views,
+      clicks,
+      courtViews,
+      revenueAgg,
+      gmvAgg,
+      payments,
+      courtAgg,
+      courtCurrent,
+      seatsUsed,
+    ] = await Promise.all([
+      this.prisma.booking.count({
+        where: { venueId, status: { not: 'cancelled' } },
+      }),
+      this.prisma.booking.count({
+        where: { venueId, status: 'confirmed', date: { gte: today } },
+      }),
+      this.prisma.venueEvent.count({ where: { venueId, type: 'view' } }),
+      this.prisma.venueEvent.count({ where: { venueId, type: 'click' } }),
+      this.prisma.venueEvent.count({ where: { venueId, type: 'court_view' } }),
+      this.prisma.venuePayment.aggregate({
+        where: { venueId },
+        _sum: { amount: true },
+      }),
+      this.prisma.booking.aggregate({
+        where: { venueId, status: { in: ['confirmed', 'completed'] } },
+        _sum: { totalPrice: true, discountAmount: true },
+      }),
+      this.prisma.venuePayment.findMany({
+        where: { venueId },
+        orderBy: { createdAt: 'desc' },
+        take: 20,
+        include: {
+          plan: { select: { name: true } },
+          recordedBy: { select: { name: true, email: true } },
+        },
+      }),
+      this.prisma.booking.groupBy({
+        by: ['courtId'],
+        where: { venueId, status: { in: ['confirmed', 'completed'] } },
+        _count: true,
+        _sum: { totalPrice: true, discountAmount: true },
+      }),
+      this.prisma.booking.groupBy({
+        by: ['courtId'],
+        where: { venueId, status: 'confirmed', date: { gte: today } },
+        _count: true,
+      }),
+      this.prisma.venueStaff.count({ where: { venueId } }),
+    ]);
+    const courtStats = new Map(
+      courtAgg.map((r) => [
+        r.courtId,
+        {
+          bookings: r._count,
+          revenue:
+            Number(r._sum.totalPrice ?? 0) - Number(r._sum.discountAmount ?? 0),
+        },
+      ]),
+    );
+    const courtCurrentMap = new Map(courtCurrent.map((r) => [r.courtId, r._count]));
+    const courts = venue.courts.map((c) => ({
+      ...c,
+      stats: {
+        bookings: courtStats.get(c.id)?.bookings ?? 0,
+        revenue: courtStats.get(c.id)?.revenue ?? 0,
+        current: courtCurrentMap.get(c.id) ?? 0,
+      },
+    }));
+    const billing = await this.plans.billingSummary(venue);
+    const seatPlan =
+      venue.plan ??
+      (await this.prisma.plan.findFirst({ where: { isDefault: true } }));
     return {
-      venue,
-      billing: await this.plans.billingSummary(venue),
+      venue: { ...venue, courts },
+      billing,
       readiness: venueReadiness(
         venue,
         venue.courts.filter((c) => c.isActive).length,
       ),
+      stats: {
+        bookingsTotal,
+        bookingsCurrent,
+        views,
+        clicks,
+        courtViews,
+        subscriptionRevenue: revenueAgg._sum.amount ?? 0,
+        gmv:
+          Number(gmvAgg._sum.totalPrice ?? 0) -
+          Number(gmvAgg._sum.discountAmount ?? 0),
+        seatsUsed,
+        seatsAllowed: seatPlan?.maxStaff ?? null,
+      },
+      payments,
     };
+  }
+
+  // ------------------------------------------------------------ moderation
+  /**
+   * Pause / block / disable a venue (or clear it with status 'none').
+   * Any non-'none' state hides the venue from players everywhere. A
+   * reason is mandatory and is shown to the owner, who is notified.
+   */
+  async setVenueModeration(
+    actorId: string,
+    venueId: string,
+    dto: { status: string; reason?: string },
+  ) {
+    const status = dto.status;
+    if (!['none', 'paused', 'blocked', 'disabled'].includes(status)) {
+      throw new BadRequestException('Invalid moderation status');
+    }
+    const reason = dto.reason?.trim();
+    if (status !== 'none' && !reason) {
+      throw new BadRequestException('A reason is required — the owner will see it');
+    }
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue) throw new NotFoundException('Venue not found');
+    const updated = await this.prisma.venue.update({
+      where: { id: venueId },
+      data: {
+        moderationStatus: status,
+        moderationReason: status === 'none' ? null : reason,
+        moderatedAt: status === 'none' ? null : new Date(),
+        moderatedById: status === 'none' ? null : actorId,
+      },
+    });
+    await this.audit(actorId, `venue.moderation.${status}`, 'venue', venueId);
+    const titles: Record<string, string> = {
+      paused: 'Your arena has been paused',
+      blocked: 'Your arena has been blocked',
+      disabled: 'Your arena has been disabled',
+      none: 'Your arena is visible again',
+    };
+    await this.notifications
+      .pushToUser(venue.ownerId, {
+        title: titles[status],
+        body:
+          status === 'none'
+            ? `${venue.name} is back on Areana and visible to players.`
+            : `${venue.name} is hidden from players. Reason: ${reason}`,
+        data: { type: 'venue_moderation', venueId },
+      })
+      .catch(() => {});
+    return updated;
+  }
+
+  // -------------------------------------------------------- court approvals
+  async pendingCourts() {
+    return this.prisma.court.findMany({
+      where: { status: 'pending' },
+      include: {
+        venue: {
+          select: {
+            id: true,
+            name: true,
+            city: true,
+            owner: { select: { name: true, email: true } },
+          },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  async approveCourt(actorId: string, courtId: string) {
+    const court = await this.prisma.court.findUnique({
+      where: { id: courtId },
+      include: { venue: { select: { name: true, ownerId: true } } },
+    });
+    if (!court) throw new NotFoundException('Court not found');
+    const updated = await this.prisma.court.update({
+      where: { id: courtId },
+      data: { status: 'approved' },
+    });
+    await this.audit(actorId, 'court.approve', 'court', courtId);
+    await this.notifications
+      .pushToUser(court.venue.ownerId, {
+        title: 'Court approved',
+        body: `${court.name} at ${court.venue.name} is live — players can now book it.`,
+        data: { type: 'court_approved', venueId: court.venueId },
+      })
+      .catch(() => {});
+    return updated;
+  }
+
+  async rejectCourt(actorId: string, courtId: string, note?: string) {
+    const court = await this.prisma.court.findUnique({
+      where: { id: courtId },
+      include: { venue: { select: { name: true, ownerId: true } } },
+    });
+    if (!court) throw new NotFoundException('Court not found');
+    const updated = await this.prisma.court.update({
+      where: { id: courtId },
+      data: { status: 'rejected' },
+    });
+    await this.audit(actorId, 'court.reject', 'court', courtId);
+    await this.notifications
+      .pushToUser(court.venue.ownerId, {
+        title: 'Court not approved',
+        body: `${court.name} at ${court.venue.name} was not approved.${note ? ` Note: ${note}` : ''} Edit it and it goes back into the review queue.`,
+        data: { type: 'court_rejected', venueId: court.venueId },
+      })
+      .catch(() => {});
+    return updated;
   }
 
   // ---------------------------------------------------------- venue images
@@ -589,8 +881,12 @@ export class AdminService {
     return { venue, billing: await this.plans.billingSummary(venue) };
   }
 
-  async markVenuePaid(actorId: string, venueId: string) {
-    const venue = await this.plans.markPaid(venueId);
+  async markVenuePaid(
+    actorId: string,
+    venueId: string,
+    opts?: { method?: string; note?: string },
+  ) {
+    const venue = await this.plans.markPaid(venueId, actorId, opts);
     await this.audit(actorId, 'venue.billing.mark_paid', 'venue', venueId);
     return { venue, billing: await this.plans.billingSummary(venue) };
   }
@@ -634,7 +930,13 @@ export class AdminService {
 
   // ---------------------------------------------------------------- promos
   listPromos() {
-    return this.prisma.promoCode.findMany({ orderBy: { createdAt: 'desc' }, take: 100 });
+    return this.prisma.promoCode.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+      include: {
+        venue: { select: { id: true, name: true } },
+      },
+    });
   }
 
   async createPromo(actorId: string, dto: any) {
@@ -723,12 +1025,13 @@ export class AdminService {
   }
 
   // ----------------------------------------------------------------- audit
-  auditLogs(entity?: string, take = 100) {
+  auditLogs(entity?: string, take = 100, offset = 0) {
     return this.prisma.auditLog.findMany({
       where: entity ? { entity } : {},
       include: { actor: { select: { name: true, email: true } } },
       orderBy: { createdAt: 'desc' },
       take,
+      skip: Math.max(0, offset),
     });
   }
 
@@ -757,8 +1060,18 @@ export class AdminService {
 
   async sendBroadcast(actorId: string, title: string, body: string, city?: string) {
     const targeted = await this.notifications.broadcastPush({ title, body }, city);
+    await this.prisma.broadcast.create({
+      data: { title, body, city: city ?? null, targeted, sentById: actorId },
+    });
     await this.audit(actorId, 'broadcast.send', 'broadcast', city ?? 'all');
     return { targeted };
+  }
+
+  broadcastHistory() {
+    return this.prisma.broadcast.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
   }
 
   listBanners() {

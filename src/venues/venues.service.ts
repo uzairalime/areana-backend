@@ -7,6 +7,64 @@ import { QueryVenuesDto } from './dto';
 export class VenuesService {
   constructor(private prisma: PrismaService) {}
 
+  // ------------------------------------------------------------ tracking
+  /**
+   * Record a listing view / click / court view. Deduplicated to one per
+   * identity per venue (or court) per Asia/Karachi day by the unique
+   * dedupeKey — repeat beacons the same day are no-ops. The venue's own
+   * owner never counts. Guests count via their visitor id.
+   */
+  async recordEvent(
+    venueId: string,
+    body: { type?: string; courtId?: string; visitorId?: string },
+    user?: { id: string },
+    ip?: string,
+  ) {
+    const type = body?.type ?? '';
+    if (!['view', 'click', 'court_view'].includes(type)) {
+      return { recorded: false };
+    }
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { id: true, ownerId: true },
+    });
+    if (!venue) return { recorded: false };
+    if (user && user.id === venue.ownerId) return { recorded: false };
+    let courtId: string | null = null;
+    if (type === 'court_view') {
+      if (!body.courtId) return { recorded: false };
+      const court = await this.prisma.court.findFirst({
+        where: { id: body.courtId, venueId },
+        select: { id: true },
+      });
+      if (!court) return { recorded: false };
+      courtId = court.id;
+    }
+    const dayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Karachi',
+    }).format(new Date());
+    const identity = user
+      ? user.id
+      : body.visitorId
+        ? `g:${String(body.visitorId).slice(0, 64)}`
+        : `ip:${ip ?? 'unknown'}`;
+    const dedupeKey = `${venueId}|${courtId ?? ''}|${type}|${identity}|${dayStr}`;
+    await this.prisma.venueEvent.upsert({
+      where: { dedupeKey },
+      create: {
+        venueId,
+        courtId,
+        type,
+        identity,
+        userId: user?.id ?? null,
+        day: new Date(`${dayStr}T00:00:00.000Z`),
+        dedupeKey,
+      },
+      update: {},
+    });
+    return { recorded: true };
+  }
+
   // Public listing — only approved venues are visible to players.
   async list(query: QueryVenuesDto) {
     const { q, city, sport, surface, sort, page = 1, limit = 20 } = query;
@@ -17,13 +75,14 @@ export class VenuesService {
       status: VenueStatus.approved,
       archivedAt: null,
       billingPaused: false,
+      moderationStatus: 'none',
       owner: { status: UserStatus.active },
     };
     if (city) where.city = { equals: city, mode: 'insensitive' };
     if (sport) where.sports = { has: sport };
     if (surface) {
       where.courts = {
-        some: { isActive: true, surface: { equals: surface, mode: 'insensitive' } },
+        some: { isActive: true, status: 'approved', surface: { equals: surface, mode: 'insensitive' } },
       };
     }
     if (q) {
@@ -103,7 +162,7 @@ export class VenuesService {
       where: {
         isActive: true,
         surface: { not: null },
-        venue: { status: VenueStatus.approved, archivedAt: null, billingPaused: false, owner: { status: UserStatus.active } },
+        venue: { status: VenueStatus.approved, archivedAt: null, billingPaused: false, moderationStatus: 'none', owner: { status: UserStatus.active } },
       },
       select: { surface: true },
       distinct: ['surface'],
@@ -126,9 +185,9 @@ export class VenuesService {
 
   async getById(id: string) {
     const venue = await this.prisma.venue.findFirst({
-      where: { id, status: VenueStatus.approved, archivedAt: null, billingPaused: false, owner: { status: UserStatus.active } },
+      where: { id, status: VenueStatus.approved, archivedAt: null, billingPaused: false, moderationStatus: 'none', owner: { status: UserStatus.active } },
       include: {
-        courts: { where: { isActive: true }, orderBy: { pricePerHour: 'asc' } },
+        courts: { where: { isActive: true, status: 'approved' }, orderBy: { pricePerHour: 'asc' } },
         badges: { include: { badge: true }, orderBy: { badge: { tier: 'desc' } } },
       },
     });

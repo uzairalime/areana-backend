@@ -193,3 +193,44 @@ export class CreatePriceWindowDto {
   @Matches(/^\d{4}-\d{2}-\d{2}$/)
   endsOn?: string;
 }
+
+// ------------------------------------------------------------ own roles
+export class CreateMyRoleDto {
+  @ApiProperty({ example: 'Manager' }) @IsString() name: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() description?: string;
+  @ApiProperty({ type: [String], description: 'Arena permission keys' })
+  @IsArray()
+  @IsString({ each: true })
+  permissions: string[];
+}
+
+export class UpdateMyRoleDto {
+  @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() description?: string;
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  permissions?: string[];
+}
+
+// ------------------------------------------------------------ own promos
+export class CreateMyPromoDto {
+  @ApiProperty() @IsString() venueId: string;
+  @ApiProperty({ example: 'EID20' }) @IsString() code: string;
+  @ApiProperty({ enum: ['percent', 'flat'] }) @IsIn(['percent', 'flat']) kind: string;
+  @ApiProperty() @IsNumber() @Min(0) value: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) maxDiscount?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) maxUses?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) perUserLimit?: number;
+  @ApiProperty({ description: 'ISO date the promo stops working' }) @IsString() validTo: string;
+}
+
+export class UpdateMyPromoDto {
+  @ApiPropertyOptional() @IsOptional() @IsBoolean() isActive?: boolean;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) value?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) maxDiscount?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) maxUses?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) perUserLimit?: number;
+  @ApiPropertyOptional() @IsOptional() @IsString() validTo?: string;
+}

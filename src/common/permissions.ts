@@ -29,6 +29,23 @@ export const PERMISSIONS = {
 
 export type PermissionKey = keyof typeof PERMISSIONS;
 
+/**
+ * Permissions an arena owner may grant through roles they create for
+ * their own team (Manager, Salesperson, …). Arena-scope only — platform
+ * keys and '*' are never owner-grantable.
+ */
+export const ARENA_ROLE_PERMISSIONS = [
+  'venues.manage',
+  'courts.manage',
+  'bookings.review',
+  'bookings.manage',
+  'blocks.manage',
+  'schedule.manage',
+  'customers.read',
+  'staff.manage',
+  'reviews.reply',
+] as const;
+
 export const PERMISSION_LIST = Object.entries(PERMISSIONS).map(([key, description]) => ({
   key,
   description,

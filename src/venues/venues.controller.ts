@@ -1,6 +1,6 @@
-import { Controller, Get, Param, Query } from '@nestjs/common';
+import { Body, Controller, Get, Ip, Param, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
-import { Public } from '../common/auth';
+import { CurrentUser, Public, type AuthUser } from '../common/auth';
 import { VenuesService } from './venues.service';
 import { QueryVenuesDto } from './dto';
 
@@ -33,5 +33,17 @@ export class VenuesController {
   @Get(':id')
   getById(@Param('id') id: string) {
     return this.venues.getById(id);
+  }
+
+  /** View / click beacon from the player web (fire-and-forget). */
+  @Public()
+  @Post(':id/events')
+  recordEvent(
+    @Param('id') id: string,
+    @Body() body: { type?: string; courtId?: string; visitorId?: string },
+    @CurrentUser() user: AuthUser | undefined,
+    @Ip() ip: string,
+  ) {
+    return this.venues.recordEvent(id, body ?? {}, user, ip);
   }
 }

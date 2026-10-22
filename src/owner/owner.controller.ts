@@ -31,6 +31,10 @@ import {
   UpdateCourtDto,
   UpdateVenueDto,
   WalkInDto,
+  CreateMyRoleDto,
+  UpdateMyRoleDto,
+  CreateMyPromoDto,
+  UpdateMyPromoDto,
 } from './dto';
 
 @ApiBearerAuth()
@@ -351,6 +355,72 @@ export class OwnerController {
   @Patch('reschedules/:id/reject')
   rejectReschedule(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: RejectDto) {
     return this.owner.rejectReschedule(user, id, dto.reason);
+  }
+
+  // ------------------------------------------------------------ own promos
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · promos')
+  @Get('promos')
+  listMyPromos(@CurrentUser() user: AuthUser) {
+    return this.owner.listMyPromos(user);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · promos')
+  @Post('promos')
+  createMyPromo(@CurrentUser() user: AuthUser, @Body() dto: CreateMyPromoDto) {
+    return this.owner.createMyPromo(user, dto);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · promos')
+  @Patch('promos/:id')
+  updateMyPromo(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: UpdateMyPromoDto,
+  ) {
+    return this.owner.updateMyPromo(user, id, dto);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · promos')
+  @Delete('promos/:id')
+  deleteMyPromo(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.deleteMyPromo(user, id);
+  }
+
+  // ------------------------------------------------------------- own roles
+  @RequirePerm('staff.manage')
+  @ApiTags('owner · roles')
+  @Get('roles')
+  listMyRoles(@CurrentUser() user: AuthUser) {
+    return this.owner.listMyRoles(user);
+  }
+
+  @RequirePerm('staff.manage')
+  @ApiTags('owner · roles')
+  @Post('roles')
+  createMyRole(@CurrentUser() user: AuthUser, @Body() dto: CreateMyRoleDto) {
+    return this.owner.createMyRole(user, dto);
+  }
+
+  @RequirePerm('staff.manage')
+  @ApiTags('owner · roles')
+  @Patch('roles/:id')
+  updateMyRole(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: UpdateMyRoleDto,
+  ) {
+    return this.owner.updateMyRole(user, id, dto);
+  }
+
+  @RequirePerm('staff.manage')
+  @ApiTags('owner · roles')
+  @Delete('roles/:id')
+  deleteMyRole(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.deleteMyRole(user, id);
   }
 
   // ------------------------------------------------------------------ staff

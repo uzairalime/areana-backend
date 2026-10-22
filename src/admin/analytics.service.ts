@@ -50,8 +50,41 @@ export class AnalyticsService {
       ),
       gmv,
       accruedCommission: Math.round((gmv * pct) / 100),
+      ...(await this.platformExtras()),
       pendingApprovals: { bookings: pendingBookings, owners: pendingOwners, venues: pendingVenues },
       openDisputes,
+    };
+  }
+
+  /** Super-admin v2 headline numbers: live bookings, subscriptions,
+   * ledger revenue and tracked engagement. */
+  private async platformExtras() {
+    const dayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Karachi',
+    }).format(new Date());
+    const today = new Date(`${dayStr}T00:00:00.000Z`);
+    const [activeBookings, currentSubscriptions, revenueAgg, views, clicks] =
+      await Promise.all([
+        this.prisma.booking.count({
+          where: { status: BookingStatus.confirmed, date: { gte: today } },
+        }),
+        this.prisma.venue.count({
+          where: {
+            status: VenueStatus.approved,
+            billingStartAt: { not: null },
+            billingPaused: false,
+          },
+        }),
+        this.prisma.venuePayment.aggregate({ _sum: { amount: true } }),
+        this.prisma.venueEvent.count({ where: { type: 'view' } }),
+        this.prisma.venueEvent.count({ where: { type: 'click' } }),
+      ]);
+    return {
+      activeBookings,
+      currentSubscriptions,
+      subscriptionRevenue: revenueAgg._sum.amount ?? 0,
+      totalViews: views,
+      totalClicks: clicks,
     };
   }
 

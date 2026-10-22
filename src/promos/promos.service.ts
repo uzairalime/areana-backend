@@ -19,11 +19,15 @@ export class PromosService {
    * Validates a promo code for a user and computes the discount on `amount`.
    * Throws BadRequestException when the code cannot be applied.
    */
-  async validatePromo(code: string, userId: string, amount: number): Promise<PromoValidation> {
+  async validatePromo(code: string, userId: string, amount: number, venueId?: string): Promise<PromoValidation> {
     const promo = await this.prisma.promoCode.findUnique({
       where: { code: code.toUpperCase().trim() },
     });
     if (!promo || !promo.isActive) throw new BadRequestException('Invalid promo code');
+    // Owner-managed promos are valid only at their own venue.
+    if (promo.venueId && venueId && promo.venueId !== venueId) {
+      throw new BadRequestException('This promo code is not valid for this venue');
+    }
 
     const now = new Date();
     if (promo.validFrom > now || promo.validTo < now) {

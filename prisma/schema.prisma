@@ -39,15 +39,27 @@ enum BookingStatus {
 
 model Role {
   id          String    @id @default(cuid())
-  name        String    @unique
+  // No longer globally unique: an owner-created role only needs a unique
+  // name within that owner's roles (@@unique below); system role names
+  // are kept unique in code.
+  name        String
   scope       RoleScope @default(arena)
   description String?
   permissions String[] // permission keys, e.g. "bookings.approve"
   isSystem    Boolean   @default(false)
+  /// Set when an arena owner created this role for their own team. Null =
+  /// a platform role managed by the super admin.
+  ownerId     String?
+  owner       User?     @relation("RoleOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  /// Super admin can disable an owner-created role; its permissions stop
+  /// applying to everyone holding it.
+  isActive    Boolean   @default(true)
   createdAt   DateTime  @default(now())
 
   users        User[]
   venueAllowed VenueAllowedRole[]
+
+  @@unique([ownerId, name])
 }
 
 model User {
@@ -85,6 +97,8 @@ model User {
   referralsMade     Referral[]       @relation("Referrer")
   referralsReceived Referral[]       @relation("Referee")
   refreshSessions RefreshSession[]
+  rolesOwned      Role[]           @relation("RoleOwner")
+  venuePayments   VenuePayment[]   @relation("PaymentRecordedBy")
 
 }
 
@@ -164,6 +178,13 @@ model Venue {
   /// paused on public surfaces exactly like a suspended owner's venue.
   billingPaused     Boolean   @default(false)
   billingDueNotifiedFor DateTime?
+  /// Super-admin moderation: none | paused | blocked | disabled. Any
+  /// non-'none' state hides the venue from players everywhere (same
+  /// plumbing as billingPaused); the reason is shown to the owner.
+  moderationStatus  String    @default("none")
+  moderationReason  String?
+  moderatedAt       DateTime?
+  moderatedById     String?
   status            VenueStatus @default(draft)
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
@@ -173,6 +194,9 @@ model Venue {
   reviews      Review[]
   favorites    Favorite[]
   staff        VenueStaff[]
+  events       VenueEvent[]
+  payments     VenuePayment[]
+  promos       PromoCode[]
   allowedRoles VenueAllowedRole[]
   badges       VenueBadge[]
   gamePosts    GamePost[]
@@ -215,10 +239,15 @@ model Court {
   closeMinutes Int      @default(1380) // 11:00 PM
   slotMinutes  Int      @default(60)
   isActive     Boolean  @default(true)
+  /// Super-admin approval for owner-created courts: approved | pending |
+  /// rejected. Existing and admin-created courts are approved; a pending
+  /// court is invisible to players and cannot be booked.
+  status       String   @default("approved")
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
   slotBlocks     SlotBlock[]
+  events         VenueEvent[]
   weeklyWindows  CourtWeeklyWindow[]
   recurringBlocks RecurringBlock[]
   priceWindows   CourtPriceWindow[]
@@ -454,6 +483,11 @@ model GameParticipant {
 // ---------------------------------------------------------------------------
 model PromoCode {
   id           String    @id @default(cuid())
+  /// Null = a platform-wide promo (super admin). Set = an owner-managed
+  /// promo valid only at that venue.
+  venueId      String?
+  venue        Venue?    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  createdById  String?
   code         String    @unique
   kind         String // percent | flat
   value        Decimal   @db.Decimal(10, 2)
@@ -592,6 +626,7 @@ model Plan {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   venues      Venue[]
+  payments    VenuePayment[]
 }
 
 model Setting {
@@ -617,4 +652,67 @@ model Notification {
 
   @@index([userId, createdAt])
   @@index([userId, readAt])
+}
+
+// ---------------------------------------------------------------------------
+// Arena view / click tracking. One row per identity per venue (or court)
+// per day: the unique dedupeKey makes "1 view per user per day" a database
+// guarantee, not an app hope. identity = user id, or "g:<visitorId>" for
+// guests, or "ip:<ip>" as a last resort.
+// ---------------------------------------------------------------------------
+model VenueEvent {
+  id        String   @id @default(cuid())
+  venueId   String
+  venue     Venue    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  courtId   String?
+  court     Court?   @relation(fields: [courtId], references: [id], onDelete: SetNull)
+  type      String // view | click | court_view
+  identity  String
+  userId    String?
+  day       DateTime @db.Date
+  dedupeKey String   @unique
+  createdAt DateTime @default(now())
+
+  @@index([venueId, type, day])
+  @@index([courtId, type, day])
+}
+
+// ---------------------------------------------------------------------------
+// Subscription payments ledger: every "mark paid" (and any manual entry)
+// writes a row, so platform revenue and per-arena revenue are sums of real
+// records, not flags.
+// ---------------------------------------------------------------------------
+model VenuePayment {
+  id           String   @id @default(cuid())
+  venueId      String
+  venue        Venue    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  planId       String?
+  plan         Plan?    @relation(fields: [planId], references: [id], onDelete: SetNull)
+  amount       Int // PKR
+  method       String? // bank | raast | cash | other
+  periodStart  DateTime?
+  periodEnd    DateTime?
+  note         String?
+  recordedById String?
+  recordedBy   User?    @relation("PaymentRecordedBy", fields: [recordedById], references: [id], onDelete: SetNull)
+  createdAt    DateTime @default(now())
+
+  @@index([venueId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast history: every admin broadcast is recorded at send time so the
+// CMS can show what went out, when, to which city and how many devices it
+// targeted.
+// ---------------------------------------------------------------------------
+model Broadcast {
+  id        String   @id @default(cuid())
+  title     String
+  body      String
+  city      String?
+  targeted  Int      @default(0)
+  sentById  String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
 }

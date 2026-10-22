@@ -84,7 +84,7 @@ export class BookingsController {
     const court = await this.courts.getActiveCourt(courtId);
     const n = Math.max(1, parseInt(slotCount ?? '1', 10));
     const amount = Number(court.pricePerHour) * ((court.slotMinutes * n) / 60);
-    return this.promos.validatePromo(code, user.id, amount);
+    return this.promos.validatePromo(code, user.id, amount, court.venueId);
   }
 
   // --- group booking share links ---

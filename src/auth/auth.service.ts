@@ -112,7 +112,7 @@ export class AuthService {
     // consuming here would burn the code and make that call fail with 401.
     // It is consumed below, only once every check has passed.
 
-    const playerRole = await this.prisma.role.findUniqueOrThrow({ where: { name: 'player' } });
+    const playerRole = await this.prisma.role.findFirstOrThrow({ where: { name: 'player', ownerId: null } });
 
     let welcomePromoCode: string | null = null;
     let user = await this.prisma.user.findUnique({ where: { email } });
@@ -238,7 +238,7 @@ export class AuthService {
     const exists = await this.prisma.user.findUnique({ where: { email } });
     if (exists) throw new ConflictException('Email already registered');
 
-    const ownerRole = await this.prisma.role.findUniqueOrThrow({ where: { name: 'owner' } });
+    const ownerRole = await this.prisma.role.findFirstOrThrow({ where: { name: 'owner', ownerId: null } });
     const user = await this.prisma.user.create({
       data: {
         email,

@@ -31,11 +31,13 @@ export class SearchService {
         status: VenueStatus.approved,
         archivedAt: null,
         billingPaused: false,
+        moderationStatus: 'none',
         owner: { status: UserStatus.active },
         ...(q.city ? { city: { equals: q.city, mode: 'insensitive' } } : {}),
         courts: {
           some: {
             isActive: true,
+            status: 'approved',
             ...(q.sport ? { sport: { equals: q.sport, mode: 'insensitive' } } : {}),
             ...(q.size ? { size: q.size } : {}),
             ...(q.indoor !== undefined ? { indoor: q.indoor } : {}),

@@ -16,6 +16,8 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { parseDateOnly, startOfToday } from '../common/date.util';
 import { CourtsService, toYmd } from '../courts/courts.service';
 import { PlansService } from '../plans/plans.service';
+import { ARENA_ROLE_PERMISSIONS } from '../common/permissions';
+import type { CreateMyPromoDto, CreateMyRoleDto, UpdateMyPromoDto, UpdateMyRoleDto } from './dto';
 import {
   photoEntriesOf,
   venueReadiness,
@@ -351,7 +353,8 @@ export class OwnerService {
     if (data.openMinutes != null && data.closeMinutes != null) {
       data.closeMinutes = this.normalizeCourtHours(data.openMinutes, data.closeMinutes);
     }
-    const court = await this.prisma.court.create({ data: { venueId, ...data } });
+    // New courts need super-admin approval before players can see/book them.
+    const court = await this.prisma.court.create({ data: { venueId, ...data, status: 'pending' } });
     await this.syncVenueSports(venueId);
     return court;
   }
@@ -367,7 +370,11 @@ export class OwnerService {
         data.closeMinutes ?? court.closeMinutes,
       );
     }
-    const updated = await this.prisma.court.update({ where: { id: courtId }, data });
+    // Editing a rejected court re-submits it for approval.
+    const updated = await this.prisma.court.update({
+      where: { id: courtId },
+      data: court.status === 'rejected' ? { ...data, status: 'pending' } : data,
+    });
     await this.syncVenueSports(court.venueId);
     return updated;
   }
@@ -1044,12 +1051,22 @@ export class OwnerService {
   // ------------------------------------------------------------------ staff
   /** Roles the super admin enabled for this venue — the only ones the owner may hand out. */
   async allowedRoles(user: AuthUser, venueId: string) {
-    await this.assertVenue(user, venueId);
+    const venue = await this.assertVenue(user, venueId);
     const links = await this.prisma.venueAllowedRole.findMany({
       where: { venueId },
       include: { role: true },
     });
-    return links.map((l) => l.role);
+    const roles = links.map((l) => l.role);
+    // The owner's own roles are assignable at all of his venues.
+    if (venue.ownerId === user.id || user.permissions.includes('venues.manage')) {
+      const own = await this.prisma.role.findMany({
+        where: { ownerId: venue.ownerId, scope: 'arena', isActive: true },
+        orderBy: { name: 'asc' },
+      });
+      const seen = new Set(roles.map((r) => r.id));
+      for (const r of own) if (!seen.has(r.id)) roles.push(r);
+    }
+    return roles;
   }
 
   async staffList(user: AuthUser, venueId: string) {
@@ -1058,6 +1075,183 @@ export class OwnerService {
       where: { venueId },
       include: { user: { select: { id: true, name: true, email: true, role: { select: { name: true } } } } },
     });
+  }
+
+  // ------------------------------------------------------------ own roles
+  /** Roles this owner can assign: platform arena roles the super admin
+   * enabled for his venues, plus roles he created himself. */
+  async listMyRoles(user: AuthUser) {
+    const venues = await this.prisma.venue.findMany({
+      where: { ownerId: user.id },
+      select: { id: true },
+    });
+    const allowed = await this.prisma.venueAllowedRole.findMany({
+      where: { venueId: { in: venues.map((v) => v.id) } },
+      include: {
+        role: { include: { _count: { select: { users: true } } } },
+      },
+    });
+    const systemById = new Map<string, (typeof allowed)[number]['role']>();
+    for (const row of allowed) {
+      if (row.role.ownerId === null && row.role.scope === 'arena') {
+        systemById.set(row.role.id, row.role);
+      }
+    }
+    const own = await this.prisma.role.findMany({
+      where: { ownerId: user.id },
+      include: { _count: { select: { users: true } } },
+      orderBy: { name: 'asc' },
+    });
+    return {
+      system: [...systemById.values()].sort((x, y) => x.name.localeCompare(y.name)),
+      own,
+      grantablePermissions: [...ARENA_ROLE_PERMISSIONS],
+    };
+  }
+
+  private assertGrantable(permissions: string[]) {
+    const bad = permissions.filter(
+      (p) => !(ARENA_ROLE_PERMISSIONS as readonly string[]).includes(p),
+    );
+    if (bad.length > 0) {
+      throw new BadRequestException(
+        `These permissions can't be granted by an owner: ${bad.join(', ')}`,
+      );
+    }
+  }
+
+  async createMyRole(user: AuthUser, dto: CreateMyRoleDto) {
+    this.assertGrantable(dto.permissions);
+    const name = dto.name.trim();
+    if (!name) throw new BadRequestException('Role name is required');
+    const clash = await this.prisma.role.findFirst({
+      where: { ownerId: user.id, name: { equals: name, mode: 'insensitive' } },
+    });
+    if (clash) throw new ConflictException('You already have a role with this name');
+    return this.prisma.role.create({
+      data: {
+        name,
+        description: dto.description,
+        permissions: [...new Set(dto.permissions)],
+        scope: 'arena',
+        ownerId: user.id,
+      },
+    });
+  }
+
+  async updateMyRole(user: AuthUser, roleId: string, dto: UpdateMyRoleDto) {
+    const role = await this.prisma.role.findFirst({
+      where: { id: roleId, ownerId: user.id },
+    });
+    if (!role) throw new NotFoundException('Role not found');
+    if (dto.permissions) this.assertGrantable(dto.permissions);
+    if (dto.name && dto.name.trim().toLowerCase() !== role.name.toLowerCase()) {
+      const clash = await this.prisma.role.findFirst({
+        where: {
+          ownerId: user.id,
+          name: { equals: dto.name.trim(), mode: 'insensitive' },
+          id: { not: roleId },
+        },
+      });
+      if (clash) throw new ConflictException('You already have a role with this name');
+    }
+    return this.prisma.role.update({
+      where: { id: roleId },
+      data: {
+        name: dto.name?.trim() ?? undefined,
+        description: dto.description,
+        permissions: dto.permissions ? [...new Set(dto.permissions)] : undefined,
+      },
+    });
+  }
+
+  async deleteMyRole(user: AuthUser, roleId: string) {
+    const role = await this.prisma.role.findFirst({
+      where: { id: roleId, ownerId: user.id },
+      include: { _count: { select: { users: true } } },
+    });
+    if (!role) throw new NotFoundException('Role not found');
+    if (role._count.users > 0) {
+      throw new BadRequestException(
+        `${role._count.users} team member(s) still hold this role — reassign them first`,
+      );
+    }
+    await this.prisma.role.delete({ where: { id: roleId } });
+    return { deleted: true };
+  }
+
+  // ------------------------------------------------------------ own promos
+  /** Promos this owner manages (venue-scoped), across all his venues. */
+  async listMyPromos(user: AuthUser) {
+    return this.prisma.promoCode.findMany({
+      where: { venue: { ownerId: user.id } },
+      include: { venue: { select: { id: true, name: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async createMyPromo(user: AuthUser, dto: CreateMyPromoDto) {
+    await this.assertVenue(user, dto.venueId);
+    const code = dto.code.toUpperCase().trim();
+    if (!code) throw new BadRequestException('Promo code is required');
+    if (dto.kind === 'percent' && (dto.value < 1 || dto.value > 100)) {
+      throw new BadRequestException('Percent promo value must be between 1 and 100');
+    }
+    const exists = await this.prisma.promoCode.findUnique({ where: { code } });
+    if (exists) throw new ConflictException('This code is already in use');
+    const validTo = new Date(dto.validTo);
+    if (isNaN(validTo.getTime()) || validTo <= new Date()) {
+      throw new BadRequestException('validTo must be a future date');
+    }
+    return this.prisma.promoCode.create({
+      data: {
+        venueId: dto.venueId,
+        createdById: user.id,
+        code,
+        kind: dto.kind,
+        value: dto.value,
+        maxDiscount: dto.maxDiscount,
+        maxUses: dto.maxUses,
+        perUserLimit: dto.perUserLimit ?? 1,
+        validTo,
+      },
+      include: { venue: { select: { id: true, name: true } } },
+    });
+  }
+
+  private async assertMyPromo(user: AuthUser, promoId: string) {
+    const promo = await this.prisma.promoCode.findFirst({
+      where: { id: promoId, venue: { ownerId: user.id } },
+    });
+    if (!promo) throw new NotFoundException('Promo not found');
+    return promo;
+  }
+
+  async updateMyPromo(user: AuthUser, promoId: string, dto: UpdateMyPromoDto) {
+    await this.assertMyPromo(user, promoId);
+    return this.prisma.promoCode.update({
+      where: { id: promoId },
+      data: {
+        isActive: dto.isActive,
+        value: dto.value,
+        maxDiscount: dto.maxDiscount,
+        maxUses: dto.maxUses,
+        perUserLimit: dto.perUserLimit,
+        validTo: dto.validTo ? new Date(dto.validTo) : undefined,
+      },
+      include: { venue: { select: { id: true, name: true } } },
+    });
+  }
+
+  async deleteMyPromo(user: AuthUser, promoId: string) {
+    const promo = await this.assertMyPromo(user, promoId);
+    if (promo.usedCount > 0) {
+      throw new BadRequestException(
+        'This promo has been used — deactivate it instead of deleting',
+      );
+    }
+    await this.prisma.promoCode.delete({ where: { id: promoId } });
+    return { deleted: true };
   }
 
   async createStaff(user: AuthUser, venueId: string, dto: CreateStaffDto) {
@@ -1072,13 +1266,20 @@ export class OwnerService {
         );
       }
     }
-    // The role must be one the super admin allowed for this arena.
+    // The role must be one the super admin allowed for this arena — or a
+    // role this owner created for their own team.
     const allowed = await this.prisma.venueAllowedRole.findUnique({
       where: { venueId_roleId: { venueId, roleId: dto.roleId } },
       include: { role: true },
     });
-    if (!allowed) throw new ForbiddenException('This role is not enabled for your arena');
-    if (allowed.role.scope !== 'arena' || allowed.role.name === 'owner') {
+    let staffRole = allowed?.role ?? null;
+    if (!staffRole) {
+      staffRole = await this.prisma.role.findFirst({
+        where: { id: dto.roleId, ownerId: user.id, scope: 'arena', isActive: true },
+      });
+    }
+    if (!staffRole) throw new ForbiddenException('This role is not enabled for your arena');
+    if (staffRole.scope !== 'arena' || staffRole.name === 'owner') {
       throw new ForbiddenException('Cannot assign this role to team members');
     }
     const email = dto.email.toLowerCase().trim();
@@ -1213,11 +1414,20 @@ export class OwnerService {
     const out = [];
     for (const v of venues) {
       const billing = await this.plans.billingSummary(v);
+      const plan = await this.plans.planForVenueId(v.id);
       out.push({
         venue: { id: v.id, name: v.name, city: v.city, status: v.status },
         planName: billing.planName,
         billing,
         features: await this.plans.featuresForVenue(v.id),
+        seatsUsed: await this.prisma.venueStaff.count({ where: { venueId: v.id } }),
+        seatsAllowed: plan?.maxStaff ?? null,
+        payments: await this.prisma.venuePayment.findMany({
+          where: { venueId: v.id },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+          include: { plan: { select: { name: true } } },
+        }),
       });
     }
     return out;

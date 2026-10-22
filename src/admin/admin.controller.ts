@@ -82,8 +82,8 @@ export class AdminController {
   // ------------------------------------------------------------------- users
   @ApiTags('admin · users')
   @Get('users')
-  listUsers(@Query('q') q?: string, @Query('role') role?: string, @Query('status') status?: string) {
-    return this.admin.listUsers(q, role, status);
+  listUsers(@Query('q') q?: string, @Query('role') role?: string, @Query('status') status?: string, @Query('offset') offset?: string) {
+    return this.admin.listUsers(q, role, status, offset ? parseInt(offset, 10) || 0 : 0);
   }
 
   @ApiTags('admin · users')
@@ -148,6 +148,16 @@ export class AdminController {
   }
 
   @ApiTags('admin · roles & permissions')
+  @Patch('roles/:id/active')
+  setRoleActive(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() body: { isActive: boolean },
+  ) {
+    return this.admin.setRoleActive(u.id, id, body.isActive);
+  }
+
+  @ApiTags('admin · roles & permissions')
   @Delete('roles/:id')
   deleteRole(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.admin.deleteRole(u.id, id);
@@ -191,8 +201,11 @@ export class AdminController {
   @ApiTags('admin · venues')
   @RequirePerm('venues.onboard')
   @Get('venues')
-  listVenuesAdmin() {
-    return this.admin.listVenuesAdmin();
+  listVenuesAdmin(
+    @Query('sort') sort?: string,
+    @Query('range') range?: string,
+  ) {
+    return this.admin.listVenuesAdmin({ sort, range });
   }
 
   @ApiTags('admin · venues')
@@ -231,6 +244,38 @@ export class AdminController {
     @Body('sport') sport: string | null,
   ) {
     return this.admin.tagVenueImage(id, url, sport ?? null);
+  }
+
+  @ApiTags('admin · venues')
+  @Post('venues/:id/moderation')
+  setVenueModeration(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: { status: string; reason?: string },
+  ) {
+    return this.admin.setVenueModeration(u.id, id, dto);
+  }
+
+  @ApiTags('admin · venues')
+  @Get('courts/pending')
+  pendingCourts() {
+    return this.admin.pendingCourts();
+  }
+
+  @ApiTags('admin · venues')
+  @Post('courts/:id/approve')
+  approveCourt(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.admin.approveCourt(u.id, id);
+  }
+
+  @ApiTags('admin · venues')
+  @Post('courts/:id/reject')
+  rejectCourt(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() body?: { note?: string },
+  ) {
+    return this.admin.rejectCourt(u.id, id, body?.note);
   }
 
   @ApiTags('admin · venues')
@@ -316,8 +361,12 @@ export class AdminController {
 
   @ApiTags('admin · plans')
   @Post('venues/:id/billing/mark-paid')
-  markVenuePaid(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.admin.markVenuePaid(u.id, id);
+  markVenuePaid(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Body() body?: { method?: string; note?: string },
+  ) {
+    return this.admin.markVenuePaid(u.id, id, body);
   }
 
   // ------------------------------------------------------------------ badges
@@ -373,8 +422,8 @@ export class AdminController {
   // ------------------------------------------------------------------- audit
   @ApiTags('admin · audit logs')
   @Get('audit-logs')
-  auditLogs(@Query('entity') entity?: string) {
-    return this.admin.auditLogs(entity);
+  auditLogs(@Query('entity') entity?: string, @Query('offset') offset?: string) {
+    return this.admin.auditLogs(entity, 100, offset ? parseInt(offset, 10) || 0 : 0);
   }
 
   // --------------------------------------------------------------- broadcast
@@ -382,6 +431,12 @@ export class AdminController {
   @Post('broadcasts')
   sendBroadcast(@CurrentUser() u: AuthUser, @Body() dto: SendBroadcastDto) {
     return this.admin.sendBroadcast(u.id, dto.title, dto.body, dto.city);
+  }
+
+  @ApiTags('admin · broadcasts & banners')
+  @Get('broadcasts/history')
+  broadcastHistory() {
+    return this.admin.broadcastHistory();
   }
 
   @ApiTags('admin · broadcasts & banners')

@@ -127,7 +127,7 @@ export class CourtsService {
     });
     if (!venue) throw new NotFoundException('Venue not found');
     return this.prisma.court.findMany({
-      where: { venueId, isActive: true },
+      where: { venueId, isActive: true, status: 'approved' },
       orderBy: { pricePerHour: 'asc' },
     });
   }
@@ -137,7 +137,8 @@ export class CourtsService {
       where: {
         id: courtId,
         isActive: true,
-        venue: { status: VenueStatus.approved, archivedAt: null, billingPaused: false, owner: { status: UserStatus.active } },
+        status: 'approved',
+        venue: { status: VenueStatus.approved, archivedAt: null, billingPaused: false, moderationStatus: 'none', owner: { status: UserStatus.active } },
       },
       include: { venue: true },
     });

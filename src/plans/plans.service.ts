@@ -217,7 +217,11 @@ export class PlansService {
   }
 
   /** Settle the current period: paid through its end boundary. */
-  async markPaid(venueId: string) {
+  async markPaid(
+    venueId: string,
+    actorId?: string,
+    opts?: { method?: string; note?: string },
+  ) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
       include: { plan: true },
@@ -233,6 +237,20 @@ export class PlansService {
       where: { id: venueId },
       data: { billingPaidUntil: paidUntil, billingPaused: false },
       include: { plan: true },
+    });
+    // Every settlement lands in the payments ledger, so platform revenue
+    // is a sum of records — never a guess from flags.
+    await this.prisma.venuePayment.create({
+      data: {
+        venueId,
+        planId: ctx.plan.id,
+        amount: ctx.plan.priceYearly,
+        method: opts?.method ?? null,
+        note: opts?.note ?? null,
+        periodStart: ctx.periodStart,
+        periodEnd: ctx.periodEnd,
+        recordedById: actorId ?? null,
+      },
     });
     return updated;
   }

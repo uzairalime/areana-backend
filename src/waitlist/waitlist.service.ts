@@ -30,10 +30,12 @@ export class WaitlistService {
       where: {
         id: dto.courtId,
         isActive: true,
+        status: 'approved',
         venue: {
           status: VenueStatus.approved,
           archivedAt: null,
           billingPaused: false,
+          moderationStatus: 'none',
           owner: { status: UserStatus.active },
         },
       },

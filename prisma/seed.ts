@@ -55,18 +55,26 @@ const ROLES = [
 
 async function main() {
   for (const r of ROLES) {
-    await prisma.role.upsert({
-      where: { name: r.name },
-      update: { permissions: r.permissions, description: r.description },
-      create: r,
+    // Role.name is no longer globally unique (owner-created roles share
+    // names across owners) — system roles are matched by name + ownerId null.
+    const existing = await prisma.role.findFirst({
+      where: { name: r.name, ownerId: null },
     });
+    if (existing) {
+      await prisma.role.update({
+        where: { id: existing.id },
+        data: { permissions: r.permissions, description: r.description },
+      });
+    } else {
+      await prisma.role.create({ data: r });
+    }
   }
   console.log('Roles seeded');
 
   const adminEmail = process.env.ADMIN_EMAIL;
   const adminPassword = process.env.ADMIN_PASSWORD;
   if (adminEmail && adminPassword) {
-    const superAdmin = await prisma.role.findUniqueOrThrow({ where: { name: 'super_admin' } });
+    const superAdmin = await prisma.role.findFirstOrThrow({ where: { name: 'super_admin', ownerId: null } });
     await prisma.user.upsert({
       where: { email: adminEmail },
       update: {},

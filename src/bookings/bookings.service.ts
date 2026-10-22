@@ -81,7 +81,7 @@ export class BookingsService {
     let discount = 0;
     let promo: { id: string } | null = null;
     if (input.promoCode && input.userId) {
-      const res = await this.promos.validatePromo(input.promoCode, input.userId, gross);
+      const res = await this.promos.validatePromo(input.promoCode, input.userId, gross, court.venueId);
       discount = res.discount;
       promo = res.promo;
     }
