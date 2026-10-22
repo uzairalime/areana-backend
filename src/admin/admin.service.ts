@@ -830,6 +830,123 @@ export class AdminService {
     return updated;
   }
 
+  // ---------------------------------------------------------- courts (admin-managed)
+  private async syncVenueSports(venueId: string) {
+    const courts = await this.prisma.court.findMany({
+      where: { venueId, isActive: true },
+      select: { sport: true },
+    });
+    const sports = [...new Set(courts.map((c) => c.sport))];
+    await this.prisma.venue.update({ where: { id: venueId }, data: { sports } });
+  }
+
+  private courtPhotoEntries(court: { photos?: unknown }): { url: string; blurhash?: string; width?: number; height?: number }[] {
+    if (!Array.isArray(court.photos)) return [];
+    return court.photos.filter(
+      (e): e is { url: string } =>
+        !!e && typeof e === 'object' && typeof (e as { url?: unknown }).url === 'string',
+    );
+  }
+
+  /** Admin adds a court directly — admin-created courts are approved instantly. */
+  async createCourt(
+    actorId: string,
+    venueId: string,
+    dto: {
+      name: string;
+      sport: string;
+      size?: string;
+      surface?: string;
+      indoor?: boolean;
+      pricePerHour: number;
+      openMinutes?: number;
+      closeMinutes?: number;
+      slotMinutes?: number;
+    },
+  ) {
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue) throw new NotFoundException('Venue not found');
+    const sport = await this.sports.normalizeSport(dto.sport);
+    const court = await this.prisma.court.create({
+      data: {
+        venueId,
+        name: dto.name,
+        sport,
+        size: dto.size,
+        surface: dto.surface,
+        indoor: dto.indoor ?? false,
+        pricePerHour: dto.pricePerHour,
+        openMinutes: dto.openMinutes ?? 360,
+        closeMinutes: dto.closeMinutes ?? 1380,
+        slotMinutes: dto.slotMinutes ?? 60,
+        status: 'approved',
+      },
+    });
+    await this.syncVenueSports(venueId);
+    await this.audit(actorId, 'court.create', 'court', court.id);
+    return court;
+  }
+
+  async updateCourt(
+    actorId: string,
+    courtId: string,
+    dto: {
+      name?: string;
+      sport?: string;
+      size?: string;
+      surface?: string;
+      indoor?: boolean;
+      pricePerHour?: number;
+      openMinutes?: number;
+      closeMinutes?: number;
+      slotMinutes?: number;
+      isActive?: boolean;
+    },
+  ) {
+    const court = await this.prisma.court.findUnique({ where: { id: courtId } });
+    if (!court) throw new NotFoundException('Court not found');
+    const data: Prisma.CourtUpdateInput = { ...dto };
+    if (dto.sport !== undefined) data.sport = await this.sports.normalizeSport(dto.sport);
+    const updated = await this.prisma.court.update({ where: { id: courtId }, data });
+    await this.syncVenueSports(court.venueId);
+    await this.audit(actorId, 'court.update', 'court', courtId);
+    return updated;
+  }
+
+  async deleteCourt(actorId: string, courtId: string) {
+    const court = await this.prisma.court.findUnique({ where: { id: courtId } });
+    if (!court) throw new NotFoundException('Court not found');
+    const bookings = await this.prisma.booking.count({ where: { courtId } });
+    if (bookings > 0) {
+      throw new ConflictException(
+        `This court has ${bookings} booking(s) — deactivate it instead of deleting it`,
+      );
+    }
+    await this.prisma.$transaction(async (tx) => {
+      await tx.slotWaitlist.deleteMany({ where: { courtId } });
+      await tx.court.delete({ where: { id: courtId } });
+    });
+    await this.syncVenueSports(court.venueId);
+    await this.audit(actorId, 'court.delete', 'court', courtId);
+    return { deleted: true };
+  }
+
+  async addCourtImage(courtId: string, file: Express.Multer.File) {
+    const court = await this.prisma.court.findUnique({ where: { id: courtId } });
+    if (!court) throw new NotFoundException('Court not found');
+    const photo = await this.storage.saveCourtImage(courtId, file);
+    const entries = [...this.courtPhotoEntries(court), photo];
+    return this.prisma.court.update({ where: { id: courtId }, data: { photos: entries } });
+  }
+
+  async removeCourtImage(courtId: string, url: string) {
+    const court = await this.prisma.court.findUnique({ where: { id: courtId } });
+    if (!court) throw new NotFoundException('Court not found');
+    await this.storage.deleteImage(url);
+    const entries = this.courtPhotoEntries(court).filter((e) => e.url !== url);
+    return this.prisma.court.update({ where: { id: courtId }, data: { photos: entries } });
+  }
+
   // ---------------------------------------------------------- venue images
   async addVenueImage(venueId: string, file: Express.Multer.File, sport?: string) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });

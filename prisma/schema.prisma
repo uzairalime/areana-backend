@@ -243,6 +243,10 @@ model Court {
   /// rejected. Existing and admin-created courts are approved; a pending
   /// court is invisible to players and cannot be booked.
   status       String   @default("approved")
+  /// Per-court photo entries [{ url, blurhash, width, height }] —
+  /// managed by owners/admins, shown on the venue page under the
+  /// court's tab. (Venues keep their own gallery + sport tags.)
+  photos       Json     @default("[]")
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

@@ -176,3 +176,29 @@ export class AdminUpdateVenueDto {
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(0) minAdvanceMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) maxAdvanceDays?: number;
 }
+
+
+export class AdminCreateCourtDto {
+  @ApiProperty() @IsString() name: string;
+  @ApiProperty({ example: 'Football' }) @IsString() sport: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() size?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() surface?: string;
+  @ApiPropertyOptional() @IsOptional() @IsBoolean() indoor?: boolean;
+  @ApiProperty({ example: 2500 }) @IsNumber() @Min(0) pricePerHour: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() openMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() closeMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() slotMinutes?: number;
+}
+
+export class AdminUpdateCourtDto {
+  @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() sport?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() size?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() surface?: string;
+  @ApiPropertyOptional() @IsOptional() @IsBoolean() indoor?: boolean;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) pricePerHour?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() openMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() closeMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() slotMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsBoolean() isActive?: boolean;
+}

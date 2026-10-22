@@ -93,6 +93,16 @@ export class StorageService {
     return { url, blurhash: processed.blurhash, width: processed.width, height: processed.height };
   }
 
+  async saveCourtImage(
+    courtId: string,
+    file: Express.Multer.File,
+  ): Promise<{ url: string; blurhash: string; width: number; height: number }> {
+    const processed = await this.processImage(file);
+    const key = `courts/${courtId}/${randomBytes(8).toString('hex')}.${processed.ext}`;
+    const url = await this.storeProcessed(key, processed);
+    return { url, blurhash: processed.blurhash, width: processed.width, height: processed.height };
+  }
+
   async saveBannerImage(
     file: Express.Multer.File,
   ): Promise<{ url: string; blurhash: string; width: number; height: number }> {

@@ -23,6 +23,8 @@ import {
   UpdateSettingsDto,
   OnboardArenaDto,
   AdminUpdateVenueDto,
+  AdminCreateCourtDto,
+  AdminUpdateCourtDto,
 } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 import { PLAN_FEATURES } from '../plans/plans.service';
@@ -294,6 +296,46 @@ export class AdminController {
   @Delete('venues/:id/images')
   removeVenueImage(@Param('id') id: string, @Body('url') url: string) {
     return this.admin.removeVenueImage(id, url);
+  }
+
+  @ApiTags('admin · venues')
+  @Post('venues/:venueId/courts')
+  createCourt(
+    @CurrentUser() user: AuthUser,
+    @Param('venueId') venueId: string,
+    @Body() dto: AdminCreateCourtDto,
+  ) {
+    return this.admin.createCourt(user.id, venueId, dto);
+  }
+
+  @ApiTags('admin · venues')
+  @Patch('courts/:id')
+  updateCourt(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: AdminUpdateCourtDto,
+  ) {
+    return this.admin.updateCourt(user.id, id, dto);
+  }
+
+  @ApiTags('admin · venues')
+  @Delete('courts/:id')
+  deleteCourt(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.admin.deleteCourt(user.id, id);
+  }
+
+  @ApiTags('admin · venues')
+  @Post('courts/:id/images')
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('image'))
+  addCourtImage(@Param('id') id: string, @UploadedFile() file: Express.Multer.File) {
+    return this.admin.addCourtImage(id, file);
+  }
+
+  @ApiTags('admin · venues')
+  @Delete('courts/:id/images')
+  removeCourtImage(@Param('id') id: string, @Body('url') url: string) {
+    return this.admin.removeCourtImage(id, url);
   }
 
   // ------------------------------------------------------------------ promos
