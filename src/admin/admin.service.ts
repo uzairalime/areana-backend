@@ -352,6 +352,152 @@ export class AdminService {
     });
   }
 
+  /**
+   * The full owner profile for /admin/owners/:id — account, their arenas
+   * (same row shape as the venues directory), team, billing and the
+   * audit trail touching the owner or their arenas.
+   */
+  async ownerDetail(id: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      include: { role: true },
+    });
+    if (!user) throw new NotFoundException('User not found');
+    const { passwordHash: _p, ...safeUser } = user;
+
+    const venues = await this.prisma.venue.findMany({
+      where: { ownerId: id },
+      include: {
+        owner: { select: { id: true, name: true, email: true, phone: true, status: true } },
+        plan: true,
+        courts: { orderBy: { name: 'asc' } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    const venueIds = venues.map((v) => v.id);
+
+    const [bookingRows, countRows, paymentRows, reportRows, staff, activity] =
+      await Promise.all([
+        this.prisma.booking.groupBy({
+          by: ['venueId'],
+          where: { venueId: { in: venueIds }, status: { in: ['confirmed', 'completed'] } },
+          _count: true,
+          _sum: { totalPrice: true, discountAmount: true },
+        }),
+        this.prisma.booking.groupBy({
+          by: ['venueId'],
+          where: { venueId: { in: venueIds }, status: { not: 'cancelled' } },
+          _count: true,
+        }),
+        this.prisma.venuePayment.groupBy({
+          by: ['venueId'],
+          where: { venueId: { in: venueIds } },
+          _sum: { amount: true },
+        }),
+        this.prisma.venueReport.groupBy({
+          by: ['venueId'],
+          where: { venueId: { in: venueIds }, status: 'open' },
+          _count: true,
+        }),
+        venueIds.length
+          ? this.prisma.venueStaff.findMany({
+              where: { venueId: { in: venueIds } },
+              include: {
+                user: {
+                  select: {
+                    id: true,
+                    name: true,
+                    email: true,
+                    status: true,
+                    role: { select: { name: true } },
+                  },
+                },
+                venue: { select: { id: true, name: true } },
+              },
+              orderBy: { createdAt: 'asc' },
+            })
+          : Promise.resolve([]),
+        this.prisma.auditLog.findMany({
+          where: {
+            OR: [
+              { entity: 'user', entityId: id },
+              ...(venueIds.length
+                ? [{ entity: 'venue', entityId: { in: venueIds } }]
+                : []),
+            ],
+          },
+          include: { actor: { select: { name: true, email: true } } },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+        }),
+      ]);
+
+    const gmvByVenue = new Map(
+      bookingRows.map((r) => [
+        r.venueId,
+        {
+          realized: r._count,
+          gmv: Number(r._sum.totalPrice ?? 0) - Number(r._sum.discountAmount ?? 0),
+        },
+      ]),
+    );
+    const countByVenue = new Map(countRows.map((r) => [r.venueId, r._count]));
+    const revenueByVenue = new Map(
+      paymentRows.map((r) => [r.venueId, r._sum.amount ?? 0]),
+    );
+    const reportsByVenue = new Map(reportRows.map((r) => [r.venueId, r._count]));
+
+    const rows = [];
+    for (const v of venues) {
+      const g = gmvByVenue.get(v.id) ?? { realized: 0, gmv: 0 };
+      rows.push({
+        venue: v,
+        billing: await this.plans.billingSummary(v),
+        readiness: venueReadiness(v, v.courts.filter((c) => c.isActive).length),
+        stats: {
+          bookings: countByVenue.get(v.id) ?? 0,
+          gmv: g.gmv,
+          views: 0,
+          clicks: 0,
+          subscriptionRevenue: revenueByVenue.get(v.id) ?? 0,
+          openReports: reportsByVenue.get(v.id) ?? 0,
+        },
+      });
+    }
+
+    const totalReviews = venues.reduce((s, v) => s + v.ratingCount, 0);
+    const totals = {
+      arenas: venues.length,
+      liveArenas: venues.filter((v) => v.status === 'approved').length,
+      bookings: rows.reduce((s, r) => s + r.stats.bookings, 0),
+      gmv: rows.reduce((s, r) => s + r.stats.gmv, 0),
+      subscriptionRevenue: rows.reduce((s, r) => s + r.stats.subscriptionRevenue, 0),
+      openReports: rows.reduce((s, r) => s + r.stats.openReports, 0),
+      reviews: totalReviews,
+      avgRating:
+        totalReviews > 0
+          ? venues.reduce((s, v) => s + v.rating * v.ratingCount, 0) / totalReviews
+          : 0,
+      staff: staff.length,
+    };
+
+    // Duplicate-account signal: another account on the same phone number.
+    const duplicatePhoneAccounts = safeUser.phone
+      ? await this.prisma.user.count({
+          where: { phone: safeUser.phone, id: { not: id } },
+        })
+      : 0;
+
+    return {
+      user: safeUser,
+      totals,
+      venues: rows,
+      staff,
+      activity,
+      duplicatePhoneAccounts,
+    };
+  }
+
   async pendingVenues() {
     const venues = await this.prisma.venue.findMany({
       where: { status: VenueStatus.pending },

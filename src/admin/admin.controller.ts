@@ -127,6 +127,12 @@ export class AdminController {
     return this.admin.pendingOwners();
   }
 
+  @ApiTags('admin · users')
+  @Get('owners/:id')
+  ownerProfile(@Param('id') id: string) {
+    return this.admin.ownerDetail(id);
+  }
+
   // ------------------------------------------------------------------- roles
   @ApiTags('admin · roles & permissions')
   @Get('roles')
