@@ -528,6 +528,107 @@ async function main() {
     }
   }
 
+  // ------------------------------------------------------------------
+  // Suggestions inbox demo — venue suggestions (arena leads) in every
+  // state, so Admin → Suggestions shows real cards, working status
+  // counts and the status-change actions. Idempotent on its own:
+  // suggestions are keyed by their (unique demo) venue name and an
+  // existing one is skipped. Suggested-by points at the demo players
+  // from the disputes section, with two anonymous entries to show the
+  // "Anonymous" rendering.
+  // ------------------------------------------------------------------
+  const suggestionSpecs: {
+    name: string;
+    city: string;
+    phone?: string;
+    note: string;
+    status: 'new' | 'contacted' | 'converted' | 'dismissed';
+    daysAgo: number;
+    byPlayer?: string;
+  }[] = [
+    {
+      name: 'Smash Padel Club',
+      city: 'Lahore',
+      phone: '+92 321 5550301',
+      note: 'New padel club in Johar Town with 3 courts — not on any booking app yet. Great lighting and a small cafe.',
+      status: 'new',
+      daysAgo: 1,
+      byPlayer: 'demo.player1@demo.areana.pk',
+    },
+    {
+      name: 'Goal Arena Bahria',
+      city: 'Lahore',
+      phone: '+92 333 5550302',
+      note: 'Big 8v8 turf in Bahria Town. Always packed on weekends, bookings are still handled on a notebook at the gate.',
+      status: 'new',
+      daysAgo: 2,
+    },
+    {
+      name: 'Skyline Futsal Rooftop',
+      city: 'Karachi',
+      phone: '+92 345 5550303',
+      note: 'Rooftop futsal in Clifton, open till 2am. Would be perfect for late-night games.',
+      status: 'new',
+      daysAgo: 3,
+      byPlayer: 'demo.player2@demo.areana.pk',
+    },
+    {
+      name: 'Champion Sports Complex',
+      city: 'Islamabad',
+      phone: '+92 300 5550304',
+      note: 'Multi-sport complex in F-7 with tennis courts and cricket nets under one roof.',
+      status: 'contacted',
+      daysAgo: 5,
+      byPlayer: 'demo.player3@demo.areana.pk',
+    },
+    {
+      name: 'Velocity Badminton Hall',
+      city: 'Lahore',
+      phone: '+92 321 5550305',
+      note: 'Six indoor badminton courts in Model Town, proper wooden flooring. Hosts a league every winter.',
+      status: 'contacted',
+      daysAgo: 6,
+    },
+    {
+      name: 'PowerPlay Turf',
+      city: 'Lahore',
+      phone: '+92 333 5550306',
+      note: 'Suggested during beta testing in our players group — the owner signed up and the arena is live now.',
+      status: 'converted',
+      daysAgo: 12,
+      byPlayer: 'demo.player4@demo.areana.pk',
+    },
+    {
+      name: 'City Ground DHA',
+      city: 'Karachi',
+      note: 'Huge open ground near Phase 6 — turns out it was demolished last year, so this lead is dead.',
+      status: 'dismissed',
+      daysAgo: 9,
+      byPlayer: 'demo.player1@demo.areana.pk',
+    },
+  ];
+  for (const spec of suggestionSpecs) {
+    const exists = await prisma.venueSuggestion.findFirst({
+      where: { name: spec.name },
+    });
+    if (exists) continue;
+    const suggester = spec.byPlayer
+      ? await prisma.user.findUnique({ where: { email: spec.byPlayer } })
+      : null;
+    await prisma.venueSuggestion.create({
+      data: {
+        name: spec.name,
+        city: spec.city,
+        phone: spec.phone ?? null,
+        note: spec.note,
+        status: spec.status,
+        suggestedById: suggester?.id ?? null,
+        createdAt: daysFromNow(-spec.daysAgo),
+      },
+    });
+    console.log(`✓ Suggestion (${spec.status}): ${spec.name} — ${spec.city}`);
+  }
+
   console.log('\nDemo seed complete. Owner password for all demo accounts: Demo@1234');
 }
 
