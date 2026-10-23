@@ -1,3 +1,4 @@
+import { BadRequestException } from '@nestjs/common';
 /**
  * Venue go-live readiness — the requirements a venue must meet before it
  * can be submitted / approved (set by the super admin, Oct 2026):
@@ -124,4 +125,28 @@ export function withSportTag(
   return entries.map((e) =>
     e.url === url ? { ...e, sport: sport && sport.trim() ? sport.trim() : null } : e,
   );
+}
+
+/**
+ * The booking window must be able to contain at least one slot: the
+ * minimum advance notice has to be shorter than the whole max-advance
+ * horizon. A pair like min 2 days + max 1 day makes EVERY slot
+ * unbookable (too near for one rule, too far for the other) — reject it
+ * wherever the pair is set instead of letting an arena silently die.
+ */
+export function assertBookingWindow(
+  minAdvanceMinutes: number,
+  maxAdvanceDays: number,
+) {
+  if (minAdvanceMinutes < 0) {
+    throw new BadRequestException('Min. advance cannot be negative');
+  }
+  if (maxAdvanceDays < 1) {
+    throw new BadRequestException('Max. advance must be at least 1 day');
+  }
+  if (minAdvanceMinutes >= maxAdvanceDays * 1440) {
+    throw new BadRequestException(
+      `Min. advance (${minAdvanceMinutes} min) must be shorter than the max. advance window (${maxAdvanceDays} day${maxAdvanceDays === 1 ? '' : 's'}) — with these settings no slot could ever be booked`,
+    );
+  }
 }

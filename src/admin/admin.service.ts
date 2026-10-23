@@ -18,6 +18,7 @@ import { PlansService } from '../plans/plans.service';
 import type { CreatePlanDto, UpdatePlanDto } from '../plans/dto';
 import type { OnboardArenaDto } from './dto';
 import {
+  assertBookingWindow,
   photoEntriesOf,
   venueReadiness,
   withSportTag,
@@ -1012,6 +1013,12 @@ export class AdminService {
   ) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
+    if (dto.minAdvanceMinutes !== undefined || dto.maxAdvanceDays !== undefined) {
+      assertBookingWindow(
+        dto.minAdvanceMinutes ?? venue.minAdvanceMinutes,
+        dto.maxAdvanceDays ?? venue.maxAdvanceDays,
+      );
+    }
     const data: Prisma.VenueUpdateInput = {};
     if (dto.name !== undefined) data.name = dto.name;
     if (dto.address !== undefined) data.address = dto.address;

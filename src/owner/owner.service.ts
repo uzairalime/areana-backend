@@ -19,6 +19,7 @@ import { PlansService } from '../plans/plans.service';
 import { ARENA_ROLE_PERMISSIONS } from '../common/permissions';
 import type { CreateMyPromoDto, CreateMyRoleDto, UpdateMyPromoDto, UpdateMyRoleDto } from './dto';
 import {
+  assertBookingWindow,
   photoEntriesOf,
   venueReadiness,
   withSportTag,
@@ -200,6 +201,12 @@ export class OwnerService {
     // can't silently rewrite a reviewed listing. Operational fields
     // (phone, description, amenities, photos) stay instant.
     const current = await this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
+    if (dto.minAdvanceMinutes !== undefined || dto.maxAdvanceDays !== undefined) {
+      assertBookingWindow(
+        dto.minAdvanceMinutes ?? current.minAdvanceMinutes,
+        dto.maxAdvanceDays ?? current.maxAdvanceDays,
+      );
+    }
     const identityChanged =
       (dto.name !== undefined && dto.name !== current.name) ||
       (dto.address !== undefined && dto.address !== current.address) ||

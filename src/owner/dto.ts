@@ -26,8 +26,8 @@ export class UpdateVenueDto {
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsString({ each: true }) sports?: string[];
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsString({ each: true }) amenities?: string[];
   @ApiPropertyOptional() @IsOptional() autoAccept?: boolean;
-  @ApiPropertyOptional() @IsOptional() @IsInt() minAdvanceMinutes?: number;
-  @ApiPropertyOptional() @IsOptional() @IsInt() maxAdvanceDays?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(0) minAdvanceMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) maxAdvanceDays?: number;
 }
 
 export class CreateCourtDto {
