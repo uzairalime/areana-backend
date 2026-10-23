@@ -598,6 +598,7 @@ export class AdminService {
       payments,
       courtAgg,
       courtCurrent,
+      courtTotals,
       seatsUsed,
     ] = await Promise.all([
       this.prisma.booking.count({
@@ -637,18 +638,33 @@ export class AdminService {
         where: { venueId, status: 'confirmed', date: { gte: today } },
         _count: true,
       }),
+      // One bookings definition everywhere: everything except cancelled
+      // (matches the arena Total bookings). Revenue above stays realized
+      // only (confirmed + completed).
+      this.prisma.booking.groupBy({
+        by: ['courtId'],
+        where: { venueId, status: { not: 'cancelled' } },
+        _count: true,
+      }),
       this.prisma.venueStaff.count({ where: { venueId } }),
     ]);
+    const courtTotalsMap = new Map(courtTotals.map((r) => [r.courtId, r._count]));
     const courtStats = new Map(
       courtAgg.map((r) => [
         r.courtId,
         {
-          bookings: r._count,
+          bookings: courtTotalsMap.get(r.courtId) ?? 0,
           revenue:
             Number(r._sum.totalPrice ?? 0) - Number(r._sum.discountAmount ?? 0),
         },
       ]),
     );
+    // Courts whose bookings are all pending/no-show have no revenue rows.
+    for (const [courtId, count] of courtTotalsMap) {
+      if (!courtStats.has(courtId)) {
+        courtStats.set(courtId, { bookings: count, revenue: 0 });
+      }
+    }
     const courtCurrentMap = new Map(courtCurrent.map((r) => [r.courtId, r._count]));
     const courts = venue.courts.map((c) => ({
       ...c,
@@ -808,32 +824,37 @@ export class AdminService {
       timeZone: 'Asia/Karachi',
     }).format(new Date());
     const today = new Date(`${todayStr}T00:00:00.000Z`);
-    const [upcoming, revenueAgg, courtViews, recent] = await Promise.all([
-      this.prisma.booking.count({
-        where: {
-          courtId,
-          date: { gte: today },
-          status: { in: ['pending', 'confirmed'] },
-        },
-      }),
-      this.prisma.booking.aggregate({
-        where: { courtId, status: { not: 'cancelled' } },
-        _sum: { totalPrice: true, discountAmount: true },
-      }),
-      this.prisma.venueEvent.count({
-        where: { courtId, type: 'court_view' },
-      }),
-      this.prisma.booking.findMany({
-        where: { courtId },
-        orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
-        take: 8,
-        include: { user: { select: { name: true } } },
-      }),
-    ]);
+    const [totalBookings, upcoming, revenueAgg, courtViews, recent] =
+      await Promise.all([
+        this.prisma.booking.count({
+          where: { courtId, status: { not: 'cancelled' } },
+        }),
+        this.prisma.booking.count({
+          where: {
+            courtId,
+            date: { gte: today },
+            status: { in: ['pending', 'confirmed'] },
+          },
+        }),
+        this.prisma.booking.aggregate({
+          // Realized money only — same rule as the arena GMV.
+          where: { courtId, status: { in: ['confirmed', 'completed'] } },
+          _sum: { totalPrice: true, discountAmount: true },
+        }),
+        this.prisma.venueEvent.count({
+          where: { courtId, type: 'court_view' },
+        }),
+        this.prisma.booking.findMany({
+          where: { courtId },
+          orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+          take: 8,
+          include: { user: { select: { name: true } } },
+        }),
+      ]);
     return {
       court,
       totals: {
-        bookings: court._count.bookings,
+        bookings: totalBookings,
         upcoming,
         revenue:
           Number(revenueAgg._sum.totalPrice ?? 0) -
