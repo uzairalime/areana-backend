@@ -73,7 +73,15 @@ export class AdminService {
   async getUser(id: string) {
     const user = await this.prisma.user.findUnique({
       where: { id },
-      include: { role: true },
+      include: {
+        role: true,
+        // An owner's arenas are the first thing an admin looks for on
+        // their profile (and the context for an approval decision).
+        venues: {
+          select: { id: true, name: true, city: true, status: true },
+          orderBy: { createdAt: 'desc' },
+        },
+      },
     });
     if (!user) throw new NotFoundException('User not found');
     const { passwordHash: _p, ...safe } = user;
