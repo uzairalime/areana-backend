@@ -17,7 +17,7 @@
  * relative to today, so the statuses hold whenever the script runs.
  * Running it twice is safe: it exits early if the demo data exists.
  */
-import { PrismaClient, VenueStatus } from '@prisma/client';
+import { BookingStatus, PrismaClient, VenueStatus } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 
 const prisma = new PrismaClient();
@@ -353,6 +353,179 @@ async function main() {
       await prisma.court.create({ data: { venueId: venue8.id, ...c } });
     }
     console.log('✓ Pending approval (Karachi): Demo Coastal Arena (owner demo.owner8@demo.areana.pk)');
+  }
+
+  // ------------------------------------------------------------------
+  // Disputes inbox demo — demo players + past bookings + disputes in
+  // every state, so Admin → Disputes shows real rows, working status
+  // counts and the resolve flow. Idempotent on its own: each dispute's
+  // booking carries a deterministic checkInCode (DEMO-DISP-n) and an
+  // existing one is skipped, so re-running never duplicates.
+  // ------------------------------------------------------------------
+  const playerRole = await prisma.role.findFirst({
+    where: { name: 'player', ownerId: null },
+  });
+  const superAdminUser = await prisma.user.findFirst({
+    where: { role: { name: 'super_admin' } },
+    orderBy: { createdAt: 'asc' },
+  });
+  if (!playerRole) {
+    console.log('Player role missing — skipping the disputes demo (run `npm run db:seed` first).');
+  } else {
+    const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000);
+    const demoPlayers: { email: string; name: string; phone: string; city: string }[] = [
+      { email: 'demo.player1@demo.areana.pk', name: 'Ali Hamza', phone: '+92 321 5550201', city: 'Lahore' },
+      { email: 'demo.player2@demo.areana.pk', name: 'Sara Khan', phone: '+92 333 5550202', city: 'Lahore' },
+      { email: 'demo.player3@demo.areana.pk', name: 'Hassan Sheikh', phone: '+92 345 5550203', city: 'Karachi' },
+      { email: 'demo.player4@demo.areana.pk', name: 'Fatima Noor', phone: '+92 300 5550204', city: 'Islamabad' },
+    ];
+    const players = [];
+    for (const p of demoPlayers) {
+      const player = await prisma.user.upsert({
+        where: { email: p.email },
+        update: {},
+        create: { ...p, roleId: playerRole.id, status: 'active' },
+      });
+      players.push(player);
+    }
+
+    const disputeSpecs: {
+      player: number;
+      venueName: string;
+      bookingDaysAgo: number;
+      startMinutes: number;
+      bookingStatus: BookingStatus;
+      reason: string;
+      disputeStatus: 'open' | 'resolved' | 'dismissed';
+      createdHoursAgo: number;
+      resolution?: string;
+      resolvedHoursAgo?: number;
+    }[] = [
+      {
+        player: 0,
+        venueName: 'Demo Active Arena',
+        bookingDaysAgo: 2,
+        startMinutes: 1140,
+        bookingStatus: BookingStatus.completed,
+        reason:
+          'We arrived on time but the court was given to another group for the first 20 minutes — our hour started late and nobody adjusted it.',
+        disputeStatus: 'open',
+        createdHoursAgo: 5,
+      },
+      {
+        player: 1,
+        venueName: 'Demo Trial Arena',
+        bookingDaysAgo: 3,
+        startMinutes: 1200,
+        bookingStatus: BookingStatus.completed,
+        reason:
+          'The floodlights went out halfway through our match and staff refused to extend our time or move us to the other court.',
+        disputeStatus: 'open',
+        createdHoursAgo: 26,
+      },
+      {
+        player: 2,
+        venueName: 'Demo Founding Arena',
+        bookingDaysAgo: 4,
+        startMinutes: 1080,
+        bookingStatus: BookingStatus.no_show,
+        reason:
+          'I was marked as a no-show but I reached the arena 10 minutes late and played the full hour — please remove the strike.',
+        disputeStatus: 'open',
+        createdHoursAgo: 49,
+      },
+      {
+        player: 3,
+        venueName: 'Demo Active Arena',
+        bookingDaysAgo: 5,
+        startMinutes: 1260,
+        bookingStatus: BookingStatus.completed,
+        reason:
+          'The turf was still wet and slippery from cleaning when our slot started — we had to stop after 15 minutes because it was unsafe.',
+        disputeStatus: 'open',
+        createdHoursAgo: 73,
+      },
+      {
+        player: 1,
+        venueName: 'Demo Trial Arena',
+        bookingDaysAgo: 7,
+        startMinutes: 1140,
+        bookingStatus: BookingStatus.completed,
+        reason:
+          'Paid for a full hour but the venue closed the second half for a private event without telling us in advance.',
+        disputeStatus: 'resolved',
+        createdHoursAgo: 144,
+        resolution:
+          'Verified with the venue — the second half was closed for a private event. Player credited at the venue for the lost half hour.',
+        resolvedHoursAgo: 120,
+      },
+      {
+        player: 0,
+        venueName: 'Demo Founding Arena',
+        bookingDaysAgo: 8,
+        startMinutes: 1200,
+        bookingStatus: BookingStatus.completed,
+        reason:
+          'Equipment rental was charged but no balls or net were provided for our game.',
+        disputeStatus: 'dismissed',
+        createdHoursAgo: 168,
+        resolution:
+          'Check-in scan and the venue log confirm the full hour was played with venue equipment — dispute dismissed.',
+        resolvedHoursAgo: 144,
+      },
+    ];
+
+    for (let i = 0; i < disputeSpecs.length; i++) {
+      const spec = disputeSpecs[i];
+      const checkInCode = `DEMO-DISP-${i + 1}`;
+      const existing = await prisma.booking.findUnique({ where: { checkInCode } });
+      if (existing) continue;
+      const venue = await prisma.venue.findFirst({ where: { name: spec.venueName } });
+      const court = venue
+        ? await prisma.court.findFirst({ where: { venueId: venue.id }, orderBy: { name: 'asc' } })
+        : null;
+      if (!venue || !court) {
+        console.log(`Skipping dispute demo ${i + 1}: ${spec.venueName} (or a court) not found.`);
+        continue;
+      }
+      const booking = await prisma.booking.create({
+        data: {
+          userId: players[spec.player].id,
+          venueId: venue.id,
+          courtId: court.id,
+          date: daysFromNow(-spec.bookingDaysAgo),
+          startMinutes: spec.startMinutes,
+          endMinutes: spec.startMinutes + 60,
+          totalPrice: court.pricePerHour,
+          status: spec.bookingStatus,
+          checkInCode,
+          checkedInAt:
+            spec.bookingStatus === BookingStatus.completed
+              ? hoursAgo(spec.createdHoursAgo + 3)
+              : null,
+          createdAt: hoursAgo(spec.createdHoursAgo + 3),
+        },
+      });
+      await prisma.dispute.create({
+        data: {
+          bookingId: booking.id,
+          raisedById: players[spec.player].id,
+          reason: spec.reason,
+          status: spec.disputeStatus,
+          resolution: spec.disputeStatus === 'open' ? null : (spec.resolution ?? null),
+          resolvedById:
+            spec.disputeStatus === 'open' ? null : (superAdminUser?.id ?? null),
+          resolvedAt:
+            spec.disputeStatus === 'open'
+              ? null
+              : hoursAgo(spec.resolvedHoursAgo ?? spec.createdHoursAgo - 24),
+          createdAt: hoursAgo(spec.createdHoursAgo),
+        },
+      });
+      console.log(
+        `✓ Dispute (${spec.disputeStatus}): ${players[spec.player].name} @ ${spec.venueName}`,
+      );
+    }
   }
 
   console.log('\nDemo seed complete. Owner password for all demo accounts: Demo@1234');
