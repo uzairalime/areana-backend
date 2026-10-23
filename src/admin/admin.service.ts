@@ -2248,6 +2248,17 @@ export class AdminService {
     if (dto.kind === 'flat' && dto.value < 1) {
       throw new BadRequestException('Flat promo value must be at least Rs 1');
     }
+    const validTo = new Date(dto.validTo);
+    if (isNaN(validTo.getTime())) {
+      throw new BadRequestException('validTo must be a valid date');
+    }
+    const validFrom = dto.validFrom ? new Date(dto.validFrom) : undefined;
+    if (validFrom && isNaN(validFrom.getTime())) {
+      throw new BadRequestException('validFrom must be a valid date');
+    }
+    if (validFrom && validFrom >= validTo) {
+      throw new BadRequestException('validFrom must be before validTo');
+    }
     const code = (dto.code ?? `PROMO-${Math.random().toString(36).slice(2, 8).toUpperCase()}`).toUpperCase();
     const promo = await this.prisma.promoCode.create({
       data: {
@@ -2257,7 +2268,8 @@ export class AdminService {
         maxDiscount: dto.maxDiscount,
         maxUses: dto.maxUses,
         perUserLimit: dto.perUserLimit ?? 1,
-        validTo: new Date(dto.validTo),
+        validFrom,
+        validTo,
         isActive: dto.isActive ?? true,
       },
     });

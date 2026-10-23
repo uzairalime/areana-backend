@@ -225,6 +225,7 @@ export class CreateMyPromoDto {
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) maxUses?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) perUserLimit?: number;
   @ApiProperty({ description: 'ISO date the promo stops working' }) @IsString() validTo: string;
+  @ApiPropertyOptional({ description: 'ISO date the promo starts working (default: now)' }) @IsOptional() @IsString() validFrom?: string;
 }
 
 export class UpdateMyPromoDto {
@@ -234,4 +235,5 @@ export class UpdateMyPromoDto {
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) maxUses?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) perUserLimit?: number;
   @ApiPropertyOptional() @IsOptional() @IsString() validTo?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() validFrom?: string;
 }

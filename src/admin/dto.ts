@@ -59,6 +59,7 @@ export class CreatePromoDto {
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) maxUses?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) perUserLimit?: number;
   @ApiProperty() @IsString() validTo: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() validFrom?: string;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() isActive?: boolean;
 }
 

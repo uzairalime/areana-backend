@@ -1388,6 +1388,13 @@ export class OwnerService {
     if (isNaN(validTo.getTime()) || validTo <= new Date()) {
       throw new BadRequestException('validTo must be a future date');
     }
+    const validFrom = dto.validFrom ? new Date(dto.validFrom) : undefined;
+    if (validFrom && isNaN(validFrom.getTime())) {
+      throw new BadRequestException('validFrom must be a valid date');
+    }
+    if (validFrom && validFrom >= validTo) {
+      throw new BadRequestException('validFrom must be before validTo');
+    }
     return this.prisma.promoCode.create({
       data: {
         venueId: dto.venueId,
@@ -1398,6 +1405,7 @@ export class OwnerService {
         maxDiscount: dto.maxDiscount,
         maxUses: dto.maxUses,
         perUserLimit: dto.perUserLimit ?? 1,
+        validFrom,
         validTo,
       },
       include: { venue: { select: { id: true, name: true } } },
@@ -1413,7 +1421,18 @@ export class OwnerService {
   }
 
   async updateMyPromo(user: AuthUser, promoId: string, dto: UpdateMyPromoDto) {
-    await this.assertMyPromo(user, promoId);
+    const existing = await this.assertMyPromo(user, promoId);
+    const validFrom = dto.validFrom ? new Date(dto.validFrom) : undefined;
+    const validTo = dto.validTo ? new Date(dto.validTo) : undefined;
+    if (validFrom && isNaN(validFrom.getTime())) {
+      throw new BadRequestException('validFrom must be a valid date');
+    }
+    if (validTo && isNaN(validTo.getTime())) {
+      throw new BadRequestException('validTo must be a valid date');
+    }
+    if ((validFrom ?? existing.validFrom) >= (validTo ?? existing.validTo)) {
+      throw new BadRequestException('validFrom must be before validTo');
+    }
     return this.prisma.promoCode.update({
       where: { id: promoId },
       data: {
@@ -1422,7 +1441,8 @@ export class OwnerService {
         maxDiscount: dto.maxDiscount,
         maxUses: dto.maxUses,
         perUserLimit: dto.perUserLimit,
-        validTo: dto.validTo ? new Date(dto.validTo) : undefined,
+        validFrom,
+        validTo,
       },
       include: { venue: { select: { id: true, name: true } } },
     });
