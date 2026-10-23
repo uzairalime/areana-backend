@@ -1,4 +1,5 @@
 import { IsIn, IsInt, IsOptional, IsString, Matches, Min } from 'class-validator';
+import { OffsetQueryDto } from '../common/pagination';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class CreateBookingDto {
@@ -55,7 +56,7 @@ export class CreateRecurringDto {
   occurrences: number;
 }
 
-export class MyBookingsQueryDto {
+export class MyBookingsQueryDto extends OffsetQueryDto {
   @ApiPropertyOptional({ enum: ['upcoming', 'past'], default: 'upcoming' })
   @IsOptional()
   @IsIn(['upcoming', 'past'])

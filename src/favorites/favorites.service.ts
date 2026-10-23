@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
+import { cursorPage, keysetWhere, pageLimit } from '../common/pagination';
 
 const venueSummary = {
   id: true,
@@ -19,16 +20,20 @@ const venueSummary = {
 export class FavoritesService {
   constructor(private prisma: PrismaService) {}
 
-  list(userId: string) {
-    return this.prisma.favorite.findMany({
+  async list(userId: string, cursor?: string, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 30);
+    const rows = await this.prisma.favorite.findMany({
       // Paused venues (owner suspended) disappear from favorites too.
       where: {
         userId,
         venue: { status: VenueStatus.approved, archivedAt: null, billingPaused: false, moderationStatus: 'none', owner: { status: UserStatus.active } },
+        ...keysetWhere(cursor, 'createdAt', 'desc', 'venueId'),
       },
       include: { venue: { select: venueSummary } },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { venueId: 'desc' }],
+      take: limit + 1,
     });
+    return cursorPage(rows, limit, (r) => r.createdAt, undefined, (r) => r.venueId);
   }
 
   async add(userId: string, venueId: string) {

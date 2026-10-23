@@ -2,6 +2,7 @@ import { Body, Controller, Get, Post } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser, RequirePerm } from '../common/auth';
 import { DisputesService } from './disputes.service';
+import { wrapList } from '../common/pagination';
 import { CreateDisputeDto } from './dto';
 
 @ApiTags('disputes')
@@ -17,7 +18,7 @@ export class DisputesController {
   }
 
   @Get('me')
-  listMine(@CurrentUser() user: AuthUser) {
-    return this.disputes.listMine(user.id);
+  async listMine(@CurrentUser() user: AuthUser) {
+    return wrapList(await this.disputes.listMine(user.id));
   }
 }

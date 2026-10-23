@@ -2,6 +2,7 @@ import { Body, Controller, Delete, Get, Param, Post } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser } from '../common/auth';
 import { WaitlistService } from './waitlist.service';
+import { wrapList } from '../common/pagination';
 import { JoinWaitlistDto } from './dto';
 
 @ApiTags('waitlist')
@@ -15,8 +16,8 @@ export class WaitlistController {
   }
 
   @Get('mine')
-  mine(@CurrentUser() user: AuthUser) {
-    return this.waitlist.listMine(user.id);
+  async mine(@CurrentUser() user: AuthUser) {
+    return wrapList(await this.waitlist.listMine(user.id));
   }
 
   @Delete(':id')

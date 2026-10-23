@@ -1,7 +1,8 @@
-import { Body, Controller, Delete, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser, RequirePerm } from '../common/auth';
 import { FavoritesService } from './favorites.service';
+import { CursorQueryDto } from '../common/pagination';
 import { FavoriteVenueDto } from './dto';
 
 @ApiTags('favorites')
@@ -12,8 +13,8 @@ export class FavoritesController {
   constructor(private favorites: FavoritesService) {}
 
   @Get()
-  list(@CurrentUser() user: AuthUser) {
-    return this.favorites.list(user.id);
+  list(@CurrentUser() user: AuthUser, @Query() query: CursorQueryDto) {
+    return this.favorites.list(user.id, query.cursor, query.limit);
   }
 
   @Post()

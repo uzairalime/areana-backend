@@ -2,6 +2,7 @@ import { Body, Controller, Get, Ip, Param, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { CurrentUser, Public, type AuthUser } from '../common/auth';
 import { VenuesService } from './venues.service';
+import { wrapList } from '../common/pagination';
 import { QueryVenuesDto, ReportVenueDto } from './dto';
 
 @ApiTags('venues')
@@ -18,15 +19,15 @@ export class VenuesController {
   /** Distinct cities that have at least one approved venue (for filter dropdowns). */
   @Public()
   @Get('cities')
-  cities() {
-    return this.venues.cities();
+  async cities() {
+    return wrapList(await this.venues.cities());
   }
 
   /** Distinct court surfaces across approved venues (for filter dropdowns). */
   @Public()
   @Get('surfaces')
-  surfaces() {
-    return this.venues.surfaces();
+  async surfaces() {
+    return wrapList(await this.venues.surfaces());
   }
 
   @Public()

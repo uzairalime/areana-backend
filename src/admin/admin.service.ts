@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { BookingStatus, UserStatus, VenueStatus, type Prisma } from '@prisma/client';
 import { startOfToday } from '../common/date.util';
+import { decodeCursor, encodeCursor, offsetPage, offsetPageFromDb, pageLimit } from '../common/pagination';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../common/prisma';
 import { BadgesService } from '../badges/badges.service';
@@ -278,16 +279,15 @@ export class AdminService {
    * rows are inserted or removed between requests — and a cursor whose
    * row was deleted still works, unlike Prisma's record-based cursor.
    */
+  // The codec lives in common/pagination (the shared schema); these
+  // adapters keep the (createdAt, id) shape this service's queries use.
   private keyset(cursor?: string): { createdAt: Date; id: string } | null {
-    if (!cursor) return null;
-    const [iso, id] = cursor.split('|');
-    const createdAt = new Date(iso);
-    if (!id || Number.isNaN(createdAt.getTime())) return null;
-    return { createdAt, id };
+    const ks = decodeCursor(cursor);
+    return ks ? { createdAt: ks.date, id: ks.id } : null;
   }
 
   private keysetCursor(row: { createdAt: Date; id: string }): string {
-    return `${row.createdAt.toISOString()}|${row.id}`;
+    return encodeCursor(row.createdAt, row.id);
   }
 
   async listUsers(q?: string, roleName?: string, status?: string, cursor?: string) {
@@ -1058,7 +1058,7 @@ export class AdminService {
    * views / clicks; subscription revenue is the all-time ledger total.
    * `sort`: bookings | views | clicks | revenue | name.
    */
-  async listVenuesAdmin(opts?: { sort?: string; range?: string }) {
+  async listVenuesAdmin(opts?: { sort?: string; range?: string; page?: number; limit?: number }) {
     const venues = await this.prisma.venue.findMany({
       include: {
         owner: { select: { id: true, name: true, email: true, phone: true, status: true } },
@@ -1147,7 +1147,7 @@ export class AdminService {
         return y.stats.subscriptionRevenue - x.stats.subscriptionRevenue;
       return y.stats.bookings - x.stats.bookings;
     });
-    return out;
+    return offsetPage(out, opts?.page ?? 1, pageLimit(opts?.limit, 50));
   }
 
   async venueDetailAdmin(venueId: string) {
@@ -2096,7 +2096,7 @@ export class AdminService {
   }
 
   /** All approved venues with their plan + billing state (Plans page). */
-  async listVenueBilling() {
+  async listVenueBilling(page = 1, rawLimit?: number) {
     const venues = await this.prisma.venue.findMany({
       where: { status: VenueStatus.approved },
       include: {
@@ -2109,7 +2109,7 @@ export class AdminService {
     for (const v of venues) {
       out.push({ venue: v, billing: await this.plans.billingSummary(v) });
     }
-    return out;
+    return offsetPage(out, page, pageLimit(rawLimit, 50));
   }
 
   async venueBilling(venueId: string) {
@@ -2213,14 +2213,32 @@ export class AdminService {
   }
 
   // ---------------------------------------------------------------- promos
-  listPromos() {
-    return this.prisma.promoCode.findMany({
-      orderBy: { createdAt: 'desc' },
-      take: 100,
+  async listPromos(cursor?: string, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 50);
+    const ks = this.keyset(cursor);
+    const rows = await this.prisma.promoCode.findMany({
+      where: ks
+        ? {
+            OR: [
+              { createdAt: { lt: ks.createdAt } },
+              { createdAt: ks.createdAt, id: { lt: ks.id } },
+            ],
+          }
+        : {},
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
       include: {
         venue: { select: { id: true, name: true } },
       },
     });
+    const items = rows.slice(0, limit);
+    return {
+      items,
+      nextCursor:
+        rows.length > limit && items.length
+          ? this.keysetCursor(items[items.length - 1])
+          : null,
+    };
   }
 
   async createPromo(actorId: string, dto: any) {
@@ -2289,16 +2307,39 @@ export class AdminService {
   }
 
   // --------------------------------------------------------------- disputes
-  listDisputes(status?: string) {
-    return this.prisma.dispute.findMany({
-      where: status ? { status } : {},
-      include: {
-        booking: { include: { venue: { select: { name: true } } } },
-        raisedBy: { select: { name: true, email: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-    });
+  async listDisputes(status?: string, cursor?: string, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 50);
+    const ks = this.keyset(cursor);
+    const baseWhere: Prisma.DisputeWhereInput = status ? { status } : {};
+    const [total, rows] = await Promise.all([
+      this.prisma.dispute.count({ where: baseWhere }),
+      this.prisma.dispute.findMany({
+        where: ks
+          ? {
+              ...baseWhere,
+              OR: [
+                { createdAt: { lt: ks.createdAt } },
+                { createdAt: ks.createdAt, id: { lt: ks.id } },
+              ],
+            }
+          : baseWhere,
+        include: {
+          booking: { include: { venue: { select: { name: true } } } },
+          raisedBy: { select: { name: true, email: true } },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit + 1,
+      }),
+    ]);
+    const items = rows.slice(0, limit);
+    return {
+      items,
+      total,
+      nextCursor:
+        rows.length > limit && items.length
+          ? this.keysetCursor(items[items.length - 1])
+          : null,
+    };
   }
 
   /** Resolve a player report about an arena: reviewed | actioned | dismissed. */
@@ -2334,14 +2375,20 @@ export class AdminService {
   }
 
   // ----------------------------------------------------------------- audit
-  auditLogs(entity?: string, take = 100, offset = 0) {
-    return this.prisma.auditLog.findMany({
-      where: entity ? { entity } : {},
-      include: { actor: { select: { name: true, email: true } } },
-      orderBy: { createdAt: 'desc' },
-      take,
-      skip: Math.max(0, offset),
-    });
+  async auditLogs(entity?: string, page = 1, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 100);
+    const where: Prisma.AuditLogWhereInput = entity ? { entity } : {};
+    const [total, items] = await Promise.all([
+      this.prisma.auditLog.count({ where }),
+      this.prisma.auditLog.findMany({
+        where,
+        include: { actor: { select: { name: true, email: true } } },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit,
+        skip: (Math.max(1, page) - 1) * limit,
+      }),
+    ]);
+    return offsetPageFromDb(items, total, Math.max(1, page), limit);
   }
 
   // ------------------------------------------------------------- broadcast
@@ -2376,11 +2423,29 @@ export class AdminService {
     return { targeted };
   }
 
-  broadcastHistory() {
-    return this.prisma.broadcast.findMany({
-      orderBy: { createdAt: 'desc' },
-      take: 50,
+  async broadcastHistory(cursor?: string, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 30);
+    const ks = this.keyset(cursor);
+    const rows = await this.prisma.broadcast.findMany({
+      where: ks
+        ? {
+            OR: [
+              { createdAt: { lt: ks.createdAt } },
+              { createdAt: ks.createdAt, id: { lt: ks.id } },
+            ],
+          }
+        : {},
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
     });
+    const items = rows.slice(0, limit);
+    return {
+      items,
+      nextCursor:
+        rows.length > limit && items.length
+          ? this.keysetCursor(items[items.length - 1])
+          : null,
+    };
   }
 
   listBanners() {

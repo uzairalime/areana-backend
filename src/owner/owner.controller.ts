@@ -15,6 +15,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser, RequireAnyPerm, RequirePerm } from '../common/auth';
 import { OwnerService } from './owner.service';
+import { CursorQueryDto, OffsetQueryDto, wrapList } from '../common/pagination';
 import {
   BookingsQueryDto,
   CheckInScanDto,
@@ -55,8 +56,8 @@ export class OwnerController {
 
   @ApiTags('owner · billing')
   @Get('billing')
-  billing(@CurrentUser() user: AuthUser) {
-    return this.owner.billing(user);
+  async billing(@CurrentUser() user: AuthUser) {
+    return wrapList(await this.owner.billing(user));
   }
 
   // ---------------------------------------------------------------- venues
@@ -71,8 +72,8 @@ export class OwnerController {
   }
 
   @Get('venues')
-  myVenues(@CurrentUser() user: AuthUser) {
-    return this.owner.listMyVenues(user);
+  myVenues(@CurrentUser() user: AuthUser, @Query() query: CursorQueryDto) {
+    return this.owner.listMyVenues(user, query.cursor, query.limit);
   }
 
   @RequirePerm('venues.manage')
@@ -162,8 +163,8 @@ export class OwnerController {
   @RequirePerm('courts.manage')
   @ApiTags('owner · venues & courts')
   @Get('venues/:venueId/courts')
-  courts(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
-    return this.owner.courts(user, venueId);
+  async courts(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
+    return wrapList(await this.owner.courts(user, venueId));
   }
 
   @RequirePerm('courts.manage')
@@ -188,12 +189,12 @@ export class OwnerController {
   @RequireAnyPerm('blocks.manage', 'schedule.manage')
   @ApiTags('owner · calendar blocks')
   @Get('venues/:venueId/blocks')
-  blocks(
+  async blocks(
     @CurrentUser() user: AuthUser,
     @Param('venueId') venueId: string,
     @Query('date') date?: string,
   ) {
-    return this.owner.blocks(user, venueId, date);
+    return wrapList(await this.owner.blocks(user, venueId, date));
   }
 
   @RequireAnyPerm('blocks.manage', 'schedule.manage')
@@ -348,8 +349,12 @@ export class OwnerController {
   @RequireAnyPerm('bookings.manage', 'bookings.review')
   @ApiTags('owner · reschedules')
   @Get('reschedules')
-  reschedules(@CurrentUser() user: AuthUser, @Query('status') status?: string) {
-    return this.owner.reschedules(user, status);
+  reschedules(
+    @CurrentUser() user: AuthUser,
+    @Query('status') status?: string,
+    @Query() query?: CursorQueryDto,
+  ) {
+    return this.owner.reschedules(user, status, query?.cursor, query?.limit);
   }
 
   @RequirePerm('bookings.review')
@@ -370,8 +375,8 @@ export class OwnerController {
   @RequirePerm('venues.manage')
   @ApiTags('owner · promos')
   @Get('promos')
-  listMyPromos(@CurrentUser() user: AuthUser) {
-    return this.owner.listMyPromos(user);
+  async listMyPromos(@CurrentUser() user: AuthUser) {
+    return wrapList(await this.owner.listMyPromos(user));
   }
 
   @RequirePerm('venues.manage')
@@ -435,15 +440,15 @@ export class OwnerController {
   // ------------------------------------------------------------------ staff
   @ApiTags('owner · staff')
   @Get('venues/:venueId/allowed-roles')
-  allowedRoles(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
-    return this.owner.allowedRoles(user, venueId);
+  async allowedRoles(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
+    return wrapList(await this.owner.allowedRoles(user, venueId));
   }
 
   @RequirePerm('staff.manage')
   @ApiTags('owner · staff')
   @Get('venues/:venueId/staff')
-  staffList(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
-    return this.owner.staffList(user, venueId);
+  async staffList(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
+    return wrapList(await this.owner.staffList(user, venueId));
   }
 
   @RequirePerm('staff.manage')
@@ -468,16 +473,24 @@ export class OwnerController {
   @RequirePerm('customers.read')
   @ApiTags('owner · customers')
   @Get('customers')
-  customers(@CurrentUser() user: AuthUser, @Query('venueId') venueId?: string) {
-    return this.owner.customers(user, venueId);
+  customers(
+    @CurrentUser() user: AuthUser,
+    @Query('venueId') venueId?: string,
+    @Query() query?: OffsetQueryDto,
+  ) {
+    return this.owner.customers(user, venueId, query?.page ?? 1, query?.limit);
   }
 
   // ---------------------------------------------------------------- reviews
   @RequirePerm('reviews.reply')
   @ApiTags('owner · reviews')
   @Get('reviews')
-  reviews(@CurrentUser() user: AuthUser, @Query('venueId') venueId?: string) {
-    return this.owner.reviews(user, venueId);
+  reviews(
+    @CurrentUser() user: AuthUser,
+    @Query('venueId') venueId?: string,
+    @Query() query?: CursorQueryDto,
+  ) {
+    return this.owner.reviews(user, venueId, query?.cursor, query?.limit);
   }
 
   @RequirePerm('reviews.reply')

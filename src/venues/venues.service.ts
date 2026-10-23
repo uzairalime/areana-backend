@@ -1,6 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
+import { offsetPageFromDb } from '../common/pagination';
 import { QueryVenuesDto } from './dto';
 
 @Injectable()
@@ -230,14 +231,14 @@ export class VenuesService {
             (b.fromPrice ?? Number.MAX_SAFE_INTEGER)) *
           dir,
       );
-      return {
+      return offsetPageFromDb(
+        shaped.slice((page - 1) * limit, page * limit),
         total,
         page,
         limit,
-        data: shaped.slice((page - 1) * limit, page * limit),
-      };
+      );
     }
-    return { total, page, limit, data: shaped };
+    return offsetPageFromDb(shaped, total, page, limit);
   }
 
   /** Distinct court surfaces across approved venues (for the filter dock). */

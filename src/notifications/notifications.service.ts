@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../common/prisma';
+import { cursorPage, keysetWhere, pageLimit } from '../common/pagination';
 import { MailService } from '../auth/mail.service';
 
 interface PushMessage {
@@ -65,12 +66,14 @@ export class NotificationsService {
   }
 
   // --- inbox -------------------------------------------------------------
-  listMine(userId: string) {
-    return this.prisma.notification.findMany({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      take: 50,
+  async listMine(userId: string, cursor?: string, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 30);
+    const rows = await this.prisma.notification.findMany({
+      where: { userId, ...keysetWhere(cursor, 'createdAt', 'desc') },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
     });
+    return cursorPage(rows, limit);
   }
 
   async unreadCount(userId: string): Promise<{ count: number }> {

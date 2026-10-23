@@ -1,4 +1,5 @@
 import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, Min, ValidateNested } from 'class-validator';
+import { OffsetQueryDto } from '../common/pagination';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -98,7 +99,7 @@ export class ReplyReviewDto {
   @ApiProperty() @IsString() reply: string;
 }
 
-export class BookingsQueryDto {
+export class BookingsQueryDto extends OffsetQueryDto {
   @ApiPropertyOptional() @IsOptional() @IsString() venueId?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() @Matches(/^\d{4}-\d{2}-\d{2}$/) date?: string;
   @ApiPropertyOptional()

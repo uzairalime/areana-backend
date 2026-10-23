@@ -4,6 +4,7 @@ import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { PERMISSION_LIST } from '../common/permissions';
 import { AuthUser, CurrentUser, RequirePerm } from '../common/auth';
 import { AdminService } from './admin.service';
+import { CursorQueryDto, OffsetQueryDto, offsetPage, pageLimit, wrapList } from '../common/pagination';
 import { AnalyticsService } from './analytics.service';
 import {
   AnalyticsQueryDto,
@@ -62,8 +63,12 @@ export class AdminController {
 
   @ApiTags('admin · analytics')
   @Get('analytics/venues')
-  venueLeaderboard() {
-    return this.analytics.venueLeaderboard();
+  async venueLeaderboard(@Query() query: OffsetQueryDto) {
+    return offsetPage(
+      await this.analytics.venueLeaderboard(),
+      query.page ?? 1,
+      pageLimit(query.limit, 50),
+    );
   }
 
   @ApiTags('admin · analytics')
@@ -153,8 +158,8 @@ export class AdminController {
   // ------------------------------------------------------------------- roles
   @ApiTags('admin · roles & permissions')
   @Get('roles')
-  listRoles(@Query('scope') scope?: string) {
-    return this.admin.listRoles(scope === 'system');
+  async listRoles(@Query('scope') scope?: string) {
+    return wrapList(await this.admin.listRoles(scope === 'system'));
   }
 
   @ApiTags('admin · roles & permissions')
@@ -232,8 +237,14 @@ export class AdminController {
   listVenuesAdmin(
     @Query('sort') sort?: string,
     @Query('range') range?: string,
+    @Query() query?: OffsetQueryDto,
   ) {
-    return this.admin.listVenuesAdmin({ sort, range });
+    return this.admin.listVenuesAdmin({
+      sort,
+      range,
+      page: query?.page,
+      limit: query?.limit,
+    });
   }
 
   @ApiTags('admin · venues')
@@ -433,8 +444,8 @@ export class AdminController {
   // ------------------------------------------------------------------ promos
   @ApiTags('admin · promos')
   @Get('promos')
-  listPromos() {
-    return this.admin.listPromos();
+  listPromos(@Query() query: CursorQueryDto) {
+    return this.admin.listPromos(query.cursor, query.limit);
   }
 
   @ApiTags('admin · promos')
@@ -458,8 +469,8 @@ export class AdminController {
 
   @ApiTags('admin · plans')
   @Get('plans')
-  listPlans() {
-    return this.admin.listPlans();
+  async listPlans() {
+    return wrapList(await this.admin.listPlans());
   }
 
   @ApiTags('admin · plans')
@@ -482,8 +493,8 @@ export class AdminController {
 
   @ApiTags('admin · plans')
   @Get('plans/venues')
-  listVenueBilling() {
-    return this.admin.listVenueBilling();
+  listVenueBilling(@Query() query: OffsetQueryDto) {
+    return this.admin.listVenueBilling(query.page ?? 1, query.limit);
   }
 
   @ApiTags('admin · plans')
@@ -517,8 +528,8 @@ export class AdminController {
   // ------------------------------------------------------------------ badges
   @ApiTags('admin · badges')
   @Get('badges')
-  listBadges() {
-    return this.admin.listBadges();
+  async listBadges() {
+    return wrapList(await this.admin.listBadges());
   }
 
   @ApiTags('admin · badges')
@@ -564,8 +575,8 @@ export class AdminController {
 
   @ApiTags('admin · disputes')
   @Get('disputes')
-  listDisputes(@Query('status') status?: string) {
-    return this.admin.listDisputes(status);
+  listDisputes(@Query('status') status?: string, @Query() query?: CursorQueryDto) {
+    return this.admin.listDisputes(status, query?.cursor, query?.limit);
   }
 
   @ApiTags('admin · disputes')
@@ -577,8 +588,8 @@ export class AdminController {
   // ------------------------------------------------------------------- audit
   @ApiTags('admin · audit logs')
   @Get('audit-logs')
-  auditLogs(@Query('entity') entity?: string, @Query('offset') offset?: string) {
-    return this.admin.auditLogs(entity, 100, offset ? parseInt(offset, 10) || 0 : 0);
+  auditLogs(@Query('entity') entity?: string, @Query() query?: OffsetQueryDto) {
+    return this.admin.auditLogs(entity, query?.page ?? 1, query?.limit);
   }
 
   // --------------------------------------------------------------- broadcast
@@ -590,8 +601,8 @@ export class AdminController {
 
   @ApiTags('admin · broadcasts & banners')
   @Get('broadcasts/history')
-  broadcastHistory() {
-    return this.admin.broadcastHistory();
+  broadcastHistory(@Query() query: CursorQueryDto) {
+    return this.admin.broadcastHistory(query.cursor, query.limit);
   }
 
   @ApiTags('admin · broadcasts & banners')
@@ -602,8 +613,8 @@ export class AdminController {
 
   @ApiTags('admin · broadcasts & banners')
   @Get('banners')
-  listBanners() {
-    return this.admin.listBanners();
+  async listBanners() {
+    return wrapList(await this.admin.listBanners());
   }
 
   @ApiTags('admin · broadcasts & banners')
@@ -635,8 +646,8 @@ export class AdminController {
   // -------------------------------------------------------------- suggestions
   @ApiTags('admin · suggestions')
   @Get('suggestions')
-  listSuggestions(@Query('status') status?: string) {
-    return this.admin.listSuggestions(status);
+  async listSuggestions(@Query('status') status?: string) {
+    return wrapList(await this.admin.listSuggestions(status));
   }
 
   @ApiTags('admin · suggestions')
@@ -692,13 +703,13 @@ export class AdminController {
   // ---------------------------------------------------------------- settings
   @ApiTags('admin · settings')
   @Get('settings')
-  getSettings() {
-    return this.admin.getSettings();
+  async getSettings() {
+    return wrapList(await this.admin.getSettings());
   }
 
   @ApiTags('admin · settings')
   @Patch('settings')
-  updateSettings(@CurrentUser() u: AuthUser, @Body() dto: UpdateSettingsDto) {
-    return this.admin.updateSettings(u.id, dto.settings);
+  async updateSettings(@CurrentUser() u: AuthUser, @Body() dto: UpdateSettingsDto) {
+    return wrapList(await this.admin.updateSettings(u.id, dto.settings));
   }
 }

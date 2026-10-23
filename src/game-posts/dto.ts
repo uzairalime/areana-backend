@@ -1,4 +1,5 @@
 import { IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
+import { OffsetQueryDto } from '../common/pagination';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class CreateGamePostDto {
@@ -108,7 +109,7 @@ export class JoinGamePostDto {
   phone?: string;
 }
 
-export class GamePostQueryDto {
+export class GamePostQueryDto extends OffsetQueryDto {
   @ApiPropertyOptional({ example: 'Football' })
   @IsOptional()
   @IsString()

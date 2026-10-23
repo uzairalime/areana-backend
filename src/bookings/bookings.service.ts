@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { BookingStatus, Prisma, UserStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
+import { offsetPageFromDb, pageLimit } from '../common/pagination';
 import { CourtsService } from '../courts/courts.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PromosService } from '../promos/promos.service';
@@ -328,10 +329,16 @@ export class BookingsService {
             status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
           };
 
-    return this.prisma.booking.findMany({
-      where,
-      include: {
-        court: { select: { name: true, sport: true } },
+    const page = query.page ?? 1;
+    const limit = pageLimit(query.limit, 20);
+    const [total, items] = await Promise.all([
+      this.prisma.booking.count({ where }),
+      this.prisma.booking.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        include: {
+          court: { select: { name: true, sport: true } },
         // images/photos power the venue photo on the player's booking
         // cards — without them the cards rendered placeholders forever.
         venue: { select: { name: true, address: true, city: true, lat: true, lng: true, images: true, photos: true } },
@@ -349,8 +356,10 @@ export class BookingsService {
         },
         _count: { select: { participants: true } },
       },
-      orderBy: [{ date: 'asc' }, { startMinutes: 'asc' }],
-    });
+        orderBy: [{ date: 'asc' }, { startMinutes: 'asc' }],
+      }),
+    ]);
+    return offsetPageFromDb(items, total, page, limit);
   }
 
   async cancelMine(userId: string, bookingId: string) {

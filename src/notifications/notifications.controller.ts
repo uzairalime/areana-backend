@@ -1,7 +1,8 @@
-import { Controller, Get, Param, Patch } from '@nestjs/common';
+import { Controller, Get, Param, Patch, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser } from '../common/auth';
 import { NotificationsService } from './notifications.service';
+import { CursorQueryDto } from '../common/pagination';
 
 /** The signed-in user's own inbox (players and staff alike). */
 @ApiTags('notifications')
@@ -11,8 +12,8 @@ export class NotificationsController {
   constructor(private notifications: NotificationsService) {}
 
   @Get()
-  list(@CurrentUser() user: AuthUser) {
-    return this.notifications.listMine(user.id);
+  list(@CurrentUser() user: AuthUser, @Query() query: CursorQueryDto) {
+    return this.notifications.listMine(user.id, query.cursor, query.limit);
   }
 
   @Get('unread-count')

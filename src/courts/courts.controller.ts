@@ -2,6 +2,7 @@ import { Controller, Get, Param } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { Public } from '../common/auth';
 import { CourtsService } from './courts.service';
+import { wrapList } from '../common/pagination';
 
 @ApiTags('courts')
 @Controller()
@@ -10,7 +11,7 @@ export class CourtsController {
 
   @Public()
   @Get('venues/:venueId/courts')
-  listByVenue(@Param('venueId') venueId: string) {
-    return this.courts.listByVenue(venueId);
+  async listByVenue(@Param('venueId') venueId: string) {
+    return wrapList(await this.courts.listByVenue(venueId));
   }
 }

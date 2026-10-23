@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
+import { offsetPageFromDb, pageLimit } from '../common/pagination';
 import { AuthUser } from '../common/auth';
 import {
   isSameDay,
@@ -127,8 +128,13 @@ export class GamePostsService {
     }
     where.AND = and;
 
+    const page = query.page ?? 1;
+    const limit = pageLimit(query.limit, 20);
+    const total = await this.prisma.gamePost.count({ where });
     const posts = await this.prisma.gamePost.findMany({
       where,
+      skip: (page - 1) * limit,
+      take: limit,
       include: {
         creator: { select: { name: true } },
         venue: { select: { id: true, name: true, address: true, city: true } },
@@ -150,7 +156,7 @@ export class GamePostsService {
       orderBy: [{ isCurated: 'desc' }, { date: 'asc' }, { startMinutes: 'asc' }],
     });
     if (!userId || posts.length === 0) {
-      return posts.map((post) => {
+      const items = posts.map((post) => {
         const { booking: _booking, participants: preview, ...rest } = post;
         return {
           ...rest,
@@ -166,6 +172,7 @@ export class GamePostsService {
           pendingCount: 0,
         };
       });
+      return offsetPageFromDb(items, total, page, limit);
     }
     // One query for the requester's participations among these posts —
     // replaces the player web's localStorage joined-tracking.
@@ -181,7 +188,7 @@ export class GamePostsService {
       _count: true,
     });
     const pendingByPost = new Map(pending.map((r) => [r.postId, r._count]));
-    return posts.map((post) => {
+    const items = posts.map((post) => {
       const state = stateByPost.get(post.id);
       const { booking: _booking, participants: preview, ...rest } = post;
       return {
@@ -195,6 +202,7 @@ export class GamePostsService {
         pendingCount: pendingByPost.get(post.id) ?? 0,
       };
     });
+    return offsetPageFromDb(items, total, page, limit);
   }
 
   /** One post with its squad — who is playing, not just how many. */

@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PrismaService } from '../common/prisma';
+import { cursorPage, keysetWhere, pageLimit } from '../common/pagination';
 import { CreateReviewDto } from './dto';
 
 @Injectable()
@@ -50,12 +51,15 @@ export class ReviewsService {
     });
   }
 
-  listByVenue(venueId: string) {
-    return this.prisma.review.findMany({
-      where: { venueId },
+  async listByVenue(venueId: string, cursor?: string, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 20);
+    const rows = await this.prisma.review.findMany({
+      where: { venueId, ...keysetWhere(cursor, 'createdAt', 'desc') },
       include: { user: { select: { name: true } } },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
     });
+    return cursorPage(rows, limit);
   }
 
   /** Called by the owner module (ownership is verified there). */

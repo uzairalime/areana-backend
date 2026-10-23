@@ -1,7 +1,8 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser, Public, RequirePerm } from '../common/auth';
 import { ReviewsService } from './reviews.service';
+import { CursorQueryDto } from '../common/pagination';
 import { CreateReviewDto } from './dto';
 
 @ApiTags('reviews')
@@ -17,7 +18,7 @@ export class ReviewsController {
 
   @Public()
   @Get('venues/:id/reviews')
-  listByVenue(@Param('id') id: string) {
-    return this.reviews.listByVenue(id);
+  listByVenue(@Param('id') id: string, @Query() query: CursorQueryDto) {
+    return this.reviews.listByVenue(id, query.cursor, query.limit);
   }
 }

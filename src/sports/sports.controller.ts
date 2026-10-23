@@ -2,6 +2,7 @@ import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/commo
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Public, RequirePerm } from '../common/auth';
 import { SportsService } from './sports.service';
+import { wrapList } from '../common/pagination';
 import { CreateSportDto, UpdateSportDto } from './dto';
 
 @ApiTags('sports')
@@ -12,8 +13,8 @@ export class SportsController {
   /** The active catalog — drives every sport picker and filter. */
   @Public()
   @Get()
-  list() {
-    return this.sports.listActive();
+  async list() {
+    return wrapList(await this.sports.listActive());
   }
 }
 
@@ -25,8 +26,8 @@ export class AdminSportsController {
   constructor(private sports: SportsService) {}
 
   @Get()
-  list() {
-    return this.sports.listAll();
+  async list() {
+    return wrapList(await this.sports.listAll());
   }
 
   @Post()

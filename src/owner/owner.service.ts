@@ -9,6 +9,7 @@ import { BookingStatus, VenueStatus, type Prisma } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { AuthUser } from '../common/auth';
 import { PrismaService } from '../common/prisma';
+import { encodeCursor, keysetWhere, offsetPage, offsetPageFromDb, pageLimit } from '../common/pagination';
 import { BookingsService } from '../bookings/bookings.service';
 import { StorageService } from '../storage/storage.service';
 import { ReviewsService } from '../reviews/reviews.service';
@@ -138,15 +139,18 @@ export class OwnerService {
   }
 
   // ---------------------------------------------------------------- venues
-  async listMyVenues(user: AuthUser) {
+  async listMyVenues(user: AuthUser, cursor?: string, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 30);
     const ids = await this.venueIds(user);
     const venues = await this.prisma.venue.findMany({
-      where: { id: { in: ids } },
+      where: { id: { in: ids }, ...keysetWhere(cursor, 'createdAt', 'desc') },
       include: { _count: { select: { courts: true } } },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
     });
+    const pageRows = venues.slice(0, limit);
     const out = [];
-    for (const v of venues) {
+    for (const v of pageRows) {
       const { limit } = await this.plans.effectiveCourtLimit(v.id);
       // Rejected courts don't consume quota (matches createCourt).
       const used = await this.prisma.court.count({
@@ -154,7 +158,13 @@ export class OwnerService {
       });
       out.push({ ...v, courtLimit: { limit, used } });
     }
-    return out;
+    return {
+      items: out,
+      nextCursor:
+        venues.length > limit && out.length
+          ? encodeCursor(out[out.length - 1].createdAt, out[out.length - 1].id)
+          : null,
+    };
   }
 
   async createVenue(user: AuthUser, dto: CreateVenueDto) {
@@ -950,21 +960,29 @@ export class OwnerService {
     const ids = query.venueId
       ? [(await this.assertVenue(user, query.venueId)).id]
       : await this.venueIds(user);
-    return this.prisma.booking.findMany({
-      where: {
-        venueId: { in: ids },
-        ...(query.date ? { date: parseDateOnly(query.date) } : {}),
-        ...(query.status ? { status: query.status as BookingStatus } : {}),
-      },
-      include: {
-        court: { select: { name: true, sport: true } },
-        venue: { select: { name: true } },
-        user: { select: { name: true, phone: true } },
-        _count: { select: { participants: true } },
-      },
-      orderBy: [{ date: 'desc' }, { startMinutes: 'desc' }],
-      take: 200,
-    });
+    const page = query.page ?? 1;
+    const limit = pageLimit(query.limit, 50);
+    const where: Prisma.BookingWhereInput = {
+      venueId: { in: ids },
+      ...(query.date ? { date: parseDateOnly(query.date) } : {}),
+      ...(query.status ? { status: query.status as BookingStatus } : {}),
+    };
+    const [total, items] = await Promise.all([
+      this.prisma.booking.count({ where }),
+      this.prisma.booking.findMany({
+        where,
+        include: {
+          court: { select: { name: true, sport: true } },
+          venue: { select: { name: true } },
+          user: { select: { name: true, phone: true } },
+          _count: { select: { participants: true } },
+        },
+        orderBy: [{ date: 'desc' }, { startMinutes: 'desc' }],
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+    ]);
+    return offsetPageFromDb(items, total, page, limit);
   }
 
   async acceptBooking(user: AuthUser, bookingId: string) {
@@ -1031,10 +1049,15 @@ export class OwnerService {
   }
 
   // ------------------------------------------------------------- reschedules
-  async reschedules(user: AuthUser, status = 'pending') {
+  async reschedules(user: AuthUser, status = 'pending', cursor?: string, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 30);
     const ids = await this.venueIds(user);
-    return this.prisma.rescheduleRequest.findMany({
-      where: { booking: { venueId: { in: ids } }, status },
+    const rows = await this.prisma.rescheduleRequest.findMany({
+      where: {
+        booking: { venueId: { in: ids } },
+        status,
+        ...keysetWhere(cursor, 'createdAt', 'desc'),
+      },
       include: {
         booking: {
           include: {
@@ -1043,8 +1066,16 @@ export class OwnerService {
           },
         },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
     });
+    return {
+      items: rows.slice(0, limit),
+      nextCursor:
+        rows.length > limit
+          ? encodeCursor(rows[limit - 1].createdAt, rows[limit - 1].id)
+          : null,
+    };
   }
 
   async acceptReschedule(user: AuthUser, requestId: string) {
@@ -1542,7 +1573,7 @@ export class OwnerService {
   }
 
   // --------------------------------------------------------------- customers
-  async customers(user: AuthUser, venueId?: string) {
+  async customers(user: AuthUser, venueId?: string, page = 1, rawLimit?: number) {
     const ids = venueId ? [(await this.assertVenue(user, venueId)).id] : await this.venueIds(user);
     const featureSets = await Promise.all(ids.map((id) => this.plans.featuresForVenue(id)));
     if (!featureSets.some((f) => f.includes('customers_insight'))) {
@@ -1581,7 +1612,8 @@ export class OwnerService {
       }
       if (b.status === BookingStatus.no_show) c.noShows += 1;
     }
-    return [...map.values()].sort((a, b) => b.visits - a.visits);
+    const all = [...map.values()].sort((a, b) => b.visits - a.visits);
+    return offsetPage(all, page, pageLimit(rawLimit, 50));
   }
 
   // ---------------------------------------------------------------- reviews
@@ -1615,14 +1647,22 @@ export class OwnerService {
     return out;
   }
 
-  async reviews(user: AuthUser, venueId?: string) {
+  async reviews(user: AuthUser, venueId?: string, cursor?: string, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 30);
     const ids = venueId ? [(await this.assertVenue(user, venueId)).id] : await this.venueIds(user);
-    return this.prisma.review.findMany({
-      where: { venueId: { in: ids } },
+    const rows = await this.prisma.review.findMany({
+      where: { venueId: { in: ids }, ...keysetWhere(cursor, 'createdAt', 'desc') },
       include: { user: { select: { name: true } } },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
     });
+    return {
+      items: rows.slice(0, limit),
+      nextCursor:
+        rows.length > limit
+          ? encodeCursor(rows[limit - 1].createdAt, rows[limit - 1].id)
+          : null,
+    };
   }
 
   async replyReview(user: AuthUser, reviewId: string, reply: string) {

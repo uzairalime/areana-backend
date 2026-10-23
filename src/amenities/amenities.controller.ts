@@ -2,6 +2,7 @@ import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/commo
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Public, RequirePerm } from '../common/auth';
 import { AmenitiesService } from './amenities.service';
+import { wrapList } from '../common/pagination';
 import { CreateAmenityDto, UpdateAmenityDto } from './dto';
 
 @ApiTags('amenities')
@@ -12,8 +13,8 @@ export class AmenitiesController {
   /** The active catalog — drives every amenity picker. */
   @Public()
   @Get()
-  list() {
-    return this.amenities.listActive();
+  async list() {
+    return wrapList(await this.amenities.listActive());
   }
 }
 
@@ -25,8 +26,8 @@ export class AdminAmenitiesController {
   constructor(private amenities: AmenitiesService) {}
 
   @Get()
-  list() {
-    return this.amenities.listAll();
+  async list() {
+    return wrapList(await this.amenities.listAll());
   }
 
   @Post()
