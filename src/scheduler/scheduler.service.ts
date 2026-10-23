@@ -124,6 +124,32 @@ export class SchedulerService {
   }
 
   /**
+   * Game posts whose match start has passed have done their job. Close
+   * them (never delete) so the status stays truthful everywhere — board
+   * filters, direct links, host history and admin views — instead of
+   * lingering as `open`/`full` forever. The board's own time filter
+   * already hides them between sweeps.
+   */
+  @Cron('*/15 * * * *')
+  async closeExpiredGamePosts() {
+    const today = startOfToday();
+    const nowMin = minutesSinceMidnight();
+    const res = await this.prisma.gamePost.updateMany({
+      where: {
+        status: { in: ['open', 'full'] },
+        OR: [
+          { date: { lt: today } },
+          { date: today, startMinutes: { lte: nowMin } },
+        ],
+      },
+      data: { status: 'closed' },
+    });
+    if (res.count > 0) {
+      this.logger.log(`Closed ${res.count} expired game posts`);
+    }
+  }
+
+  /**
    * Nightly housekeeping: auth tables grow on every login/refresh/OTP —
    * drop expired sessions, week-old revocations and day-old OTP rows.
    */
