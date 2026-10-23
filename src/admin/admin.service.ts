@@ -56,6 +56,163 @@ export class AdminService {
   }
 
   // ---------------------------------------------------------------- users
+  /**
+   * The role-aware detail screen for /admin/users/:id — account plus,
+   * by what the account actually does: player history (bookings, spend,
+   * reviews, favorites, disputes, reports, referrals) and staff
+   * assignments, with the audit trail both ways.
+   */
+  async userDetailScreen(id: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      include: { role: true },
+    });
+    if (!user) throw new NotFoundException('User not found');
+    const { passwordHash: _p, ...safeUser } = user;
+
+    const today = new Date(
+      `${new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Karachi' }).format(new Date())}T00:00:00.000Z`,
+    );
+
+    const [
+      statusRows,
+      upcoming,
+      recentBookings,
+      reviews,
+      reviewCount,
+      favorites,
+      disputes,
+      reportsFiled,
+      referralsMade,
+      referredBy,
+      staffLinks,
+      activityOn,
+      activityBy,
+    ] = await Promise.all([
+      this.prisma.booking.groupBy({
+        by: ['status'],
+        where: { userId: id },
+        _count: true,
+        _sum: { totalPrice: true, discountAmount: true },
+      }),
+      this.prisma.booking.count({
+        where: { userId: id, status: 'confirmed', date: { gte: today } },
+      }),
+      this.prisma.booking.findMany({
+        where: { userId: id },
+        include: {
+          venue: { select: { id: true, name: true, city: true } },
+          court: { select: { name: true, sport: true } },
+        },
+        orderBy: [{ date: 'desc' }, { startMinutes: 'desc' }],
+        take: 10,
+      }),
+      this.prisma.review.findMany({
+        where: { userId: id },
+        include: { venue: { select: { id: true, name: true } } },
+        orderBy: { createdAt: 'desc' },
+        take: 8,
+      }),
+      this.prisma.review.count({ where: { userId: id } }),
+      this.prisma.favorite.findMany({
+        where: { userId: id },
+        include: {
+          venue: { select: { id: true, name: true, city: true, status: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.dispute.findMany({
+        where: { raisedById: id },
+        include: {
+          booking: {
+            select: {
+              date: true,
+              venue: { select: { name: true } },
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 8,
+      }),
+      this.prisma.venueReport.count({ where: { userId: id } }),
+      this.prisma.referral.count({ where: { referrerId: id } }),
+      this.prisma.referral.findUnique({
+        where: { refereeId: id },
+        include: { referrer: { select: { name: true, email: true } } },
+      }),
+      this.prisma.venueStaff.findMany({
+        where: { userId: id },
+        include: {
+          venue: {
+            select: {
+              id: true,
+              name: true,
+              city: true,
+              status: true,
+              owner: { select: { name: true, email: true } },
+            },
+          },
+        },
+        orderBy: { createdAt: 'asc' },
+      }),
+      this.prisma.auditLog.findMany({
+        where: { entity: 'user', entityId: id },
+        include: { actor: { select: { name: true, email: true } } },
+        orderBy: { createdAt: 'desc' },
+        take: 15,
+      }),
+      this.prisma.auditLog.findMany({
+        where: { actorId: id },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      }),
+    ]);
+
+    const byStatus = new Map(statusRows.map((r) => [r.status as string, r]));
+    const count = (s: string) => byStatus.get(s)?._count ?? 0;
+    const spent = (['confirmed', 'completed'] as const).reduce(
+      (sum, s) =>
+        sum +
+        Number(byStatus.get(s)?._sum.totalPrice ?? 0) -
+        Number(byStatus.get(s)?._sum.discountAmount ?? 0),
+      0,
+    );
+
+    return {
+      user: safeUser,
+      player: {
+        totals: {
+          bookings:
+            statusRows.reduce((s, r) => s + r._count, 0) - count('cancelled'),
+          upcoming,
+          completed: count('completed'),
+          cancelled: count('cancelled'),
+          noShows: count('no_show'),
+          spent,
+          reviews: reviewCount,
+          favorites: favorites.length,
+          disputesOpen: disputes.filter((d) => d.status === 'open').length,
+          reportsFiled,
+          referralsMade,
+        },
+        recentBookings,
+        reviews,
+        favorites,
+        disputes,
+        referredBy: referredBy
+          ? {
+              name: referredBy.referrer.name,
+              email: referredBy.referrer.email,
+              status: referredBy.status,
+            }
+          : null,
+      },
+      staff: staffLinks,
+      activityOn,
+      activityBy,
+    };
+  }
+
   async listUsers(q?: string, roleName?: string, status?: string, offset = 0) {
     return this.prisma.user.findMany({
       where: {

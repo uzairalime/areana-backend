@@ -92,6 +92,11 @@ export class AdminController {
   }
 
   @ApiTags('admin · users')
+  @Get('users/:id/profile')
+  userProfile(@Param('id') id: string) {
+    return this.admin.userDetailScreen(id);
+  }
+
   @Get('users/:id')
   getUser(@Param('id') id: string) {
     return this.admin.getUser(id);
