@@ -66,6 +66,7 @@ model User {
   id           String     @id @default(cuid())
   email        String     @unique
   name         String?
+  avatarUrl    String?
   phone        String?
   city         String?
   passwordHash String? // staff only (owner/staff/super_admin). Players are OTP-only.

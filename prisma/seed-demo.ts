@@ -219,14 +219,24 @@ async function main() {
     phone: string;
     city: string;
     daysAgo: number;
+    avatarUrl: string;
   }[] = [
-    { email: 'demo.signup1@demo.areana.pk', name: 'Ahmed Raza', phone: '+92 321 5550101', city: 'Lahore', daysAgo: 1 },
-    { email: 'demo.signup2@demo.areana.pk', name: 'Bilal Hussain', phone: '+92 333 5550102', city: 'Karachi', daysAgo: 2 },
-    { email: 'demo.signup3@demo.areana.pk', name: 'Usman Tariq', phone: '+92 345 5550103', city: 'Islamabad', daysAgo: 4 },
+    { email: 'demo.signup1@demo.areana.pk', name: 'Ahmed Raza', phone: '+92 321 5550101', city: 'Lahore', daysAgo: 1, avatarUrl: 'https://randomuser.me/api/portraits/men/32.jpg' },
+    { email: 'demo.signup2@demo.areana.pk', name: 'Bilal Hussain', phone: '+92 333 5550102', city: 'Karachi', daysAgo: 2, avatarUrl: 'https://randomuser.me/api/portraits/men/45.jpg' },
+    { email: 'demo.signup3@demo.areana.pk', name: 'Usman Tariq', phone: '+92 345 5550103', city: 'Islamabad', daysAgo: 4, avatarUrl: 'https://randomuser.me/api/portraits/men/67.jpg' },
   ];
   for (const s of signups) {
     const exists = await prisma.user.findUnique({ where: { email: s.email } });
-    if (exists) continue;
+    if (exists) {
+      // Backfill the portrait for signups seeded before avatarUrl existed.
+      if (!exists.avatarUrl) {
+        await prisma.user.update({
+          where: { id: exists.id },
+          data: { avatarUrl: s.avatarUrl },
+        });
+      }
+      continue;
+    }
     await prisma.user.create({
       data: {
         email: s.email,
@@ -236,6 +246,7 @@ async function main() {
         passwordHash: passwordHash2,
         roleId: ownerRole.id,
         status: 'pending',
+        avatarUrl: s.avatarUrl,
         createdAt: daysFromNow(-s.daysAgo),
       },
     });
