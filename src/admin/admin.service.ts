@@ -821,7 +821,10 @@ export class AdminService {
       else if (b.status === 'completed') row.completed++;
       else if (b.status === 'cancelled') row.cancelled++;
       else if (b.status === 'no_show') row.noShow++;
-      if (b.status !== 'cancelled') {
+      // Revenue is realized money only (confirmed + completed) — the
+      // same definition as every GMV figure in the admin. Pending and
+      // no-show bookings count in the state bars, never in revenue.
+      if (b.status === 'confirmed' || b.status === 'completed') {
         row.revenue += Number(b.totalPrice) - Number(b.discountAmount);
       }
     }

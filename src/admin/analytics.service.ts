@@ -63,7 +63,7 @@ export class AnalyticsService {
       timeZone: 'Asia/Karachi',
     }).format(new Date());
     const today = new Date(`${dayStr}T00:00:00.000Z`);
-    const [activeBookings, currentSubscriptions, revenueAgg, views, clicks] =
+    const [activeBookings, currentSubscriptions, revenueAgg, views, clicks, openReports] =
       await Promise.all([
         this.prisma.booking.count({
           where: { status: BookingStatus.confirmed, date: { gte: today } },
@@ -78,8 +78,10 @@ export class AnalyticsService {
         this.prisma.venuePayment.aggregate({ _sum: { amount: true } }),
         this.prisma.venueEvent.count({ where: { type: 'view' } }),
         this.prisma.venueEvent.count({ where: { type: 'click' } }),
+        this.prisma.venueReport.count({ where: { status: 'open' } }),
       ]);
     return {
+      openReports,
       activeBookings,
       currentSubscriptions,
       subscriptionRevenue: revenueAgg._sum.amount ?? 0,

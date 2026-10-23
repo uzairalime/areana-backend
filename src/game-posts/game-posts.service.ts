@@ -5,7 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { AuthUser } from '../common/auth';
 import {
@@ -53,6 +53,44 @@ export class GamePostsService {
     };
   }
 
+  /**
+   * A game post is public only while its venue is: approved, not archived,
+   * billing not paused, not moderated, owner active. Curated posts may
+   * have no venue at all — those stay visible.
+   */
+  private venueVisibleWhere(): Prisma.GamePostWhereInput {
+    return {
+      OR: [
+        { venueId: null },
+        {
+          venue: {
+            status: VenueStatus.approved,
+            archivedAt: null,
+            billingPaused: false,
+            moderationStatus: 'none',
+            owner: { status: UserStatus.active },
+          },
+        },
+      ],
+    };
+  }
+
+  private async assertVenueVisible(venueId: string | null) {
+    if (!venueId) return;
+    const v = await this.prisma.venue.findFirst({
+      where: {
+        id: venueId,
+        status: VenueStatus.approved,
+        archivedAt: null,
+        billingPaused: false,
+        moderationStatus: 'none',
+        owner: { status: UserStatus.active },
+      },
+      select: { id: true },
+    });
+    if (!v) throw new NotFoundException('This game is no longer available');
+  }
+
   /** Price view for one post, freshly read (used by notifications). */
   private async priceForPost(postId: string) {
     const post = await this.prisma.gamePost.findUnique({
@@ -68,6 +106,7 @@ export class GamePostsService {
 
   async list(query: GamePostQueryDto, userId?: string) {
     const where: Prisma.GamePostWhereInput = { status: 'open' };
+    const and: Prisma.GamePostWhereInput[] = [this.venueVisibleWhere()];
     if (query.sport) where.sport = { equals: query.sport, mode: 'insensitive' };
     if (query.city) where.city = { equals: query.city, mode: 'insensitive' };
     // Date filter: future days wholesale; for today, only games that
@@ -79,15 +118,14 @@ export class GamePostsService {
       where.date = d;
       if (isSameDay(d, today)) where.startMinutes = { gt: nowMin };
     } else {
-      where.AND = [
-        {
-          OR: [
-            { date: { gt: today } },
-            { date: today, startMinutes: { gt: nowMin } },
-          ],
-        },
-      ];
+      and.push({
+        OR: [
+          { date: { gt: today } },
+          { date: today, startMinutes: { gt: nowMin } },
+        ],
+      });
     }
+    where.AND = and;
 
     const posts = await this.prisma.gamePost.findMany({
       where,
@@ -180,6 +218,7 @@ export class GamePostsService {
       },
     });
     if (!post) throw new NotFoundException('Game not found');
+    await this.assertVenueVisible(post.venueId);
     const { participants, booking: _booking, ...rest } = post;
     const squad = participants.filter((x) => x.status === 'joined');
     const myRow = userId ? participants.find((x) => x.userId === userId) : undefined;
@@ -404,6 +443,20 @@ export class GamePostsService {
       }
       if (post.status !== 'open') {
         throw new BadRequestException('This game is no longer open');
+      }
+      if (post.venueId) {
+        const v = await tx.venue.findFirst({
+          where: {
+            id: post.venueId,
+            status: VenueStatus.approved,
+            archivedAt: null,
+            billingPaused: false,
+            moderationStatus: 'none',
+            owner: { status: UserStatus.active },
+          },
+          select: { id: true },
+        });
+        if (!v) throw new NotFoundException('This game is no longer available');
       }
       const now = new Date();
       if (

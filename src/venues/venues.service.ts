@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { QueryVenuesDto } from './dto';
@@ -20,9 +20,12 @@ export class VenuesService {
   ) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
-      select: { id: true },
+      select: { id: true, ownerId: true },
     });
     if (!venue) throw new NotFoundException('Venue not found');
+    if (venue.ownerId === userId) {
+      throw new BadRequestException('You cannot report your own arena.');
+    }
     const existing = await this.prisma.venueReport.findFirst({
       where: { venueId, userId, status: 'open' },
       select: { id: true },
@@ -30,6 +33,32 @@ export class VenuesService {
     if (existing) {
       throw new ConflictException(
         'You already have an open report for this arena — our team is reviewing it.',
+      );
+    }
+    // Anti-spam: a report the team already closed less than 30 days ago
+    // can't be re-filed for the same arena, and one player can hold at
+    // most 10 open reports across all arenas.
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000);
+    const recentlyClosed = await this.prisma.venueReport.findFirst({
+      where: {
+        venueId,
+        userId,
+        status: { not: 'open' },
+        resolvedAt: { gte: thirtyDaysAgo },
+      },
+      select: { id: true },
+    });
+    if (recentlyClosed) {
+      throw new ConflictException(
+        'You reported this arena recently and our team has already reviewed it.',
+      );
+    }
+    const openCount = await this.prisma.venueReport.count({
+      where: { userId, status: 'open' },
+    });
+    if (openCount >= 10) {
+      throw new ConflictException(
+        'You have too many open reports right now — please wait for our team to review them.',
       );
     }
     return this.prisma.venueReport.create({
@@ -123,11 +152,14 @@ export class VenuesService {
       owner: { status: UserStatus.active },
     };
     if (city) where.city = { equals: city, mode: 'insensitive' };
-    if (sport) where.sports = { has: sport };
-    if (surface) {
-      where.courts = {
-        some: { isActive: true, status: 'approved', surface: { equals: surface, mode: 'insensitive' } },
-      };
+    // Sport and surface filters match on real bookable courts (active +
+    // approved) — the same set the card's sports are derived from, so a
+    // pending court's sport never makes its arena match a filter.
+    if (sport || surface) {
+      const some: Prisma.CourtWhereInput = { isActive: true, status: 'approved' };
+      if (sport) some.sport = { equals: sport, mode: 'insensitive' };
+      if (surface) some.surface = { equals: surface, mode: 'insensitive' };
+      where.courts = { some };
     }
     if (q) {
       where.OR = [
@@ -147,8 +179,9 @@ export class VenuesService {
         _count: { select: { courts: true } },
         badges: { include: { badge: true }, orderBy: { badge: { tier: 'desc' } } },
         courts: {
-          where: { isActive: true },
+          where: { isActive: true, status: 'approved' },
           select: {
+            sport: true,
             pricePerHour: true,
             priceWindows: { select: { pricePerHour: true } },
           },

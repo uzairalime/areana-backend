@@ -401,6 +401,25 @@ export class OwnerService {
         data.openMinutes ?? court.openMinutes,
         data.closeMinutes ?? court.closeMinutes,
       );
+      // Same guard the admin path has: shrinking hours must not strand
+      // confirmed upcoming bookings outside the court's day.
+      const newOpen = data.openMinutes ?? court.openMinutes;
+      const stranded = await this.prisma.booking.count({
+        where: {
+          courtId,
+          status: 'confirmed',
+          date: { gte: startOfToday() },
+          OR: [
+            { startMinutes: { lt: newOpen } },
+            { endMinutes: { gt: data.closeMinutes } },
+          ],
+        },
+      });
+      if (stranded > 0) {
+        throw new ConflictException(
+          `${stranded} upcoming booking(s) fall outside the new hours — move or cancel them first`,
+        );
+      }
     }
     // Editing a rejected court re-submits it for approval.
     const updated = await this.prisma.court.update({
