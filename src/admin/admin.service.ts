@@ -178,8 +178,10 @@ export class AdminService {
       0,
     );
 
+    const rejected = (await this.rejectedFlags([id])).has(id);
     return {
       user: safeUser,
+      rejected,
       player: {
         totals: {
           bookings:
@@ -213,17 +215,87 @@ export class AdminService {
     };
   }
 
-  async listUsers(q?: string, roleName?: string, status?: string, offset = 0) {
-    return this.prisma.user.findMany({
+  /**
+   * Accounts whose latest status audit was a signup rejection — they sit
+   * in `suspended` like everyone else, but the UI marks them Rejected so
+   * they stay distinguishable (and re-approvable) in Users.
+   */
+  private async rejectedFlags(ids: string[]): Promise<Set<string>> {
+    if (!ids.length) return new Set();
+    const logs = await this.prisma.auditLog.findMany({
       where: {
-        ...(q ? { OR: [{ email: { contains: q, mode: 'insensitive' } }, { name: { contains: q, mode: 'insensitive' } }] } : {}),
+        entity: 'user',
+        entityId: { in: ids },
+        action: { in: ['user.reject', 'user.suspended', 'user.active', 'user.pending'] },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { entityId: true, action: true },
+    });
+    const latest = new Map<string, string>();
+    for (const l of logs) {
+      if (!latest.has(l.entityId)) latest.set(l.entityId, l.action);
+    }
+    return new Set(
+      [...latest].filter(([, a]) => a === 'user.reject').map(([id]) => id),
+    );
+  }
+
+  /** Platform-wide user totals for the Users stat cards. */
+  async usersStats() {
+    const [total, players, owners, suspended] = await Promise.all([
+      this.prisma.user.count(),
+      this.prisma.user.count({ where: { role: { name: 'player' } } }),
+      this.prisma.user.count({ where: { role: { name: 'owner' } } }),
+      this.prisma.user.count({ where: { status: UserStatus.suspended } }),
+    ]);
+    return { total, players, owners, suspended };
+  }
+
+  /**
+   * Reject a pending signup: suspends the account but audits it as a
+   * rejection, so the account stays marked Rejected in Users (with a
+   * one-tap re-approval) instead of blending into suspended-for-cause.
+   */
+  async rejectUser(actorId: string, id: string) {
+    const target = await this.prisma.user.findUnique({ where: { id } });
+    if (!target) throw new NotFoundException('User not found');
+    if (target.status !== UserStatus.pending) {
+      throw new BadRequestException('Only a pending signup can be rejected');
+    }
+    const user = await this.prisma.user.update({
+      where: { id },
+      data: { status: UserStatus.suspended },
+    });
+    await this.audit(actorId, 'user.reject', 'user', id);
+    const { passwordHash: _p, ...safe } = user;
+    return safe;
+  }
+
+  async listUsers(q?: string, roleName?: string, status?: string, offset = 0) {
+    const users = await this.prisma.user.findMany({
+      where: {
+        ...(q
+          ? {
+              OR: [
+                { email: { contains: q, mode: 'insensitive' } },
+                { name: { contains: q, mode: 'insensitive' } },
+                { phone: { contains: q, mode: 'insensitive' } },
+                { city: { contains: q, mode: 'insensitive' } },
+              ],
+            }
+          : {}),
         ...(roleName ? { role: { name: roleName } } : {}),
         ...(status ? { status: status as UserStatus } : {}),
       },
       include: { role: { select: { name: true } } },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: 100,
       skip: Math.max(0, offset),
+    });
+    const rejected = await this.rejectedFlags(users.map((u) => u.id));
+    return users.map((u) => {
+      const { passwordHash: _p, ...safe } = u;
+      return { ...safe, rejected: rejected.has(u.id) };
     });
   }
 
@@ -251,6 +323,11 @@ export class AdminService {
     if (exists) throw new ConflictException('Email already registered');
     const role = await this.prisma.role.findUnique({ where: { id: dto.roleId } });
     if (!role) throw new NotFoundException('Role not found');
+    if (role.ownerId) {
+      throw new BadRequestException(
+        "That role belongs to an arena owner — team roles are assigned from the owner's panel, not here.",
+      );
+    }
     const user = await this.prisma.user.create({
       data: {
         email,
@@ -269,6 +346,11 @@ export class AdminService {
   async setUserRole(actorId: string, id: string, roleId: string) {
     const role = await this.prisma.role.findUnique({ where: { id: roleId } });
     if (!role) throw new NotFoundException('Role not found');
+    if (role.ownerId) {
+      throw new BadRequestException(
+        "That role belongs to an arena owner — team roles are assigned from the owner's panel, not here.",
+      );
+    }
     const user = await this.prisma.user.update({ where: { id }, data: { roleId } });
     await this.audit(actorId, 'user.set_role', 'user', id);
     const { passwordHash: _p, ...safe } = user;
@@ -443,8 +525,9 @@ export class AdminService {
   }
 
   // ---------------------------------------------------------------- roles
-  listRoles() {
+  listRoles(systemOnly = false) {
     return this.prisma.role.findMany({
+      ...(systemOnly ? { where: { ownerId: null } } : {}),
       include: {
         _count: { select: { users: true } },
         owner: { select: { id: true, name: true, email: true } },
@@ -501,11 +584,15 @@ export class AdminService {
 
   // -------------------------------------------------------- owners & venues
   /** Owner accounts waiting for approval. */
-  pendingOwners() {
-    return this.prisma.user.findMany({
+  async pendingOwners() {
+    const users = await this.prisma.user.findMany({
       where: { status: UserStatus.pending, role: { name: 'owner' } },
       include: { role: { select: { name: true } } },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { createdAt: 'asc' },
+    });
+    return users.map((u) => {
+      const { passwordHash: _p, ...safe } = u;
+      return safe;
     });
   }
 
@@ -647,6 +734,7 @@ export class AdminService {
 
     return {
       user: safeUser,
+      rejected: (await this.rejectedFlags([id])).has(id),
       totals,
       venues: rows,
       staff,
@@ -659,12 +747,12 @@ export class AdminService {
     const venues = await this.prisma.venue.findMany({
       where: { status: VenueStatus.pending },
       include: {
-        owner: { select: { name: true, email: true, phone: true } },
+        owner: { select: { name: true, email: true, phone: true, status: true } },
         // Active courts ride along so the approvals card can mirror the
         // venues-list card (court count + sports) without extra calls.
         courts: { where: { isActive: true }, select: { id: true, sport: true } },
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { createdAt: 'asc' },
     });
     return venues.map((v) => ({
       ...v,
@@ -675,6 +763,20 @@ export class AdminService {
   async approveVenue(actorId: string, venueId: string) {
     const existing = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!existing) throw new NotFoundException('Venue not found');
+    if (existing.status !== VenueStatus.pending && existing.status !== VenueStatus.draft) {
+      throw new BadRequestException(
+        `This venue is ${existing.status} — only a pending submission can be approved. Refresh the queue.`,
+      );
+    }
+    const owner = await this.prisma.user.findUnique({
+      where: { id: existing.ownerId },
+      select: { status: true },
+    });
+    if (!owner || owner.status !== UserStatus.active) {
+      throw new BadRequestException(
+        "This arena's owner is not active (suspended or awaiting approval) — resolve the owner account first, otherwise the arena goes live with nobody able to manage it and billing running.",
+      );
+    }
     const courts = await this.prisma.court.count({
       where: { venueId, isActive: true },
     });
@@ -1863,6 +1965,13 @@ export class AdminService {
   }
 
   async rejectVenue(actorId: string, venueId: string) {
+    const existing = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!existing) throw new NotFoundException('Venue not found');
+    if (existing.status !== VenueStatus.pending && existing.status !== VenueStatus.draft) {
+      throw new BadRequestException(
+        `This venue is ${existing.status} — only a pending submission can be rejected. Refresh the queue.`,
+      );
+    }
     const venue = await this.prisma.venue.update({
       where: { id: venueId },
       data: { status: VenueStatus.rejected },
@@ -1872,6 +1981,13 @@ export class AdminService {
   }
 
   async suspendVenue(actorId: string, venueId: string) {
+    const existing = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!existing) throw new NotFoundException('Venue not found');
+    if (existing.status !== VenueStatus.pending && existing.status !== VenueStatus.approved) {
+      throw new BadRequestException(
+        `This venue is ${existing.status} — only a pending or live venue can be suspended.`,
+      );
+    }
     const venue = await this.prisma.venue.update({
       where: { id: venueId },
       data: { status: VenueStatus.suspended },

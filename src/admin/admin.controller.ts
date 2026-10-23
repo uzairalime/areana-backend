@@ -92,6 +92,12 @@ export class AdminController {
   }
 
   @ApiTags('admin · users')
+  @Get('users/stats')
+  usersStats() {
+    return this.admin.usersStats();
+  }
+
+  @ApiTags('admin · users')
   @Get('users/:id/profile')
   userProfile(@Param('id') id: string) {
     return this.admin.userDetailScreen(id);
@@ -121,6 +127,12 @@ export class AdminController {
   }
 
   @ApiTags('admin · users')
+  @Post('users/:id/reject')
+  rejectUser(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.admin.rejectUser(u.id, id);
+  }
+
+  @ApiTags('admin · users')
   @Post('users/:id/reset-strikes')
   resetStrikes(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.admin.resetStrikes(u.id, id);
@@ -141,8 +153,8 @@ export class AdminController {
   // ------------------------------------------------------------------- roles
   @ApiTags('admin · roles & permissions')
   @Get('roles')
-  listRoles() {
-    return this.admin.listRoles();
+  listRoles(@Query('scope') scope?: string) {
+    return this.admin.listRoles(scope === 'system');
   }
 
   @ApiTags('admin · roles & permissions')
