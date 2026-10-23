@@ -271,32 +271,70 @@ export class AdminService {
     return safe;
   }
 
-  async listUsers(q?: string, roleName?: string, status?: string, offset = 0) {
-    const users = await this.prisma.user.findMany({
+  /**
+   * Keyset (cursor) pagination helpers. A cursor is
+   * `${createdAtISO}|${id}` of the last row of the previous page; the
+   * (createdAt, id) pair is unique and stable, so pages never drift when
+   * rows are inserted or removed between requests — and a cursor whose
+   * row was deleted still works, unlike Prisma's record-based cursor.
+   */
+  private keyset(cursor?: string): { createdAt: Date; id: string } | null {
+    if (!cursor) return null;
+    const [iso, id] = cursor.split('|');
+    const createdAt = new Date(iso);
+    if (!id || Number.isNaN(createdAt.getTime())) return null;
+    return { createdAt, id };
+  }
+
+  private keysetCursor(row: { createdAt: Date; id: string }): string {
+    return `${row.createdAt.toISOString()}|${row.id}`;
+  }
+
+  async listUsers(q?: string, roleName?: string, status?: string, cursor?: string) {
+    const ks = this.keyset(cursor);
+    const rows = await this.prisma.user.findMany({
       where: {
-        ...(q
-          ? {
-              OR: [
-                { email: { contains: q, mode: 'insensitive' } },
-                { name: { contains: q, mode: 'insensitive' } },
-                { phone: { contains: q, mode: 'insensitive' } },
-                { city: { contains: q, mode: 'insensitive' } },
-              ],
-            }
-          : {}),
         ...(roleName ? { role: { name: roleName } } : {}),
         ...(status ? { status: status as UserStatus } : {}),
+        AND: [
+          ...(q
+            ? [
+                {
+                  OR: [
+                    { email: { contains: q, mode: 'insensitive' as const } },
+                    { name: { contains: q, mode: 'insensitive' as const } },
+                    { phone: { contains: q, mode: 'insensitive' as const } },
+                    { city: { contains: q, mode: 'insensitive' as const } },
+                  ],
+                },
+              ]
+            : []),
+          ...(ks
+            ? [
+                {
+                  OR: [
+                    { createdAt: { lt: ks.createdAt } },
+                    { createdAt: ks.createdAt, id: { lt: ks.id } },
+                  ],
+                },
+              ]
+            : []),
+        ],
       },
       include: { role: { select: { name: true } } },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      take: 100,
-      skip: Math.max(0, offset),
+      take: 101,
     });
-    const rejected = await this.rejectedFlags(users.map((u) => u.id));
-    return users.map((u) => {
+    const pageRows = rows.slice(0, 100);
+    const rejected = await this.rejectedFlags(pageRows.map((u) => u.id));
+    const items = pageRows.map((u) => {
       const { passwordHash: _p, ...safe } = u;
       return { ...safe, rejected: rejected.has(u.id) };
     });
+    return {
+      items,
+      nextCursor: rows.length > 100 ? this.keysetCursor(pageRows[pageRows.length - 1]) : null,
+    };
   }
 
   async getUser(id: string) {
@@ -638,14 +676,32 @@ export class AdminService {
 
   // -------------------------------------------------------- owners & venues
   /** Owner accounts waiting for approval. */
-  async pendingOwners() {
-    const users = await this.prisma.user.findMany({
-      where: { status: UserStatus.pending, role: { name: 'owner' } },
-      include: { role: { select: { name: true } } },
-      orderBy: { createdAt: 'asc' },
-    });
+  async pendingOwners(cursor?: string) {
+    const ks = this.keyset(cursor);
+    const baseWhere: Prisma.UserWhereInput = {
+      status: UserStatus.pending,
+      role: { name: 'owner' },
+    };
+    const [total, users] = await Promise.all([
+      this.prisma.user.count({ where: baseWhere }),
+      this.prisma.user.findMany({
+        where: ks
+          ? {
+              ...baseWhere,
+              OR: [
+                { createdAt: { gt: ks.createdAt } },
+                { createdAt: ks.createdAt, id: { gt: ks.id } },
+              ],
+            }
+          : baseWhere,
+        include: { role: { select: { name: true } } },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        take: 31,
+      }),
+    ]);
+    const pageRows = users.slice(0, 30);
     const out = [];
-    for (const u of users) {
+    for (const u of pageRows) {
       const { passwordHash: _p, ...safe } = u;
       const duplicatePhoneAccounts = u.phone
         ? await this.prisma.user.count({
@@ -654,7 +710,11 @@ export class AdminService {
         : 0;
       out.push({ ...safe, duplicatePhoneAccounts });
     }
-    return out;
+    return {
+      items: out,
+      total,
+      nextCursor: users.length > 30 ? this.keysetCursor(pageRows[pageRows.length - 1]) : null,
+    };
   }
 
   /**
@@ -804,21 +864,40 @@ export class AdminService {
     };
   }
 
-  async pendingVenues() {
-    const venues = await this.prisma.venue.findMany({
-      where: { status: VenueStatus.pending },
-      include: {
-        owner: { select: { name: true, email: true, phone: true, status: true } },
-        // Active courts ride along so the approvals card can mirror the
-        // venues-list card (court count + sports) without extra calls.
-        courts: { where: { isActive: true }, select: { id: true, sport: true, status: true } },
-      },
-      orderBy: { createdAt: 'asc' },
-    });
-    return venues.map((v) => ({
-      ...v,
-      readiness: venueReadiness(v, v.courts.length),
-    }));
+  async pendingVenues(cursor?: string) {
+    const ks = this.keyset(cursor);
+    const baseWhere: Prisma.VenueWhereInput = { status: VenueStatus.pending };
+    const [total, venues] = await Promise.all([
+      this.prisma.venue.count({ where: baseWhere }),
+      this.prisma.venue.findMany({
+        where: ks
+          ? {
+              ...baseWhere,
+              OR: [
+                { createdAt: { gt: ks.createdAt } },
+                { createdAt: ks.createdAt, id: { gt: ks.id } },
+              ],
+            }
+          : baseWhere,
+        include: {
+          owner: { select: { name: true, email: true, phone: true, status: true } },
+          // Active courts ride along so the approvals card can mirror the
+          // venues-list card (court count + sports) without extra calls.
+          courts: { where: { isActive: true }, select: { id: true, sport: true, status: true } },
+        },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        take: 31,
+      }),
+    ]);
+    const pageRows = venues.slice(0, 30);
+    return {
+      items: pageRows.map((v) => ({
+        ...v,
+        readiness: venueReadiness(v, v.courts.length),
+      })),
+      total,
+      nextCursor: venues.length > 30 ? this.keysetCursor(pageRows[pageRows.length - 1]) : null,
+    };
   }
 
   async approveVenue(actorId: string, venueId: string) {
@@ -1600,21 +1679,41 @@ export class AdminService {
   }
 
   // -------------------------------------------------------- court approvals
-  async pendingCourts() {
-    return this.prisma.court.findMany({
-      where: { status: 'pending' },
-      include: {
-        venue: {
-          select: {
-            id: true,
-            name: true,
-            city: true,
-            owner: { select: { name: true, email: true } },
+  async pendingCourts(cursor?: string) {
+    const ks = this.keyset(cursor);
+    const baseWhere: Prisma.CourtWhereInput = { status: 'pending' };
+    const [total, courts] = await Promise.all([
+      this.prisma.court.count({ where: baseWhere }),
+      this.prisma.court.findMany({
+        where: ks
+          ? {
+              ...baseWhere,
+              OR: [
+                { createdAt: { gt: ks.createdAt } },
+                { createdAt: ks.createdAt, id: { gt: ks.id } },
+              ],
+            }
+          : baseWhere,
+        include: {
+          venue: {
+            select: {
+              id: true,
+              name: true,
+              city: true,
+              owner: { select: { name: true, email: true } },
+            },
           },
         },
-      },
-      orderBy: { createdAt: 'asc' },
-    });
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        take: 31,
+      }),
+    ]);
+    const pageRows = courts.slice(0, 30);
+    return {
+      items: pageRows,
+      total,
+      nextCursor: courts.length > 30 ? this.keysetCursor(pageRows[pageRows.length - 1]) : null,
+    };
   }
 
   async approveCourt(actorId: string, courtId: string) {

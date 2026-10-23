@@ -87,8 +87,8 @@ export class AdminController {
   // ------------------------------------------------------------------- users
   @ApiTags('admin · users')
   @Get('users')
-  listUsers(@Query('q') q?: string, @Query('role') role?: string, @Query('status') status?: string, @Query('offset') offset?: string) {
-    return this.admin.listUsers(q, role, status, offset ? parseInt(offset, 10) || 0 : 0);
+  listUsers(@Query('q') q?: string, @Query('role') role?: string, @Query('status') status?: string, @Query('cursor') cursor?: string) {
+    return this.admin.listUsers(q, role, status, cursor);
   }
 
   @ApiTags('admin · users')
@@ -140,8 +140,8 @@ export class AdminController {
 
   @ApiTags('admin · approvals')
   @Get('owners/pending')
-  pendingOwners() {
-    return this.admin.pendingOwners();
+  pendingOwners(@Query('cursor') cursor?: string) {
+    return this.admin.pendingOwners(cursor);
   }
 
   @ApiTags('admin · users')
@@ -194,8 +194,8 @@ export class AdminController {
   // ------------------------------------------------------------------ venues
   @ApiTags('admin · approvals')
   @Get('venues/pending')
-  pendingVenues() {
-    return this.admin.pendingVenues();
+  pendingVenues(@Query('cursor') cursor?: string) {
+    return this.admin.pendingVenues(cursor);
   }
 
   @ApiTags('admin · approvals')
@@ -349,8 +349,8 @@ export class AdminController {
 
   @ApiTags('admin · venues')
   @Get('courts/pending')
-  pendingCourts() {
-    return this.admin.pendingCourts();
+  pendingCourts(@Query('cursor') cursor?: string) {
+    return this.admin.pendingCourts(cursor);
   }
 
   @ApiTags('admin · venues')
