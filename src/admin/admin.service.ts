@@ -328,6 +328,13 @@ export class AdminService {
         "That role belongs to an arena owner — team roles are assigned from the owner's panel, not here.",
       );
     }
+    if (role.name !== 'player' && !dto.password) {
+      // Owners and staff sign in with a password and there is no
+      // set-password flow — a passwordless account could never sign in.
+      throw new BadRequestException(
+        'Set a password — owners and staff sign in with one, and a passwordless account could never sign in.',
+      );
+    }
     const user = await this.prisma.user.create({
       data: {
         email,
@@ -346,6 +353,28 @@ export class AdminService {
   async setUserRole(actorId: string, id: string, roleId: string) {
     const role = await this.prisma.role.findUnique({ where: { id: roleId } });
     if (!role) throw new NotFoundException('Role not found');
+    if (id === actorId) {
+      throw new BadRequestException("You can't change your own role");
+    }
+    const target = await this.prisma.user.findUnique({
+      where: { id },
+      include: { role: { select: { name: true } } },
+    });
+    if (!target) throw new NotFoundException('User not found');
+    if (target.role.name === 'super_admin' && role.name !== 'super_admin') {
+      const others = await this.prisma.user.count({
+        where: {
+          id: { not: id },
+          status: UserStatus.active,
+          role: { name: 'super_admin' },
+        },
+      });
+      if (others === 0) {
+        throw new BadRequestException(
+          "You can't demote the last active super admin",
+        );
+      }
+    }
     if (role.ownerId) {
       throw new BadRequestException(
         "That role belongs to an arena owner — team roles are assigned from the owner's panel, not here.",
@@ -363,6 +392,14 @@ export class AdminService {
       include: { role: { select: { name: true } } },
     });
     if (!target) throw new NotFoundException('User not found');
+    if (status === UserStatus.pending) {
+      // Pending is a signup state, not a management state — moving an
+      // account back there locks it out and (for players) hides it from
+      // every queue. Signups are rejected via the reject flow instead.
+      throw new BadRequestException(
+        "Accounts can't be moved back to pending — reject the signup or suspend the account instead.",
+      );
+    }
     if (status === UserStatus.suspended) {
       // Nobody locks the platform out of its own admin panel.
       if (id === actorId) {
@@ -385,6 +422,19 @@ export class AdminService {
     }
     const user = await this.prisma.user.update({ where: { id }, data: { status } });
     await this.audit(actorId, `user.${status}`, 'user', id);
+    if (
+      status === UserStatus.active &&
+      target.status === UserStatus.pending &&
+      target.role.name === 'owner'
+    ) {
+      await this.notifications
+        .pushToUser(id, {
+          title: 'Your Areana owner account is approved',
+          body: 'You can sign in now and start listing your arenas.',
+          data: { type: 'account_approved' },
+        })
+        .catch(() => {});
+    }
     // Suspending a PLAYER cancels their upcoming bookings and tells both
     // sides (owners keep their existing bookings under the round-3
     // policy instead — their venues pause, nothing is cancelled).
@@ -516,9 +566,13 @@ export class AdminService {
   }
 
   async resetStrikes(actorId: string, id: string) {
+    const target = await this.prisma.user.findUnique({ where: { id } });
+    if (!target) throw new NotFoundException('User not found');
+    // Strikes only — reactivating a suspended account is a separate,
+    // explicit decision (the Unsuspend action), never a side effect.
     const user = await this.prisma.user.update({
       where: { id },
-      data: { noShowCount: 0, status: UserStatus.active },
+      data: { noShowCount: 0 },
     });
     await this.audit(actorId, 'user.reset_strikes', 'user', id);
     return { id: user.id, noShowCount: 0 };
@@ -590,10 +644,17 @@ export class AdminService {
       include: { role: { select: { name: true } } },
       orderBy: { createdAt: 'asc' },
     });
-    return users.map((u) => {
+    const out = [];
+    for (const u of users) {
       const { passwordHash: _p, ...safe } = u;
-      return safe;
-    });
+      const duplicatePhoneAccounts = u.phone
+        ? await this.prisma.user.count({
+            where: { phone: u.phone, id: { not: u.id } },
+          })
+        : 0;
+      out.push({ ...safe, duplicatePhoneAccounts });
+    }
+    return out;
   }
 
   /**
@@ -750,7 +811,7 @@ export class AdminService {
         owner: { select: { name: true, email: true, phone: true, status: true } },
         // Active courts ride along so the approvals card can mirror the
         // venues-list card (court count + sports) without extra calls.
-        courts: { where: { isActive: true }, select: { id: true, sport: true } },
+        courts: { where: { isActive: true }, select: { id: true, sport: true, status: true } },
       },
       orderBy: { createdAt: 'asc' },
     });
@@ -794,6 +855,13 @@ export class AdminService {
     // free period first) — see PlansService.
     await this.plans.startBilling(venueId);
     await this.audit(actorId, 'venue.approve', 'venue', venueId);
+    await this.notifications
+      .pushToUser(venue.ownerId, {
+        title: 'Your arena is approved',
+        body: `${venue.name} is live on Areana — players can find it and book its approved courts.`,
+        data: { type: 'venue_approved', venueId },
+      })
+      .catch(() => {});
     return venue;
   }
 
@@ -1552,7 +1620,17 @@ export class AdminService {
   async approveCourt(actorId: string, courtId: string) {
     const court = await this.prisma.court.findUnique({
       where: { id: courtId },
-      include: { venue: { select: { name: true, ownerId: true } } },
+      include: {
+        venue: {
+          select: {
+            name: true,
+            ownerId: true,
+            status: true,
+            moderationStatus: true,
+            billingPaused: true,
+          },
+        },
+      },
     });
     if (!court) throw new NotFoundException('Court not found');
     const updated = await this.prisma.court.update({
@@ -1560,10 +1638,16 @@ export class AdminService {
       data: { status: 'approved' },
     });
     await this.audit(actorId, 'court.approve', 'court', courtId);
+    const arenaLive =
+      court.venue.status === 'approved' &&
+      court.venue.moderationStatus === 'none' &&
+      !court.venue.billingPaused;
     await this.notifications
       .pushToUser(court.venue.ownerId, {
         title: 'Court approved',
-        body: `${court.name} at ${court.venue.name} is live — players can now book it.`,
+        body: arenaLive
+          ? `${court.name} at ${court.venue.name} is live — players can now book it.`
+          : `${court.name} at ${court.venue.name} is approved — it becomes bookable once the arena itself is live.`,
         data: { type: 'court_approved', venueId: court.venueId },
       })
       .catch(() => {});
@@ -1977,6 +2061,13 @@ export class AdminService {
       data: { status: VenueStatus.rejected },
     });
     await this.audit(actorId, 'venue.reject', 'venue', venueId);
+    await this.notifications
+      .pushToUser(venue.ownerId, {
+        title: 'Your arena was not approved',
+        body: `${venue.name} won't go live. Check its photos, location and details, then submit it again.`,
+        data: { type: 'venue_rejected', venueId },
+      })
+      .catch(() => {});
     return venue;
   }
 
@@ -1993,6 +2084,13 @@ export class AdminService {
       data: { status: VenueStatus.suspended },
     });
     await this.audit(actorId, 'venue.suspend', 'venue', venueId);
+    await this.notifications
+      .pushToUser(venue.ownerId, {
+        title: 'Your arena has been suspended',
+        body: `${venue.name} is hidden from players and takes no new bookings until it is reinstated.`,
+        data: { type: 'venue_suspended', venueId },
+      })
+      .catch(() => {});
     return venue;
   }
 
