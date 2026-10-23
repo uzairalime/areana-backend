@@ -2324,8 +2324,15 @@ export class AdminService {
             }
           : baseWhere,
         include: {
-          booking: { include: { venue: { select: { name: true } } } },
-          raisedBy: { select: { name: true, email: true } },
+          booking: { include: { venue: { select: { id: true, name: true } } } },
+          raisedBy: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              role: { select: { name: true } },
+            },
+          },
         },
         orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
         take: limit + 1,
