@@ -42,6 +42,8 @@ export interface BillingSummary {
   amountDue: number;
   paidUntil: string | null;
   billingPaused: boolean;
+  /** When the grace window closes (status due/overdue); null otherwise. */
+  graceEndsAt: string | null;
 }
 
 function addMonths(d: Date, months: number): Date {
@@ -330,6 +332,7 @@ export class PlansService {
       amountDue: 0,
       paidUntil: venue.billingPaidUntil?.toISOString() ?? null,
       billingPaused: venue.billingPaused,
+      graceEndsAt: null,
     };
     const ctx = await this.context(venue);
     if (!ctx) return base;
@@ -363,6 +366,7 @@ export class PlansService {
       status: overdue ? 'overdue' : 'due',
       nextDueAt: periodStart.toISOString(),
       amountDue: ctx.plan.priceYearly,
+      graceEndsAt: graceEnd.toISOString(),
     };
   }
 
