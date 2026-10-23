@@ -505,7 +505,7 @@ export class AdminService {
           `${new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Karachi' }).format(since)}T00:00:00.000Z`,
         )
       : null;
-    const [bookingRows, eventRows, paymentRows] = await Promise.all([
+    const [bookingRows, eventRows, paymentRows, reportRows] = await Promise.all([
       this.prisma.booking.groupBy({
         by: ['venueId'],
         where: {
@@ -521,7 +521,15 @@ export class AdminService {
         _count: true,
       }),
       this.prisma.venuePayment.groupBy({ by: ['venueId'], _sum: { amount: true } }),
+      this.prisma.venueReport.groupBy({
+        by: ['venueId'],
+        where: { status: 'open' },
+        _count: true,
+      }),
     ]);
+    const openReportsByVenue = new Map(
+      reportRows.map((r) => [r.venueId, r._count]),
+    );
     const bookingByVenue = new Map(
       bookingRows.map((r) => [
         r.venueId,
@@ -555,6 +563,7 @@ export class AdminService {
           views: e.views,
           clicks: e.clicks,
           subscriptionRevenue: revenueByVenue.get(v.id) ?? 0,
+          openReports: openReportsByVenue.get(v.id) ?? 0,
         },
       });
     }
@@ -648,6 +657,36 @@ export class AdminService {
       }),
       this.prisma.venueStaff.count({ where: { venueId } }),
     ]);
+    const [reports, venueDisputes, openReportsCount, openDisputesCount] =
+      await Promise.all([
+        this.prisma.venueReport.findMany({
+          where: { venueId },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+          include: { user: { select: { name: true, email: true } } },
+        }),
+        this.prisma.dispute.findMany({
+          where: { booking: { venueId } },
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+          include: {
+            raisedBy: { select: { name: true, email: true } },
+            booking: {
+              select: {
+                date: true,
+                status: true,
+                court: { select: { name: true } },
+              },
+            },
+          },
+        }),
+        this.prisma.venueReport.count({
+          where: { venueId, status: 'open' },
+        }),
+        this.prisma.dispute.count({
+          where: { booking: { venueId }, status: 'open' },
+        }),
+      ]);
     const courtTotalsMap = new Map(courtTotals.map((r) => [r.courtId, r._count]));
     const courtStats = new Map(
       courtAgg.map((r) => [
@@ -685,6 +724,9 @@ export class AdminService {
       courtLimit,
       staffLimit,
       billing,
+      reports,
+      disputes: venueDisputes,
+      reportCounts: { openReports: openReportsCount, openDisputes: openDisputesCount },
       readiness: venueReadiness(
         venue,
         venue.courts.filter((c) => c.isActive).length,
@@ -1538,6 +1580,31 @@ export class AdminService {
       },
       orderBy: { createdAt: 'desc' },
       take: 100,
+    });
+  }
+
+  /** Resolve a player report about an arena: reviewed | actioned | dismissed. */
+  async resolveVenueReport(
+    adminId: string,
+    reportId: string,
+    body: { status: string; resolution?: string },
+  ) {
+    const allowed = ['reviewed', 'actioned', 'dismissed'];
+    if (!allowed.includes(body.status)) {
+      throw new BadRequestException('Invalid report status');
+    }
+    const report = await this.prisma.venueReport.findUnique({
+      where: { id: reportId },
+    });
+    if (!report) throw new NotFoundException('Report not found');
+    return this.prisma.venueReport.update({
+      where: { id: reportId },
+      data: {
+        status: body.status,
+        resolution: body.resolution?.trim() || null,
+        resolvedById: adminId,
+        resolvedAt: new Date(),
+      },
     });
   }
 

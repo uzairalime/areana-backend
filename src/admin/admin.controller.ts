@@ -510,6 +510,16 @@ export class AdminController {
   }
 
   // ---------------------------------------------------------------- disputes
+  @ApiTags('admin · venues')
+  @Post('venue-reports/:id/resolve')
+  resolveVenueReport(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() body: { status: string; resolution?: string },
+  ) {
+    return this.admin.resolveVenueReport(user.id, id, body ?? { status: '' });
+  }
+
   @ApiTags('admin · disputes')
   @Get('disputes')
   listDisputes(@Query('status') status?: string) {

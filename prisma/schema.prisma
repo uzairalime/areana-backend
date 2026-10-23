@@ -91,6 +91,8 @@ model User {
   suggestions       VenueSuggestion[]
   auditLogs         AuditLog[]       @relation("ActorLogs")
   disputesRaised    Dispute[]        @relation("RaisedDisputes")
+  venueReportsRaised   VenueReport[]    @relation("RaisedVenueReports")
+  venueReportsResolved VenueReport[]    @relation("ResolvedVenueReports")
   disputesResolved  Dispute[]        @relation("ResolvedDisputes")
   grantedBadges     VenueBadge[]
   curatedPosts      GamePost[]       @relation("CuratedPosts")
@@ -202,6 +204,7 @@ model Venue {
   favorites    Favorite[]
   staff        VenueStaff[]
   events       VenueEvent[]
+  reports   VenueReport[]
   payments     VenuePayment[]
   promos       PromoCode[]
   allowedRoles VenueAllowedRole[]
@@ -578,6 +581,25 @@ model Dispute {
   createdAt    DateTime  @default(now())
   resolvedAt   DateTime?
 
+  @@index([status])
+}
+
+model VenueReport {
+  id           String    @id @default(cuid())
+  venueId      String
+  venue        Venue     @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  userId       String
+  user         User      @relation("RaisedVenueReports", fields: [userId], references: [id])
+  category     String // fake_listing | wrong_info | closed | misconduct | unsafe | other
+  details      String?
+  status       String    @default("open") // open | reviewed | actioned | dismissed
+  resolution   String?
+  resolvedById String?
+  resolvedBy   User?     @relation("ResolvedVenueReports", fields: [resolvedById], references: [id])
+  createdAt    DateTime  @default(now())
+  resolvedAt   DateTime?
+
+  @@index([venueId, status])
   @@index([status])
 }
 

@@ -2,7 +2,7 @@ import { Body, Controller, Get, Ip, Param, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { CurrentUser, Public, type AuthUser } from '../common/auth';
 import { VenuesService } from './venues.service';
-import { QueryVenuesDto } from './dto';
+import { QueryVenuesDto, ReportVenueDto } from './dto';
 
 @ApiTags('venues')
 @Controller('venues')
@@ -33,6 +33,22 @@ export class VenuesController {
   @Get(':id')
   getById(@Param('id') id: string) {
     return this.venues.getById(id);
+  }
+
+  /** Report this arena (signed-in players only). */
+  @Post(':id/report')
+  report(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: ReportVenueDto,
+  ) {
+    return this.venues.reportVenue(user.id, id, dto);
+  }
+
+  /** The signed-in player's own latest report for this arena, if any. */
+  @Get(':id/report/me')
+  myReport(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.venues.myVenueReport(user.id, id);
   }
 
   /** View / click beacon from the player web (fire-and-forget). */

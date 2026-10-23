@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { QueryVenuesDto } from './dto';
@@ -6,6 +6,50 @@ import { QueryVenuesDto } from './dto';
 @Injectable()
 export class VenuesService {
   constructor(private prisma: PrismaService) {}
+
+  // ------------------------------------------------------------ reports
+  /**
+   * A signed-in player reports an arena (fake listing, closed, misconduct…).
+   * One OPEN report per player per arena — a second attempt while one is
+   * still open returns a 409 so the queue stays clean.
+   */
+  async reportVenue(
+    userId: string,
+    venueId: string,
+    body: { category: string; details?: string },
+  ) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { id: true },
+    });
+    if (!venue) throw new NotFoundException('Venue not found');
+    const existing = await this.prisma.venueReport.findFirst({
+      where: { venueId, userId, status: 'open' },
+      select: { id: true },
+    });
+    if (existing) {
+      throw new ConflictException(
+        'You already have an open report for this arena — our team is reviewing it.',
+      );
+    }
+    return this.prisma.venueReport.create({
+      data: {
+        venueId,
+        userId,
+        category: body.category,
+        details: body.details?.trim() || null,
+      },
+    });
+  }
+
+  /** The player's own latest report for this arena (any status), if any. */
+  async myVenueReport(userId: string, venueId: string) {
+    return this.prisma.venueReport.findFirst({
+      where: { venueId, userId },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, category: true, status: true, createdAt: true },
+    });
+  }
 
   // ------------------------------------------------------------ tracking
   /**

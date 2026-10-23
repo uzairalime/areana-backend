@@ -1,4 +1,4 @@
-import { IsInt, IsOptional, IsString, Min } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, MaxLength, Min } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -41,4 +41,23 @@ export class QueryVenuesDto {
   @IsInt()
   @Min(1)
   limit?: number = 20;
+}
+
+export const VENUE_REPORT_CATEGORIES = [
+  'fake_listing',
+  'wrong_info',
+  'closed',
+  'misconduct',
+  'unsafe',
+  'other',
+] as const;
+
+export class ReportVenueDto {
+  @IsIn(VENUE_REPORT_CATEGORIES)
+  category!: (typeof VENUE_REPORT_CATEGORIES)[number];
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  details?: string;
 }
