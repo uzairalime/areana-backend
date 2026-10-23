@@ -7,10 +7,11 @@ import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 import { PlansModule } from '../plans/plans.module';
 import { SportsModule } from '../sports/sports.module';
+import { AmenitiesModule } from '../amenities/amenities.module';
 import { AnalyticsService } from './analytics.service';
 
 @Module({
-  imports: [BadgesModule, DisputesModule, SuggestionsModule, StorageModule, PlansModule, SportsModule],
+  imports: [BadgesModule, DisputesModule, SuggestionsModule, StorageModule, PlansModule, SportsModule, AmenitiesModule],
   controllers: [AdminController],
   providers: [AdminService, AnalyticsService],
 })

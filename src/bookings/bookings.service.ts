@@ -23,6 +23,8 @@ export interface CreateBookingInput extends CreateBookingDto {
   recurrenceId?: string;
   /** Walk-ins / staff-created bookings skip the advance-notice window. */
   skipWindowCheck?: boolean;
+  /** Recurring-series occurrences skip only the max-advance window. */
+  skipMaxAdvance?: boolean;
 }
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -59,7 +61,7 @@ export class BookingsService {
     await this.validateSlotGrid(court, date, startMinutes, slotCount);
     const endMinutes = startMinutes + court.slotMinutes * slotCount;
     if (!input.skipWindowCheck) {
-      this.validateWindow(court, date, startMinutes);
+      this.validateWindow(court, date, startMinutes, input.skipMaxAdvance);
     }
 
     await this.assertNoOverlap(court.id, date, startMinutes, endMinutes);
@@ -153,7 +155,12 @@ export class BookingsService {
     }
   }
 
-  private validateWindow(court: any, date: Date, startMinutes: number) {
+  private validateWindow(
+    court: any,
+    date: Date,
+    startMinutes: number,
+    skipMaxAdvance = false,
+  ) {
     const now = new Date();
     const bookingAt = new Date(date);
     bookingAt.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
@@ -164,10 +171,15 @@ export class BookingsService {
         `Bookings need at least ${court.venue.minAdvanceMinutes} minutes notice`,
       );
     }
-    const maxDate = startOfToday();
-    maxDate.setDate(maxDate.getDate() + court.venue.maxAdvanceDays);
-    if (date > maxDate) {
-      throw new BadRequestException(`Bookings open only ${court.venue.maxAdvanceDays} days ahead`);
+    // A recurring series is a standing commitment the owner approves —
+    // its later occurrences are exempt from the max-advance window
+    // (min-advance above still applies to every occurrence).
+    if (!skipMaxAdvance) {
+      const maxDate = startOfToday();
+      maxDate.setDate(maxDate.getDate() + court.venue.maxAdvanceDays);
+      if (date > maxDate) {
+        throw new BadRequestException(`Bookings open only ${court.venue.maxAdvanceDays} days ahead`);
+      }
     }
     if (bookingAt <= now) throw new BadRequestException('Cannot book a slot in the past');
   }
@@ -263,6 +275,7 @@ export class BookingsService {
           slotCount: dto.slotCount ?? 1,
           userId,
           recurrenceId,
+          skipMaxAdvance: true,
         });
         created.push(b);
       } catch (e: any) {

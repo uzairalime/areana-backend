@@ -61,6 +61,15 @@ export class OwnerController {
 
   // ---------------------------------------------------------------- venues
   @ApiTags('owner · venues & courts')
+  @Get('venues/check-duplicate')
+  duplicateVenueCheck(
+    @Query('name') name?: string,
+    @Query('city') city?: string,
+    @Query('excludeId') excludeId?: string,
+  ) {
+    return this.owner.duplicateVenueCheck(name, city, excludeId);
+  }
+
   @Get('venues')
   myVenues(@CurrentUser() user: AuthUser) {
     return this.owner.listMyVenues(user);

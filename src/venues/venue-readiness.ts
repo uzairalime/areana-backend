@@ -134,6 +134,21 @@ export function withSportTag(
  * unbookable (too near for one rule, too far for the other) — reject it
  * wherever the pair is set instead of letting an arena silently die.
  */
+
+/**
+ * Launch is Pakistan-only. Coordinates outside the country's bounding
+ * box are almost always a swapped lat/lng (a swap keeps both numbers
+ * inside the global ±90/±180 ranges, so plain range checks miss it).
+ */
+export function assertPakistanCoords(lat?: number | null, lng?: number | null) {
+  if (lat == null || lng == null) return;
+  if (lat < 23 || lat > 37.2 || lng < 60.8 || lng > 78) {
+    throw new BadRequestException(
+      'These coordinates fall outside Pakistan — check that latitude and longitude are not swapped.',
+    );
+  }
+}
+
 export function assertBookingWindow(
   minAdvanceMinutes: number,
   maxAdvanceDays: number,

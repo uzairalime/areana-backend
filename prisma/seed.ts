@@ -142,6 +142,29 @@ async function main() {
   }
   console.log('Sports seeded');
 
+  // Amenities catalog — same rule as sports: seed the defaults ONCE,
+  // afterwards the catalog is fully admin-managed.
+  if ((await prisma.amenity.count()) === 0) {
+    const defaults = [
+      'Parking',
+      'Floodlights',
+      'Changing Rooms',
+      'Showers',
+      'Washrooms',
+      'Cafe',
+      'Seating Area',
+      'First Aid',
+      'Equipment Rental',
+      'Drinking Water',
+      'Wi-Fi',
+      'Prayer Area',
+    ];
+    for (const [i, name] of defaults.entries()) {
+      await prisma.amenity.create({ data: { name, sortOrder: i } });
+    }
+  }
+  console.log('Amenities seeded');
+
   const settings: Record<string, string> = {
     commissionPct: '10',
     billingGraceDays: '14',

@@ -19,10 +19,12 @@ import type { CreatePlanDto, UpdatePlanDto } from '../plans/dto';
 import type { OnboardArenaDto } from './dto';
 import {
   assertBookingWindow,
+  assertPakistanCoords,
   photoEntriesOf,
   venueReadiness,
   withSportTag,
 } from '../venues/venue-readiness';
+import { AmenitiesService } from '../amenities/amenities.service';
 import { CreateRoleDto, CreateUserDto, UpdateRoleDto } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 import { SportsService } from '../sports/sports.service';
@@ -38,6 +40,7 @@ export class AdminService {
     private storage: StorageService,
     private plans: PlansService,
     private sports: SportsService,
+    private amenities: AmenitiesService,
   ) {}
 
   private audit(
@@ -403,6 +406,8 @@ export class AdminService {
     if (new Set(courtNames).size !== courtNames.length) {
       throw new BadRequestException('Two courts in this onboard have the same name');
     }
+    assertPakistanCoords(dto.lat, dto.lng);
+    const amenities = await this.amenities.normalizeAmenities(dto.amenities ?? []);
     const courtSports = [...new Set((dto.courts ?? []).map((c) => c.sport))];
     const sports = await this.sports.normalizeSports(
       dto.sports && dto.sports.length > 0 ? dto.sports : courtSports,
@@ -433,7 +438,7 @@ export class AdminService {
           lat: dto.lat,
           lng: dto.lng,
           sports,
-          amenities: dto.amenities ?? [],
+          amenities,
           // approveNow submits the venue for approval (pending) — it goes
           // live through the normal approve action once the photo and
           // readiness requirements are met, like every other venue.
@@ -1030,7 +1035,13 @@ export class AdminService {
     if (dto.phone !== undefined) data.phone = dto.phone;
     if (dto.lat !== undefined) data.lat = dto.lat;
     if (dto.lng !== undefined) data.lng = dto.lng;
-    if (dto.amenities !== undefined) data.amenities = dto.amenities;
+    if (dto.lat !== undefined || dto.lng !== undefined) {
+      assertPakistanCoords(dto.lat ?? venue.lat, dto.lng ?? venue.lng);
+    }
+    if (dto.amenities !== undefined)
+      data.amenities = await this.amenities.normalizeAmenities(dto.amenities, {
+        grandfathered: venue.amenities,
+      });
     if (dto.autoAccept !== undefined) data.autoAccept = dto.autoAccept;
     if (dto.minAdvanceMinutes !== undefined) data.minAdvanceMinutes = dto.minAdvanceMinutes;
     if (dto.maxAdvanceDays !== undefined) data.maxAdvanceDays = dto.maxAdvanceDays;

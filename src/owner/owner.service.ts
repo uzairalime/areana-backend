@@ -20,11 +20,13 @@ import { ARENA_ROLE_PERMISSIONS } from '../common/permissions';
 import type { CreateMyPromoDto, CreateMyRoleDto, UpdateMyPromoDto, UpdateMyRoleDto } from './dto';
 import {
   assertBookingWindow,
+  assertPakistanCoords,
   photoEntriesOf,
   venueReadiness,
   withSportTag,
 } from '../venues/venue-readiness';
 import { SportsService } from '../sports/sports.service';
+import { AmenitiesService } from '../amenities/amenities.service';
 import {
   BookingsQueryDto,
   CreateBlockDto,
@@ -51,6 +53,7 @@ export class OwnerService {
     private notifications: NotificationsService,
     private plans: PlansService,
     private sports: SportsService,
+    private amenities: AmenitiesService,
   ) {}
 
   // ------------------------------------------------------------ access scope
@@ -164,7 +167,9 @@ export class OwnerService {
         );
       }
     }
+    assertPakistanCoords(dto.lat, dto.lng);
     const sports = await this.sports.normalizeSports(dto.sports ?? []);
+    const amenities = await this.amenities.normalizeAmenities(dto.amenities ?? []);
     const venue = await this.prisma.venue.create({
       data: {
         ownerId: user.id,
@@ -175,7 +180,7 @@ export class OwnerService {
         lat: dto.lat,
         lng: dto.lng,
         sports,
-        amenities: dto.amenities ?? [],
+        amenities,
         status: VenueStatus.draft,
       },
     });
@@ -189,6 +194,28 @@ export class OwnerService {
       });
     }
     return venue;
+  }
+
+  /**
+   * Soft duplicate check for the owner form: another arena with the same
+   * name in the same city (any owner, not archived). Warning only —
+   * legit branches share names, so creation is never blocked.
+   */
+  async duplicateVenueCheck(name?: string, city?: string, excludeId?: string) {
+    const n = (name ?? '').trim();
+    const c = (city ?? '').trim();
+    if (!n || !c) return { duplicates: [] };
+    const duplicates = await this.prisma.venue.findMany({
+      where: {
+        archivedAt: null,
+        ...(excludeId ? { id: { not: excludeId } } : {}),
+        name: { equals: n, mode: 'insensitive' },
+        city: { equals: c, mode: 'insensitive' },
+      },
+      select: { id: true, name: true, city: true, status: true },
+      take: 5,
+    });
+    return { duplicates };
   }
 
   async updateVenue(user: AuthUser, venueId: string, dto: UpdateVenueDto) {
@@ -217,6 +244,14 @@ export class OwnerService {
     if (dto.sports !== undefined) {
       data.sports = await this.sports.normalizeSports(dto.sports, {
         grandfathered: current.sports,
+      });
+    }
+    if (dto.lat !== undefined || dto.lng !== undefined) {
+      assertPakistanCoords(dto.lat ?? current.lat, dto.lng ?? current.lng);
+    }
+    if (dto.amenities !== undefined) {
+      data.amenities = await this.amenities.normalizeAmenities(dto.amenities, {
+        grandfathered: current.amenities,
       });
     }
     let backToPending = false;

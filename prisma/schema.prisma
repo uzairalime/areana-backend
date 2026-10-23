@@ -764,3 +764,13 @@ model Sport {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+/** Canonical amenity list, super-admin managed like the sports catalog. */
+model Amenity {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
