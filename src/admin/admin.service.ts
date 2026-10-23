@@ -690,6 +690,142 @@ export class AdminService {
     };
   }
 
+  // ------------------------------------------------------------ charts
+  /**
+   * Daily series for the venue / court performance charts, bucketed by
+   * PLAY date in Asia/Karachi: booking counts per status, revenue from
+   * non-cancelled bookings, and discovery traffic from VenueEvent.
+   */
+  private async dailySeries(
+    scope: { venueId: string; courtId?: string },
+    days: number,
+  ) {
+    const n = Math.min(90, Math.max(7, Math.floor(days) || 30));
+    const todayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Karachi',
+    }).format(new Date());
+    const dayStrs: string[] = [];
+    for (let i = n - 1; i >= 0; i--) {
+      const d = new Date(`${todayStr}T00:00:00.000Z`);
+      d.setUTCDate(d.getUTCDate() - i);
+      dayStrs.push(d.toISOString().slice(0, 10));
+    }
+    const from = new Date(`${dayStrs[0]}T00:00:00.000Z`);
+    const to = new Date(`${dayStrs[dayStrs.length - 1]}T00:00:00.000Z`);
+    const [bookings, events] = await Promise.all([
+      this.prisma.booking.findMany({
+        where: {
+          venueId: scope.venueId,
+          ...(scope.courtId ? { courtId: scope.courtId } : {}),
+          date: { gte: from, lte: to },
+        },
+        select: { date: true, status: true, totalPrice: true, discountAmount: true },
+      }),
+      this.prisma.venueEvent.findMany({
+        where: {
+          venueId: scope.venueId,
+          ...(scope.courtId ? { courtId: scope.courtId } : {}),
+          day: { gte: from, lte: to },
+        },
+        select: { day: true, type: true },
+      }),
+    ]);
+    const blank = () => ({
+      pending: 0, confirmed: 0, completed: 0, cancelled: 0, noShow: 0,
+      revenue: 0, views: 0, clicks: 0, courtViews: 0,
+    });
+    const byDay = new Map(dayStrs.map((d) => [d, blank()]));
+    for (const b of bookings) {
+      const row = byDay.get(b.date.toISOString().slice(0, 10));
+      if (!row) continue;
+      if (b.status === 'pending') row.pending++;
+      else if (b.status === 'confirmed') row.confirmed++;
+      else if (b.status === 'completed') row.completed++;
+      else if (b.status === 'cancelled') row.cancelled++;
+      else if (b.status === 'no_show') row.noShow++;
+      if (b.status !== 'cancelled') {
+        row.revenue += Number(b.totalPrice) - Number(b.discountAmount);
+      }
+    }
+    for (const e of events) {
+      const row = byDay.get(e.day.toISOString().slice(0, 10));
+      if (!row) continue;
+      if (e.type === 'view') row.views++;
+      else if (e.type === 'click') row.clicks++;
+      else if (e.type === 'court_view') row.courtViews++;
+    }
+    return dayStrs.map((date) => ({ date, ...byDay.get(date)! }));
+  }
+
+  async venueSeries(venueId: string, days: number) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { id: true },
+    });
+    if (!venue) throw new NotFoundException('Venue not found');
+    return { series: await this.dailySeries({ venueId }, days) };
+  }
+
+  /** Court detail screen data: court + venue, lifetime totals, chart series, recent bookings. */
+  async courtDetailAdmin(courtId: string, days: number) {
+    const court = await this.prisma.court.findUnique({
+      where: { id: courtId },
+      include: {
+        venue: { select: { id: true, name: true, city: true } },
+        _count: { select: { bookings: true } },
+      },
+    });
+    if (!court) throw new NotFoundException('Court not found');
+    const todayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Karachi',
+    }).format(new Date());
+    const today = new Date(`${todayStr}T00:00:00.000Z`);
+    const [upcoming, revenueAgg, courtViews, recent] = await Promise.all([
+      this.prisma.booking.count({
+        where: {
+          courtId,
+          date: { gte: today },
+          status: { in: ['pending', 'confirmed'] },
+        },
+      }),
+      this.prisma.booking.aggregate({
+        where: { courtId, status: { not: 'cancelled' } },
+        _sum: { totalPrice: true, discountAmount: true },
+      }),
+      this.prisma.venueEvent.count({
+        where: { courtId, type: 'court_view' },
+      }),
+      this.prisma.booking.findMany({
+        where: { courtId },
+        orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+        take: 8,
+        include: { user: { select: { name: true } } },
+      }),
+    ]);
+    return {
+      court,
+      totals: {
+        bookings: court._count.bookings,
+        upcoming,
+        revenue:
+          Number(revenueAgg._sum.totalPrice ?? 0) -
+          Number(revenueAgg._sum.discountAmount ?? 0),
+        courtViews,
+      },
+      series: await this.dailySeries({ venueId: court.venueId, courtId }, days),
+      recentBookings: recent.map((b) => ({
+        id: b.id,
+        date: b.date,
+        startMinutes: b.startMinutes,
+        endMinutes: b.endMinutes,
+        status: b.status,
+        amount: Number(b.totalPrice) - Number(b.discountAmount),
+        player: b.user?.name ?? b.guestName ?? 'Walk-in',
+        checkedInAt: b.checkedInAt,
+      })),
+    };
+  }
+
   // ------------------------------------------------------------ moderation
   /**
    * Pause / block / disable a venue (or clear it with status 'none').
