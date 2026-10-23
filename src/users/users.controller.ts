@@ -1,9 +1,11 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from '@nestjs/common';
-import { ApiBearerAuth, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, Delete, Get, Param, Patch, Post, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { ApiBearerAuth, ApiConsumes, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
 import { IsOptional, IsString } from 'class-validator';
 import { AuthUser, CurrentUser, RequirePerm } from '../common/auth';
 import { PrismaService } from '../common/prisma';
 import { BookingsService } from '../bookings/bookings.service';
+import { StorageService } from '../storage/storage.service';
+import { FileInterceptor } from '@nestjs/platform-express';
 
 class UpdateMeDto {
   @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
@@ -23,6 +25,7 @@ export class UsersController {
   constructor(
     private prisma: PrismaService,
     private bookings: BookingsService,
+    private storage: StorageService,
   ) {}
 
   @Get('me')
@@ -36,6 +39,29 @@ export class UsersController {
   @Patch('me')
   updateMe(@CurrentUser() user: AuthUser, @Body() dto: UpdateMeDto) {
     return this.prisma.user.update({ where: { id: user.id }, data: dto });
+  }
+
+  /** Upload (or replace) the signed-in user's profile photo. */
+  @Post('me/avatar')
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(FileInterceptor('image'))
+  async uploadAvatar(@CurrentUser() user: AuthUser, @UploadedFile() file: Express.Multer.File) {
+    const saved = await this.storage.saveAvatarImage(user.id, file);
+    const updated = await this.prisma.user.update({
+      where: { id: user.id },
+      data: { avatarUrl: saved.url },
+    });
+    return { avatarUrl: updated.avatarUrl, blurhash: saved.blurhash };
+  }
+
+  /** Remove the signed-in user's profile photo. */
+  @Delete('me/avatar')
+  async removeAvatar(@CurrentUser() user: AuthUser) {
+    const updated = await this.prisma.user.update({
+      where: { id: user.id },
+      data: { avatarUrl: null },
+    });
+    return { avatarUrl: updated.avatarUrl };
   }
 
   /**
