@@ -347,17 +347,18 @@ export class AdminService {
   async pendingVenues() {
     const venues = await this.prisma.venue.findMany({
       where: { status: VenueStatus.pending },
-      include: { owner: { select: { name: true, email: true, phone: true } } },
+      include: {
+        owner: { select: { name: true, email: true, phone: true } },
+        // Active courts ride along so the approvals card can mirror the
+        // venues-list card (court count + sports) without extra calls.
+        courts: { where: { isActive: true }, select: { id: true, sport: true } },
+      },
       orderBy: { createdAt: 'desc' },
     });
-    const out = [];
-    for (const v of venues) {
-      const courts = await this.prisma.court.count({
-        where: { venueId: v.id, isActive: true },
-      });
-      out.push({ ...v, readiness: venueReadiness(v, courts) });
-    }
-    return out;
+    return venues.map((v) => ({
+      ...v,
+      readiness: venueReadiness(v, v.courts.length),
+    }));
   }
 
   async approveVenue(actorId: string, venueId: string) {
