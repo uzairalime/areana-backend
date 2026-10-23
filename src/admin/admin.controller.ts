@@ -224,8 +224,16 @@ export class AdminController {
   @RequirePerm('venues.onboard')
   @ApiTags('admin · venues')
   @Get('venues/:id/series')
-  venueSeries(@Param('id') id: string, @Query('days') days?: string) {
-    return this.admin.venueSeries(id, days ? parseInt(days, 10) : 30);
+  venueSeries(
+    @Param('id') id: string,
+    @Query('days') days?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.admin.venueSeries(id, days ? parseInt(days, 10) : 30, {
+      from,
+      to,
+    });
   }
 
   @Get('venues/:id')
@@ -339,8 +347,16 @@ export class AdminController {
   @ApiTags('admin · venues')
   @ApiTags('admin · venues')
   @Get('courts/:id/detail')
-  courtDetail(@Param('id') id: string, @Query('days') days?: string) {
-    return this.admin.courtDetailAdmin(id, days ? parseInt(days, 10) : 30);
+  courtDetail(
+    @Param('id') id: string,
+    @Query('days') days?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.admin.courtDetailAdmin(id, days ? parseInt(days, 10) : 30, {
+      from,
+      to,
+    });
   }
 
   @Patch('courts/:id')

@@ -699,16 +699,36 @@ export class AdminService {
   private async dailySeries(
     scope: { venueId: string; courtId?: string },
     days: number,
+    range?: { from?: string; to?: string },
   ) {
-    const n = Math.min(90, Math.max(7, Math.floor(days) || 30));
-    const todayStr = new Intl.DateTimeFormat('en-CA', {
-      timeZone: 'Asia/Karachi',
-    }).format(new Date());
-    const dayStrs: string[] = [];
-    for (let i = n - 1; i >= 0; i--) {
-      const d = new Date(`${todayStr}T00:00:00.000Z`);
-      d.setUTCDate(d.getUTCDate() - i);
-      dayStrs.push(d.toISOString().slice(0, 10));
+    const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+    let dayStrs: string[] = [];
+    if (
+      range?.from &&
+      range?.to &&
+      DATE_RE.test(range.from) &&
+      DATE_RE.test(range.to)
+    ) {
+      // Custom range, inclusive both ends, capped at 366 days. A reversed
+      // range is swapped rather than rejected.
+      const start = range.from <= range.to ? range.from : range.to;
+      const end = range.from <= range.to ? range.to : range.from;
+      const d = new Date(`${start}T00:00:00.000Z`);
+      const endD = new Date(`${end}T00:00:00.000Z`);
+      while (d <= endD && dayStrs.length < 366) {
+        dayStrs.push(d.toISOString().slice(0, 10));
+        d.setUTCDate(d.getUTCDate() + 1);
+      }
+    } else {
+      const n = Math.min(90, Math.max(7, Math.floor(days) || 30));
+      const todayStr = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Karachi',
+      }).format(new Date());
+      for (let i = n - 1; i >= 0; i--) {
+        const d = new Date(`${todayStr}T00:00:00.000Z`);
+        d.setUTCDate(d.getUTCDate() - i);
+        dayStrs.push(d.toISOString().slice(0, 10));
+      }
     }
     const from = new Date(`${dayStrs[0]}T00:00:00.000Z`);
     const to = new Date(`${dayStrs[dayStrs.length - 1]}T00:00:00.000Z`);
@@ -757,17 +777,25 @@ export class AdminService {
     return dayStrs.map((date) => ({ date, ...byDay.get(date)! }));
   }
 
-  async venueSeries(venueId: string, days: number) {
+  async venueSeries(
+    venueId: string,
+    days: number,
+    range?: { from?: string; to?: string },
+  ) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
       select: { id: true },
     });
     if (!venue) throw new NotFoundException('Venue not found');
-    return { series: await this.dailySeries({ venueId }, days) };
+    return { series: await this.dailySeries({ venueId }, days, range) };
   }
 
   /** Court detail screen data: court + venue, lifetime totals, chart series, recent bookings. */
-  async courtDetailAdmin(courtId: string, days: number) {
+  async courtDetailAdmin(
+    courtId: string,
+    days: number,
+    range?: { from?: string; to?: string },
+  ) {
     const court = await this.prisma.court.findUnique({
       where: { id: courtId },
       include: {
@@ -812,7 +840,7 @@ export class AdminService {
           Number(revenueAgg._sum.discountAmount ?? 0),
         courtViews,
       },
-      series: await this.dailySeries({ venueId: court.venueId, courtId }, days),
+      series: await this.dailySeries({ venueId: court.venueId, courtId }, days, range),
       recentBookings: recent.map((b) => ({
         id: b.id,
         date: b.date,
