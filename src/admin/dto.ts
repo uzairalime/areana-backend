@@ -7,6 +7,7 @@ import {
   IsNumber,
   IsOptional,
   IsString,
+  Matches,
   Max,
   Min,
 } from 'class-validator';
@@ -16,7 +17,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 export class CreateUserDto {
   @ApiProperty() @IsString() email: string;
   @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() phone?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @Matches(/^\+?[0-9\s()\-]{7,20}$/, { message: 'Phone must be 7–20 characters of digits, spaces, +, - or ()' }) phone?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() password?: string;
   @ApiProperty({ description: 'Role id' }) @IsString() roleId: string;
 }
@@ -134,7 +135,7 @@ export class OnboardArenaDto {
   // owner account
   @ApiProperty() @IsString() ownerName: string;
   @ApiProperty() @IsString() ownerEmail: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() ownerPhone?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @Matches(/^\+?[0-9\s()\-]{7,20}$/, { message: 'Phone must be 7–20 characters of digits, spaces, +, - or ()' }) ownerPhone?: string;
   @ApiProperty({ description: 'Initial password for the owner login' })
   @IsString()
   ownerPassword: string;
@@ -142,7 +143,7 @@ export class OnboardArenaDto {
   @ApiProperty() @IsString() venueName: string;
   @ApiProperty() @IsString() address: string;
   @ApiProperty() @IsString() city: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() venuePhone?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @Matches(/^\+?[0-9\s()\-]{7,20}$/, { message: 'Phone must be 7–20 characters of digits, spaces, +, - or ()' }) venuePhone?: string;
   @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-90) @Max(90) lat?: number;
   @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-180) @Max(180) lng?: number;
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) sports?: string[];
@@ -168,7 +169,7 @@ export class AdminUpdateVenueDto {
   @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() address?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() city?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() phone?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @Matches(/^\+?[0-9\s()\-]{7,20}$/, { message: 'Phone must be 7–20 characters of digits, spaces, +, - or ()' }) phone?: string;
   @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-90) @Max(90) lat?: number;
   @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(-180) @Max(180) lng?: number;
   @ApiPropertyOptional({ type: [String] }) @IsOptional() @IsArray() @IsString({ each: true }) sports?: string[];

@@ -53,6 +53,14 @@ export class VenuesService {
         'You reported this arena recently and our team has already reviewed it.',
       );
     }
+    if (
+      body.category === 'other' &&
+      (!body.details || body.details.trim().length < 10)
+    ) {
+      throw new BadRequestException(
+        'For an "Other" report, please add a few details (at least 10 characters) so our team can act on it.',
+      );
+    }
     const openCount = await this.prisma.venueReport.count({
       where: { userId, status: 'open' },
     });
@@ -152,15 +160,14 @@ export class VenuesService {
       owner: { status: UserStatus.active },
     };
     if (city) where.city = { equals: city, mode: 'insensitive' };
-    // Sport and surface filters match on real bookable courts (active +
-    // approved) — the same set the card's sports are derived from, so a
-    // pending court's sport never makes its arena match a filter.
-    if (sport || surface) {
-      const some: Prisma.CourtWhereInput = { isActive: true, status: 'approved' };
-      if (sport) some.sport = { equals: sport, mode: 'insensitive' };
-      if (surface) some.surface = { equals: surface, mode: 'insensitive' };
-      where.courts = { some };
-    }
+    // An arena is only listed while it has at least one BOOKABLE court
+    // (active + approved) — an arena whose courts are all off or awaiting
+    // approval is a dead end for players, so it leaves discovery until a
+    // court comes back. Sport/surface filters narrow that same court set.
+    const courtSome: Prisma.CourtWhereInput = { isActive: true, status: 'approved' };
+    if (sport) courtSome.sport = { equals: sport, mode: 'insensitive' };
+    if (surface) courtSome.surface = { equals: surface, mode: 'insensitive' };
+    where.courts = { some: courtSome };
     if (q) {
       where.OR = [
         { name: { contains: q, mode: 'insensitive' } },

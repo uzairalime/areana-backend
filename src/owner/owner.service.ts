@@ -283,10 +283,65 @@ export class OwnerService {
   /** Retire a venue: hidden from players everywhere, history kept. */
   async archiveVenue(user: AuthUser, venueId: string) {
     const venue = await this.assertVenue(user, venueId);
+    // Archiving hides the arena everywhere at once — it must not strand
+    // players holding live bookings (same policy as court delete).
+    const upcoming = await this.prisma.booking.count({
+      where: {
+        venueId,
+        status: { in: ['pending', 'confirmed'] },
+        date: { gte: startOfToday() },
+      },
+    });
+    if (upcoming > 0) {
+      throw new ConflictException(
+        `This arena has ${upcoming} upcoming booking(s) — cancel or complete them before archiving`,
+      );
+    }
     return this.prisma.venue.update({
       where: { id: venue.id },
       data: { archivedAt: new Date() },
     });
+  }
+
+  /** Court names are how players and staff tell courts apart — keep them unique per arena. */
+  private async assertCourtNameFree(
+    venueId: string,
+    name: string,
+    excludeId?: string,
+  ) {
+    const siblings = await this.prisma.court.findMany({
+      where: { venueId, ...(excludeId ? { id: { not: excludeId } } : {}) },
+      select: { name: true },
+    });
+    const wanted = name.trim().toLowerCase();
+    if (siblings.some((c) => c.name.trim().toLowerCase() === wanted)) {
+      throw new BadRequestException(
+        `A court named "${name.trim()}" already exists at this arena`,
+      );
+    }
+  }
+
+  /**
+   * While an arena is sanctioned or its billing is paused, the owner can
+   * still reject/cancel (cleanup), but cannot CONFIRM new bookings —
+   * confirming creates commitments at an arena players cannot see.
+   */
+  private async assertVenueActionable(venueId: string) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { moderationStatus: true, billingPaused: true },
+    });
+    if (!venue) return;
+    if (venue.moderationStatus !== 'none') {
+      throw new ForbiddenException(
+        'This arena is under a platform sanction — bookings cannot be confirmed until the sanction is lifted',
+      );
+    }
+    if (venue.billingPaused) {
+      throw new ForbiddenException(
+        "This arena's billing is paused — resolve the billing to confirm bookings",
+      );
+    }
   }
 
   async unarchiveVenue(user: AuthUser, venueId: string) {
@@ -371,6 +426,7 @@ export class OwnerService {
 
   async createCourt(user: AuthUser, venueId: string, dto: CreateCourtDto) {
     await this.assertVenue(user, venueId);
+    await this.assertCourtNameFree(venueId, dto.name);
     const data = { ...dto, sport: await this.sports.normalizeSport(dto.sport) };
     if (data.openMinutes != null && data.closeMinutes != null) {
       data.closeMinutes = this.normalizeCourtHours(data.openMinutes, data.closeMinutes);
@@ -402,6 +458,9 @@ export class OwnerService {
     const court = await this.prisma.court.findUnique({ where: { id: courtId } });
     if (!court) throw new NotFoundException('Court not found');
     await this.assertVenue(user, court.venueId);
+    if (dto.name !== undefined && dto.name !== court.name) {
+      await this.assertCourtNameFree(court.venueId, dto.name, courtId);
+    }
     const data = { ...dto };
     if (data.openMinutes != null || data.closeMinutes != null) {
       data.closeMinutes = this.normalizeCourtHours(
@@ -874,7 +933,8 @@ export class OwnerService {
   }
 
   async acceptBooking(user: AuthUser, bookingId: string) {
-    await this.ownedBooking(user, bookingId);
+    const booking = await this.ownedBooking(user, bookingId);
+    await this.assertVenueActionable(booking.venueId);
     return this.bookingOps.acceptBooking(bookingId);
   }
 
@@ -885,6 +945,7 @@ export class OwnerService {
 
   async acceptSeries(user: AuthUser, recurrenceId: string, venueId: string) {
     await this.assertVenue(user, venueId);
+    await this.assertVenueActionable(venueId);
     return this.bookingOps.acceptSeries(recurrenceId, venueId);
   }
 

@@ -285,6 +285,25 @@ export class AdminController {
   }
 
   @ApiTags('admin · venues')
+  @Patch('venues/:id/images/order')
+  reorderVenueImages(
+    @Param('id') id: string,
+    @Body() body: { urls?: string[] },
+  ) {
+    return this.admin.reorderVenueImages(id, body?.urls ?? []);
+  }
+
+  @ApiTags('admin · venues')
+  @Get('venues/onboard/check')
+  onboardCheck(
+    @Query('phone') phone?: string,
+    @Query('name') name?: string,
+    @Query('city') city?: string,
+  ) {
+    return this.admin.onboardDuplicateCheck({ phone, name, city });
+  }
+
+  @ApiTags('admin · venues')
   @RequirePerm('venues.onboard')
   @Patch('venues/:id/images/tag')
   tagVenueImage(

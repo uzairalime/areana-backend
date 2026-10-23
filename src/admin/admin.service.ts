@@ -399,6 +399,10 @@ export class AdminService {
       const plan = await this.prisma.plan.findUnique({ where: { id: dto.planId } });
       if (!plan) throw new NotFoundException('Plan not found');
     }
+    const courtNames = (dto.courts ?? []).map((c) => c.name.trim().toLowerCase());
+    if (new Set(courtNames).size !== courtNames.length) {
+      throw new BadRequestException('Two courts in this onboard have the same name');
+    }
     const courtSports = [...new Set((dto.courts ?? []).map((c) => c.sport))];
     const sports = await this.sports.normalizeSports(
       dto.sports && dto.sports.length > 0 ? dto.sports : courtSports,
@@ -1163,6 +1167,24 @@ export class AdminService {
   }
 
   // ---------------------------------------------------------- courts (admin-managed)
+  /** Court names stay unique per arena (players/staff tell courts apart by name). */
+  private async assertCourtNameFree(
+    venueId: string,
+    name: string,
+    excludeId?: string,
+  ) {
+    const siblings = await this.prisma.court.findMany({
+      where: { venueId, ...(excludeId ? { id: { not: excludeId } } : {}) },
+      select: { name: true },
+    });
+    const wanted = name.trim().toLowerCase();
+    if (siblings.some((c) => c.name.trim().toLowerCase() === wanted)) {
+      throw new BadRequestException(
+        `A court named "${name.trim()}" already exists at this arena`,
+      );
+    }
+  }
+
   private async syncVenueSports(venueId: string) {
     const [courts, venue] = await Promise.all([
       this.prisma.court.findMany({
@@ -1202,6 +1224,7 @@ export class AdminService {
   ) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
+    await this.assertCourtNameFree(venueId, dto.name);
     const open0 = dto.openMinutes ?? 360;
     const close0 = dto.closeMinutes ?? 1380;
     if (close0 - open0 < 60 || close0 - open0 > 1200) {
@@ -1256,6 +1279,9 @@ export class AdminService {
       include: { venue: { select: { name: true, ownerId: true } } },
     });
     if (!court) throw new NotFoundException('Court not found');
+    if (dto.name !== undefined && dto.name !== court.name) {
+      await this.assertCourtNameFree(court.venueId, dto.name, courtId);
+    }
     const data: Prisma.CourtUpdateInput = { ...dto };
     if (dto.sport !== undefined)
       data.sport = await this.sports.normalizeSport(dto.sport, court.sport);
@@ -1328,6 +1354,11 @@ export class AdminService {
       await tx.slotWaitlist.deleteMany({ where: { courtId } });
       await tx.court.delete({ where: { id: courtId } });
     });
+    // The court's photo files go with it (single-photo deletes already
+    // clean up; a whole-court delete must not leak the files).
+    for (const entry of this.courtPhotoEntries(court)) {
+      await this.storage.deleteImage(entry.url);
+    }
     await this.syncVenueSports(court.venueId);
     await this.audit(actorId, 'court.delete', 'court', courtId, court.name);
     await this.notifications
@@ -1379,6 +1410,47 @@ export class AdminService {
       where: { id: venueId },
       data: { photos: entries },
     });
+  }
+
+  /** Reorder a venue's photos (first photo is the cover everywhere). Same-set guard as the owner endpoint. */
+  async reorderVenueImages(venueId: string, urls: string[]) {
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue) throw new NotFoundException('Venue not found');
+    const entries = photoEntriesOf(venue);
+    const current = entries.map((e) => e.url);
+    const sameSet =
+      urls.length === current.length &&
+      [...urls].sort().join('|') === [...current].sort().join('|');
+    if (!sameSet) {
+      throw new BadRequestException('Photo order must contain exactly the current photos');
+    }
+    const byUrl = new Map(entries.map((e) => [e.url, e]));
+    const ordered = urls.map((u) => byUrl.get(u) as { url: string });
+    return this.prisma.venue.update({
+      where: { id: venueId },
+      data: { images: urls, photos: ordered },
+    });
+  }
+
+  /** Soft duplicate check for onboarding: same phone, or same name+city. */
+  async onboardDuplicateCheck(q: { phone?: string; name?: string; city?: string }) {
+    const digits = (q.phone ?? '').replace(/\D/g, '');
+    const suffix = digits.length >= 9 ? digits.slice(-9) : null;
+    const or: Prisma.VenueWhereInput[] = [];
+    if (suffix) or.push({ phone: { contains: suffix } });
+    if (q.name && q.city) {
+      or.push({
+        name: { equals: q.name, mode: 'insensitive' },
+        city: { equals: q.city, mode: 'insensitive' },
+      });
+    }
+    if (or.length === 0) return { duplicates: [] };
+    const duplicates = await this.prisma.venue.findMany({
+      where: { archivedAt: null, OR: or },
+      select: { id: true, name: true, city: true, phone: true, status: true },
+      take: 5,
+    });
+    return { duplicates };
   }
 
   async removeVenueImage(venueId: string, url: string) {
