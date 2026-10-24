@@ -199,6 +199,34 @@ export class VenuesService {
     const priceSort = sort === 'price_asc' || sort === 'price_desc';
     const orderBy: Prisma.VenueOrderByWithRelationInput =
       sort === 'name' ? { name: 'asc' } : { rating: 'desc' };
+
+    // featured_placement, enforced at last (N-9): a venue is featured
+    // when its own plan carries the feature, or when it rides the
+    // default plan and the default carries it. Featured venues sort
+    // first, then the requested sort applies within each partition.
+    // Plans are a tiny table, so the feature set is resolved in JS
+    // (features is a Json array, not a scalar array column).
+    const allPlans = await this.prisma.plan.findMany({
+      select: { id: true, features: true, isDefault: true },
+    });
+    const hasFeatured = (f: Prisma.JsonValue) =>
+      Array.isArray(f) && (f as unknown[]).includes('featured_placement');
+    const featuredIds = new Set(
+      allPlans.filter((p) => hasFeatured(p.features)).map((p) => p.id),
+    );
+    const defaultFeatured = allPlans.some((p) => p.isDefault && hasFeatured(p.features));
+    const isFeatured = (planId: string | null) =>
+      planId ? featuredIds.has(planId) : defaultFeatured;
+    // Combined with the base `where` via AND (never spread: the q
+    // search already uses where.OR, and the featured clause uses OR
+    // too when the default plan is featured).
+    const featuredWhere: Prisma.VenueWhereInput = defaultFeatured
+      ? { OR: [{ planId: { in: [...featuredIds] } }, { planId: null }] }
+      : { planId: { in: [...featuredIds] } };
+    const nonFeaturedWhere: Prisma.VenueWhereInput = defaultFeatured
+      ? { AND: [{ planId: { notIn: [...featuredIds] } }, { planId: { not: null } }] }
+      : { OR: [{ planId: null }, { planId: { notIn: [...featuredIds] } }] };
+
     const findArgs: Prisma.VenueFindManyArgs = {
       where,
       include: {
@@ -218,10 +246,41 @@ export class VenuesService {
         ? { take: 500 }
         : { skip: (page - 1) * limit, take: limit }),
     };
-    const [total, data] = await Promise.all([
-      this.prisma.venue.count({ where }),
-      this.prisma.venue.findMany(findArgs),
-    ]);
+    const [total, data] = priceSort
+      ? await Promise.all([
+          this.prisma.venue.count({ where }),
+          this.prisma.venue.findMany(findArgs),
+        ])
+      : await (async () => {
+          // DB-paged sorts can't express "featured first" in one
+          // orderBy, so the page is assembled from the two partitions:
+          // featured rows first, then the remainder. Totals stay
+          // exact, and the requested sort holds within each partition.
+          const featuredTotal = await this.prisma.venue.count({
+            where: { AND: [where, featuredWhere] },
+          });
+          const offset = (page - 1) * limit;
+          const featuredPage = await this.prisma.venue.findMany({
+            ...findArgs,
+            where: { AND: [where, featuredWhere] },
+            skip: offset,
+            take: limit,
+          });
+          const restTake = limit - featuredPage.length;
+          const restPage =
+            restTake > 0
+              ? await this.prisma.venue.findMany({
+                  ...findArgs,
+                  where: { AND: [where, nonFeaturedWhere] },
+                  skip: Math.max(0, offset - featuredTotal),
+                  take: restTake,
+                })
+              : [];
+          return [
+            await this.prisma.venue.count({ where }),
+            [...featuredPage, ...restPage],
+          ] as const;
+        })();
     // fromPrice = the cheapest hour a player could actually pay at this
     // venue: the minimum over active courts of (base rate, any special
     // price-window rate). Courts are stripped from the payload afterwards.
@@ -243,12 +302,17 @@ export class VenuesService {
     });
     if (priceSort) {
       const dir = sort === 'price_asc' ? 1 : -1;
-      shaped.sort(
-        (a: any, b: any) =>
+      shaped.sort((a: any, b: any) => {
+        // Featured first, then the price direction.
+        const fa = isFeatured(a.planId ?? null) ? 0 : 1;
+        const fb = isFeatured(b.planId ?? null) ? 0 : 1;
+        if (fa !== fb) return fa - fb;
+        return (
           ((a.fromPrice ?? Number.MAX_SAFE_INTEGER) -
             (b.fromPrice ?? Number.MAX_SAFE_INTEGER)) *
-          dir,
-      );
+          dir
+        );
+      });
       return offsetPageFromDb(
         shaped.slice((page - 1) * limit, page * limit),
         total,

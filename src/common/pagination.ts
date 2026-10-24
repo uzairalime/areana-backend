@@ -1,3 +1,4 @@
+import { BadRequestException } from '@nestjs/common';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
@@ -95,6 +96,8 @@ export function encodeCursor(date: Date, id: string): string {
  * Prisma OR condition selecting rows strictly AFTER the cursor in a
  * (field, id) ordering. `field` is the datetime column the list orders
  * by ('createdAt' for most lists); direction follows the list's sort.
+ * A cursor that is present but malformed is a 400, not a silent reset
+ * to page 1 — a corrupted/bookmarked cursor must fail visibly.
  */
 export function keysetWhere(
   cursor: string | undefined | null,
@@ -104,6 +107,10 @@ export function keysetWhere(
 ):
   | { OR: Record<string, unknown>[] }
   | Record<string, never> {
+  if (cursor) {
+    const ks = decodeCursor(cursor);
+    if (!ks) throw new BadRequestException('Malformed pagination cursor');
+  }
   const ks = decodeCursor(cursor);
   if (!ks) return {};
   const cmp = dir === 'asc' ? 'gt' : 'lt';
@@ -140,7 +147,13 @@ export function cursorPage<T>(
   };
 }
 
-/** Build an OffsetPage from an in-memory (already sorted) full list. */
+/**
+ * Build an OffsetPage from an in-memory (already sorted) full list.
+ * One contract everywhere (matching offsetPageFromDb): the requested
+ * page is echoed back, and an out-of-range page returns empty items
+ * with hasMore: false — never silently clamped to the last page, so a
+ * client asking for page 99 can't mistake last-page data for page 99.
+ */
 export function offsetPage<T>(
   all: T[],
   page: number,
@@ -148,9 +161,9 @@ export function offsetPage<T>(
 ): OffsetPage<T> {
   const total = all.length;
   const totalPages = Math.max(1, Math.ceil(total / limit));
-  const p = Math.min(Math.max(1, page), totalPages);
+  const p = Math.max(1, page);
   return {
-    items: all.slice((p - 1) * limit, p * limit),
+    items: p > totalPages ? [] : all.slice((p - 1) * limit, p * limit),
     total,
     page: p,
     limit,

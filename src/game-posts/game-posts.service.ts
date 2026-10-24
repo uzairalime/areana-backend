@@ -106,7 +106,12 @@ export class GamePostsService {
   }
 
   async list(query: GamePostQueryDto, userId?: string) {
-    const where: Prisma.GamePostWhereInput = { status: 'open' };
+    // Default open preserves the player board exactly; an explicit
+    // non-open status is the admin filter view, where past posts must
+    // stay visible — so the future-only date rule applies to open
+    // listings only (an explicit date still filters any status).
+    const status = query.status ?? 'open';
+    const where: Prisma.GamePostWhereInput = { status };
     const and: Prisma.GamePostWhereInput[] = [this.venueVisibleWhere()];
     if (query.sport) where.sport = { equals: query.sport, mode: 'insensitive' };
     if (query.city) where.city = { equals: query.city, mode: 'insensitive' };
@@ -117,8 +122,8 @@ export class GamePostsService {
     if (query.date) {
       const d = parseDateOnly(query.date);
       where.date = d;
-      if (isSameDay(d, today)) where.startMinutes = { gt: nowMin };
-    } else {
+      if (status === 'open' && isSameDay(d, today)) where.startMinutes = { gt: nowMin };
+    } else if (status === 'open') {
       and.push({
         OR: [
           { date: { gt: today } },

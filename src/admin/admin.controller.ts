@@ -638,8 +638,13 @@ export class AdminController {
   // ------------------------------------------------------------------- audit
   @ApiTags('admin · audit logs')
   @Get('audit-logs')
-  auditLogs(@Query('entity') entity?: string, @Query() query?: OffsetQueryDto) {
-    return this.admin.auditLogs(entity, query?.page ?? 1, query?.limit);
+  auditLogs(
+    @Query('entity') entity?: string,
+    @Query() query?: OffsetQueryDto,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.admin.auditLogs(entity, query?.page ?? 1, query?.limit, from, to);
   }
 
   // --------------------------------------------------------------- broadcast

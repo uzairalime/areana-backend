@@ -1,4 +1,4 @@
-import { IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
 import { OffsetQueryDto } from '../common/pagination';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -125,4 +125,14 @@ export class GamePostQueryDto extends OffsetQueryDto {
   @IsString()
   @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'date must be YYYY-MM-DD' })
   date?: string;
+
+  @ApiPropertyOptional({
+    enum: ['open', 'full', 'closed'],
+    default: 'open',
+    description: 'Board status filter; defaults to open (the player board). Non-open views skip the future-only date rule so past posts stay visible.',
+  })
+  @IsOptional()
+  @IsString()
+  @IsIn(['open', 'full', 'closed'])
+  status?: string;
 }

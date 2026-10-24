@@ -1343,6 +1343,9 @@ export class OwnerService {
         this.courtsSvc.priceRateForSlot(priceWindows, baseRate, s) *
         (court.slotMinutes / 60);
     }
+    // Same 2dp rounding as booking creation — fractional paisa must
+    // never reach a stored total.
+    gross = Math.round(gross * 100) / 100;
     const discount = Math.min(validated.discount, gross);
     const newTotal = Math.max(0, gross - discount);
 

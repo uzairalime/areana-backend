@@ -17,6 +17,14 @@ async function bootstrap() {
   const trustProxy = process.env.TRUST_PROXY;
   if (trustProxy) {
     app.set('trust proxy', trustProxy === 'true' ? true : Number(trustProxy) || trustProxy);
+  } else if (process.env.NODE_ENV === 'production') {
+    // Without this, every visitor shares the proxy's IP and the
+    // per-IP OTP caps + throttler pool across all users (audit A2).
+    // Loud on purpose: this must be fixed in the deployment, not
+    // discovered from a support ticket about OTP lockouts.
+    console.warn(
+      '[BOOT WARNING] TRUST_PROXY is not set in production — rate limits and per-IP OTP caps will pool behind the reverse proxy. Set TRUST_PROXY=1.',
+    );
   }
 
   app.setGlobalPrefix('api');

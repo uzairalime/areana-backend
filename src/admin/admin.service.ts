@@ -92,6 +92,8 @@ export class AdminService {
       staffLinks,
       activityOn,
       activityBy,
+      gamesHosted,
+      gamesJoined,
     ] = await Promise.all([
       this.prisma.booking.groupBy({
         by: ['status'],
@@ -170,6 +172,26 @@ export class AdminService {
         orderBy: { createdAt: 'desc' },
         take: 10,
       }),
+      // Game history: posts the user hosts plus posts they joined.
+      this.prisma.gamePost.findMany({
+        where: { creatorId: id },
+        include: {
+          venue: { select: { id: true, name: true } },
+          _count: { select: { participants: { where: { status: 'joined' } } } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 8,
+      }),
+      this.prisma.gamePost.findMany({
+        where: { participants: { some: { userId: id, status: 'joined' } } },
+        include: {
+          venue: { select: { id: true, name: true } },
+          creator: { select: { name: true } },
+          _count: { select: { participants: { where: { status: 'joined' } } } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 8,
+      }),
     ]);
 
     const byStatus = new Map(statusRows.map((r) => [r.status as string, r]));
@@ -205,6 +227,8 @@ export class AdminService {
         reviews,
         favorites,
         disputes,
+        gamesHosted,
+        gamesJoined,
         referredBy: referredBy
           ? {
               name: referredBy.referrer.name,
@@ -295,8 +319,12 @@ export class AdminService {
   // The codec lives in common/pagination (the shared schema); these
   // adapters keep the (createdAt, id) shape this service's queries use.
   private keyset(cursor?: string): { createdAt: Date; id: string } | null {
-    const ks = decodeCursor(cursor);
-    return ks ? { createdAt: ks.date, id: ks.id } : null;
+    if (cursor) {
+      const ks = decodeCursor(cursor);
+      if (!ks) throw new BadRequestException('Malformed pagination cursor');
+      return { createdAt: ks.date, id: ks.id };
+    }
+    return null;
   }
 
   private keysetCursor(row: { createdAt: Date; id: string }): string {
@@ -502,6 +530,13 @@ export class AdminService {
           data: { type: 'account_unsuspended' },
         })
         .catch(() => {});
+      // Billing freeze, second half (S6): the sweep skips suspended
+      // owners' venues, so no new pause/reminder fires while hidden —
+      // but the wall-clock billing dates still aged. Shift every
+      // billed venue's clock forward by the suspension window so the
+      // owner isn't instantly overdue for time their arenas were
+      // hidden. See forgiveSuspensionBillingWindow.
+      await this.forgiveSuspensionBillingWindow(actorId, id);
     }
     if (
       status === UserStatus.active &&
@@ -643,7 +678,74 @@ export class AdminService {
         data: { revokedAt: new Date() },
       });
     }
+    if (status === UserStatus.suspended) {
+      // A suspended account keeps no push channel: direct pushes and
+      // broadcasts both resolve device tokens, and a suspended owner
+      // or player must not keep receiving them. This runs LAST on
+      // purpose — the suspension notices above are pushed first, and
+      // deleting the tokens earlier would have swallowed them.
+      // (API access is already blocked per request by the JWT guard;
+      // this closes the push side too. Tokens re-register on next
+      // sign-in, if the account is ever reactivated.)
+      await this.prisma.deviceToken.deleteMany({ where: { userId: id } });
+    }
     return { id: user.id, status: user.status };
+  }
+
+  /**
+   * Billing freeze, second half (S6). While an owner is suspended the
+   * sweep skips their venues (see plans.sweepBilling), so no new
+   * overdue/pause transition or due reminder fires while the arenas
+   * are hidden — but the wall-clock billing dates still aged. On
+   * unsuspend, shift every billed venue's clock forward by the
+   * suspension window so the owner isn't instantly overdue for time
+   * their arenas were hidden. The window is measured from the latest
+   * `user.suspended` audit row; if none exists (history pruned, or
+   * the status was set outside this path) nothing shifts rather than
+   * guessing. The shifted period gets a fresh due reminder (the old
+   * period's key is cleared) and the shift itself is audited.
+   */
+  private async forgiveSuspensionBillingWindow(actorId: string, ownerId: string) {
+    const suspendedRow = await this.prisma.auditLog.findFirst({
+      where: { entity: 'user', entityId: ownerId, action: 'user.suspended' },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!suspendedRow) return;
+    const ms = Date.now() - suspendedRow.createdAt.getTime();
+    if (ms <= 0) return;
+    const venues = await this.prisma.venue.findMany({
+      where: { ownerId, billingStartAt: { not: null } },
+      select: {
+        id: true,
+        billingStartAt: true,
+        billingPaidUntil: true,
+        freeUntilOverride: true,
+        billingPeriodStart: true,
+        billingPeriodEnd: true,
+      },
+    });
+    if (!venues.length) return;
+    const shift = (d: Date | null) => (d ? new Date(d.getTime() + ms) : null);
+    for (const v of venues) {
+      await this.prisma.venue.update({
+        where: { id: v.id },
+        data: {
+          billingStartAt: shift(v.billingStartAt),
+          billingPaidUntil: shift(v.billingPaidUntil),
+          freeUntilOverride: shift(v.freeUntilOverride),
+          billingPeriodStart: shift(v.billingPeriodStart),
+          billingPeriodEnd: shift(v.billingPeriodEnd),
+          billingDueNotifiedFor: null,
+        },
+      });
+    }
+    await this.audit(
+      actorId,
+      'billing.suspension_forgiven',
+      'user',
+      ownerId,
+      `${venues.length} venue(s) shifted by ${Math.round(ms / 86400000)} day(s)`,
+    );
   }
 
   async resetStrikes(actorId: string, id: string) {
@@ -2286,6 +2388,22 @@ export class AdminService {
         'This court has bookings with open disputes — resolve them before deleting it',
       );
     }
+    // Waiters are told BEFORE their rows are deleted — unlike the
+    // player-suspend path, which pings waiters on freed slots, a court
+    // delete used to silently drop waitlist entries.
+    const waiters = await this.prisma.slotWaitlist.findMany({
+      where: { courtId },
+      select: { userId: true },
+    });
+    for (const w of waiters) {
+      await this.notifications
+        .pushToUser(w.userId, {
+          title: 'Court removed',
+          body: `A court you were waiting on at "${court.venue.name}" was removed by Areana admin, so your waitlist entry is closed.`,
+          data: { type: 'court_deleted', venueId: court.venueId },
+        })
+        .catch(() => {});
+    }
     await this.prisma.$transaction(async (tx) => {
       // Only historical bookings can remain at this point; resolved or
       // dismissed disputes on them are removed explicitly (no onDelete),
@@ -2297,9 +2415,12 @@ export class AdminService {
       await tx.court.delete({ where: { id: courtId } });
     });
     // The court's photo files go with it (single-photo deletes already
-    // clean up; a whole-court delete must not leak the files).
+    // clean up; a whole-court delete must not leak the files). This
+    // runs after the commit and is best-effort: a storage failure
+    // orphans a file, it must never fail a delete that already
+    // committed (there is no retry job queue to hand this to).
     for (const entry of this.courtPhotoEntries(court)) {
-      await this.storage.deleteImage(entry.url);
+      await this.storage.deleteImage(entry.url).catch(() => {});
     }
     await this.syncVenueSports(court.venueId);
     await this.audit(actorId, 'court.delete', 'court', courtId, court.name);
@@ -3179,9 +3300,25 @@ export class AdminService {
   }
 
   // ----------------------------------------------------------------- audit
-  async auditLogs(entity?: string, page = 1, rawLimit?: number) {
+  async auditLogs(entity?: string, page = 1, rawLimit?: number, from?: string, to?: string) {
     const limit = pageLimit(rawLimit, 100);
-    const where: Prisma.AuditLogWhereInput = entity ? { entity } : {};
+    // Server-side date filter (YYYY-MM-DD PKT days, mirroring the
+    // analytics dayBounds convention: `to` is inclusive). A reversed
+    // range is swapped rather than returning nothing; a malformed date
+    // is a 400, not a silently ignored filter.
+    const datePat = /^\d{4}-\d{2}-\d{2}$/;
+    if ((from && !datePat.test(from)) || (to && !datePat.test(to))) {
+      throw new BadRequestException('from/to must be YYYY-MM-DD dates');
+    }
+    let [f, t] = [from, to];
+    if (f && t && f > t) [f, t] = [t, f];
+    const createdAt: Prisma.DateTimeFilter = {};
+    if (f) createdAt.gte = new Date(`${f}T00:00:00+05:00`);
+    if (t) createdAt.lt = new Date(new Date(`${t}T00:00:00+05:00`).getTime() + 86400000);
+    const where: Prisma.AuditLogWhereInput = {
+      ...(entity ? { entity } : {}),
+      ...(Object.keys(createdAt).length ? { createdAt } : {}),
+    };
     const [total, items] = await Promise.all([
       this.prisma.auditLog.count({ where }),
       this.prisma.auditLog.findMany({

@@ -499,8 +499,17 @@ export class PlansService {
 
   /** Nightly sweep: flip billingPaused + notify owners on due / overdue. */
   async sweepBilling() {
+    // Billing freeze, first half (S6): a suspended owner's venues are
+    // skipped entirely — no pause/resume transition, no due reminder
+    // — while the arenas are hidden. The clock itself is forgiven on
+    // unsuspend (see admin.forgiveSuspensionBillingWindow), so the
+    // sweep skipping here never strands a venue in a stale state.
     const venues = await this.prisma.venue.findMany({
-      where: { status: 'approved', billingStartAt: { not: null } },
+      where: {
+        status: 'approved',
+        billingStartAt: { not: null },
+        owner: { status: 'active' },
+      },
       include: { plan: true, owner: { select: { id: true, name: true } } },
     });
     let paused = 0;

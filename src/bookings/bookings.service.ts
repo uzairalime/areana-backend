@@ -81,6 +81,10 @@ export class BookingsService {
       );
       gross += rate * (court.slotMinutes / 60);
     }
+    // Round the gross before any discount math: 45-minute slots at odd
+    // hourly rates otherwise store fractional paisa, and GMV sums drift
+    // from the rounded receipts players see.
+    gross = Math.round(gross * 100) / 100;
     let discount = 0;
     let promo: { id: string } | null = null;
     if (input.promoCode && input.userId) {

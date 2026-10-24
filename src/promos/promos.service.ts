@@ -24,6 +24,15 @@ export class PromosService {
       where: { code: code.toUpperCase().trim() },
     });
     if (!promo || !promo.isActive) throw new BadRequestException('Invalid promo code');
+    // Code namespace decision (audit I-6, documented not changed):
+    // codes are globally @unique even though validation is
+    // venue-scoped, so two owners cannot both run WELCOME10 — the
+    // namespace is first-come-first-served by design. Scoping
+    // uniqueness to (venueId, code) would need partial unique indexes
+    // (platform promos have venueId null, and Postgres treats NULLs
+    // as distinct) plus collision rules between platform and venue
+    // codes; that migration is not worth it while codes are
+    // admin/owner-typed, not player-chosen.
     // Owner-managed promos are valid only at their own venue.
     if (promo.venueId && venueId && promo.venueId !== venueId) {
       throw new BadRequestException('This promo code is not valid for this venue');
