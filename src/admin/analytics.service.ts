@@ -37,10 +37,12 @@ export class AnalyticsService {
   }
 
   // ------------------------------------------------------- 1. platform KPIs
-  // The range filters ACTIVITY (bookings, GMV, commission, payments,
-  // views/clicks). Platform totals (players, owners, venues, pending
-  // queues, live subscriptions, active bookings) are current state and
-  // stay all-time — the panel labels this under the filter bar.
+  // The range filters EVERY stat on the strip: entity counts by
+  // createdAt (players, owners, venues, pending queues, open disputes),
+  // booking activity by play date, payments by recorded date, traffic by
+  // tracked day. Only live subscriptions stay current-state (a venue is
+  // either on a live plan now or not — there is no period history for it).
+  // With no range, the previous all-time / today-onward meanings apply.
   async overview(range: AnalyticsRange = {}) {
     const [
       players,
@@ -53,9 +55,17 @@ export class AnalyticsService {
       pendingVenues,
       openDisputes,
     ] = await Promise.all([
-      this.prisma.user.count({ where: { role: { name: 'player' } } }),
-      this.prisma.user.count({ where: { role: { name: 'owner' } } }),
-      this.prisma.venue.groupBy({ by: ['status'], _count: true }),
+      this.prisma.user.count({
+        where: { role: { name: 'player' }, createdAt: dateWhere(range) },
+      }),
+      this.prisma.user.count({
+        where: { role: { name: 'owner' }, createdAt: dateWhere(range) },
+      }),
+      this.prisma.venue.groupBy({
+        by: ['status'],
+        _count: true,
+        where: { createdAt: dateWhere(range) },
+      }),
       this.prisma.booking.groupBy({
         by: ['status'],
         _count: true,
@@ -67,9 +77,15 @@ export class AnalyticsService {
         _sum: { totalPrice: true },
       }),
       this.prisma.booking.count({ where: { status: BookingStatus.pending } }),
-      this.prisma.user.count({ where: { status: 'pending', role: { name: 'owner' } } }),
-      this.prisma.venue.count({ where: { status: VenueStatus.pending } }),
-      this.prisma.dispute.count({ where: { status: 'open' } }),
+      this.prisma.user.count({
+        where: { status: 'pending', role: { name: 'owner' }, createdAt: dateWhere(range) },
+      }),
+      this.prisma.venue.count({
+        where: { status: VenueStatus.pending, createdAt: dateWhere(range) },
+      }),
+      this.prisma.dispute.count({
+        where: { status: 'open', createdAt: dateWhere(range) },
+      }),
     ]);
     const gmv = Number(gmvAgg._sum.totalPrice ?? 0);
     const pct = await this.commissionPct();
@@ -95,10 +111,15 @@ export class AnalyticsService {
       timeZone: 'Asia/Karachi',
     }).format(new Date());
     const today = new Date(`${dayStr}T00:00:00.000Z`);
+    const rangeBounds = dateWhere(range);
     const [activeBookings, currentSubscriptions, revenueAgg, views, clicks, openReports] =
       await Promise.all([
+        // With a range: confirmed bookings whose play date falls in it.
+        // Without one: the original "confirmed, today onward" meaning.
         this.prisma.booking.count({
-          where: { status: BookingStatus.confirmed, date: { gte: today } },
+          where: rangeBounds
+            ? { status: BookingStatus.confirmed, date: rangeBounds }
+            : { status: BookingStatus.confirmed, date: { gte: today } },
         }),
         this.prisma.venue.count({
           where: {
