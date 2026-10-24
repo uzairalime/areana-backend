@@ -196,11 +196,10 @@ export class AdminService {
 
     const byStatus = new Map(statusRows.map((r) => [r.status as string, r]));
     const count = (s: string) => byStatus.get(s)?._count ?? 0;
+    // totalPrice is already net of any discount — subtracting
+    // discountAmount again understated every spend/GMV figure.
     const spent = (['confirmed', 'completed'] as const).reduce(
-      (sum, s) =>
-        sum +
-        Number(byStatus.get(s)?._sum.totalPrice ?? 0) -
-        Number(byStatus.get(s)?._sum.discountAmount ?? 0),
+      (sum, s) => sum + Number(byStatus.get(s)?._sum.totalPrice ?? 0),
       0,
     );
 
@@ -459,6 +458,19 @@ export class AdminService {
         "That role belongs to an arena owner — team roles are assigned from the owner's panel, not here.",
       );
     }
+    if (role.name === 'owner') {
+      // The platform owner role is an identity, not a grant: handing it
+      // to a user who owns no venues would make every owner-scoped
+      // lookup treat them as an owner. Real owners hold it via
+      // onboarding / venue creation; restoring it to someone who
+      // actually owns venues is still allowed.
+      const owned = await this.prisma.venue.count({ where: { ownerId: id } });
+      if (owned === 0) {
+        throw new BadRequestException(
+          'The platform owner role can only be assigned to users who own at least one venue',
+        );
+      }
+    }
     const user = await this.prisma.user.update({ where: { id }, data: { roleId } });
     await this.audit(actorId, 'user.set_role', 'user', id);
     await this.notifications
@@ -514,6 +526,20 @@ export class AdminService {
     });
     await this.audit(actorId, `user.${status}`, 'user', id);
     if (status === UserStatus.suspended && target.role.name === 'owner') {
+      // Owner suspension follows the venue-suspension policy: upcoming
+      // bookings at their venues are cancelled and players notified
+      // (cancelVenueUpcomingBookings pushes each player). The old
+      // middle state — venues hidden but bookings standing — left
+      // players showing up to games at invisible arenas.
+      const venues = await this.prisma.venue.findMany({
+        where: { ownerId: id, archivedAt: null },
+        select: { id: true },
+      });
+      for (const v of venues) {
+        await this.bookings
+          .cancelVenueUpcomingBookings(v.id, "the arena owner's account is suspended")
+          .catch(() => {});
+      }
       await this.notifications
         .pushToUser(id, {
           title: 'Your Areana account is suspended',
@@ -551,93 +577,23 @@ export class AdminService {
         })
         .catch(() => {});
     }
-    // Suspending a PLAYER cancels their upcoming bookings and tells both
-    // sides (owners keep their existing bookings under the round-3
-    // policy instead — their venues pause, nothing is cancelled).
+    // Suspending a PLAYER cancels their upcoming bookings through the
+    // shared cascade (promo refunds + reschedule rejection + game-post
+    // cleanup + waitlist + owner emails) — the old hand-rolled loop
+    // here skipped the promo refund and the reschedule rejection.
+    // Owner suspensions take the venue path above instead: their
+    // venues' bookings are cancelled, not the owner's own bookings.
     if (status === UserStatus.suspended && target.role.name === 'player') {
-      const today = startOfToday();
-      const future = await this.prisma.booking.findMany({
-        where: {
-          userId: id,
-          date: { gte: today },
-          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
-        },
-        include: {
-          venue: { select: { name: true, owner: { select: { email: true } } } },
-        },
-      });
-      for (const b of future) {
-        await this.prisma.booking.update({
-          where: { id: b.id },
-          data: { status: BookingStatus.cancelled },
-        });
-        // A linked game post dies with its booking; tell its squad.
-        const post = await this.prisma.gamePost.findUnique({
-          where: { bookingId: b.id },
-        });
-        if (post) {
-          const squad = await this.prisma.gameParticipant.findMany({
-            where: { postId: post.id, userId: { not: null } },
-            select: { userId: true },
-          });
-          for (const s of squad) {
-            await this.notifications
-              .pushToUser(s.userId!, {
-                title: 'Game cancelled',
-                body: "The host's account was suspended, so this game is off.",
-                data: { type: 'game_cancelled' },
-              })
-              .catch(() => {});
-          }
-          await this.prisma.gamePost.delete({ where: { id: post.id } });
-        }
-        // Freed slots: ping the waitlist for every slot in the range.
-        const freedCourt = await this.prisma.court.findUnique({
-          where: { id: b.courtId },
-          select: { slotMinutes: true },
-        });
-        const step = freedCourt?.slotMinutes ?? 60;
-        for (let s = b.startMinutes; s < b.endMinutes; s += step) {
-          const waiting = await this.prisma.slotWaitlist.findMany({
-            where: {
-              courtId: b.courtId,
-              date: b.date,
-              startMinutes: s,
-              notifiedAt: null,
-            },
-          });
-          for (const w of waiting) {
-            await this.notifications
-              .pushToUser(w.userId, {
-                title: 'A slot just opened up',
-                body: `A slot you were waiting on is free again on ${b.date.toISOString().slice(0, 10)} — first come, first served.`,
-                data: { type: 'slot_opened' },
-              })
-              .catch(() => {});
-          }
-          if (waiting.length > 0) {
-            await this.prisma.slotWaitlist.updateMany({
-              where: { id: { in: waiting.map((w) => w.id) } },
-              data: { notifiedAt: new Date() },
-            });
-          }
-        }
-        if (b.venue.owner?.email) {
-          await this.notifications
-            .notifyOwnerNewBooking(
-              b.venue.owner.email,
-              b.venue.name,
-              `A booking on ${b.date.toISOString().slice(0, 10)} was cancelled because the player's account was suspended.`,
-            )
-            .catch(() => {});
-        }
-      }
+      const cancelled = await this.bookings.cancelFutureBookings(
+        id,
+        "because the player's account was suspended",
+      );
       await this.notifications
         .pushToUser(id, {
           title: 'Account suspended',
           body:
-            future.length > 0
-              ? `Your Areana account has been suspended and your ${future.length} upcoming booking${future.length === 1 ? ' was' : 's were'} cancelled.`
+            cancelled > 0
+              ? `Your Areana account has been suspended and your ${cancelled} upcoming booking${cancelled === 1 ? ' was' : 's were'} cancelled.`
               : 'Your Areana account has been suspended.',
           data: { type: 'account_suspended' },
         })
@@ -1004,7 +960,7 @@ export class AdminService {
         r.venueId,
         {
           realized: r._count,
-          gmv: Number(r._sum.totalPrice ?? 0) - Number(r._sum.discountAmount ?? 0),
+          gmv: Number(r._sum.totalPrice ?? 0),
         },
       ]),
     );
@@ -1126,6 +1082,14 @@ export class AdminService {
     if (existing.billingPaused) {
       throw new BadRequestException('This arena\'s billing is paused — settle billing before approving');
     }
+    // Computed billing, not just the materialized flag: the flag only
+    // flips on the nightly sweep, so a venue whose grace ended since
+    // the last sweep would otherwise be approved into a listing that
+    // discovery hides the same night. Neither a stale flag nor an
+    // unswept overdue state may go live.
+    if ((await this.plans.billingSummary(existing)).status === 'overdue') {
+      throw new BadRequestException('This arena\'s billing is overdue — settle billing before approving');
+    }
     const owner = await this.prisma.user.findUnique({
       where: { id: existing.ownerId },
       select: { status: true },
@@ -1240,6 +1204,10 @@ export class AdminService {
           // readiness requirements are met, like every other venue.
           status: dto.approveNow ? VenueStatus.pending : VenueStatus.draft,
           planId: dto.planId ?? null,
+          // The onboarding operator, for image scoping: delegated
+          // operators may later edit photos only on venues they
+          // created themselves.
+          createdById: actorId,
         },
       });
       // Same default staff-role allowances the owner panel grants:
@@ -1294,7 +1262,7 @@ export class AdminService {
    * views / clicks; subscription revenue is the all-time ledger total.
    * `sort`: bookings | views | clicks | revenue | name.
    */
-  async listVenuesAdmin(opts?: { sort?: string; range?: string; status?: string; page?: number; limit?: number }) {
+  async listVenuesAdmin(opts?: { sort?: string; range?: string; status?: string; page?: number; limit?: number; stripSensitive?: boolean }) {
     // Server-side status filter: omitted keeps the old load-everything
     // behaviour; an unknown value is a client error, not an empty page.
     const statusFilter = opts?.status;
@@ -1310,21 +1278,28 @@ export class AdminService {
       },
       orderBy: [{ name: 'asc' }],
     });
+    // One PKT calendar-day range for BOTH bookings and events. The old
+    // code counted bookings on a rolling instant (createdAt >= now −
+    // (days−1)×24h) but events on a PKT calendar day, so the two
+    // columns never covered the same window. event.day is stored as
+    // UTC-midnight of its PKT date; createdAt is a real instant, so
+    // its cutoff is the instant that PKT day started (PKT is fixed
+    // UTC+5, no DST, so the offset is exact).
     const rangeDays = opts?.range === '7d' ? 7 : opts?.range === '30d' ? 30 : null;
-    const since = rangeDays
-      ? new Date(Date.now() - (rangeDays - 1) * 86400000)
-      : null;
-    const sinceDay = since
+    const sinceDay = rangeDays
       ? new Date(
-          `${new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Karachi' }).format(since)}T00:00:00.000Z`,
+          `${new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Karachi' }).format(
+            new Date(Date.now() - (rangeDays - 1) * 86400000),
+          )}T00:00:00.000Z`,
         )
       : null;
+    const sinceInstant = sinceDay ? new Date(sinceDay.getTime() - 5 * 3600_000) : null;
     const [bookingRows, eventRows, paymentRows, reportRows] = await Promise.all([
       this.prisma.booking.groupBy({
         by: ['venueId'],
         where: {
           status: { in: ['confirmed', 'completed'] },
-          ...(since ? { createdAt: { gte: since } } : {}),
+          ...(sinceInstant ? { createdAt: { gte: sinceInstant } } : {}),
         },
         _count: true,
         _sum: { totalPrice: true, discountAmount: true },
@@ -1351,7 +1326,7 @@ export class AdminService {
         r.venueId,
         {
           bookings: r._count,
-          gmv: Number(r._sum.totalPrice ?? 0) - Number(r._sum.discountAmount ?? 0),
+          gmv: Number(r._sum.totalPrice ?? 0),
         },
       ]),
     );
@@ -1365,20 +1340,26 @@ export class AdminService {
     const revenueByVenue = new Map(
       paymentRows.map((r) => [r.venueId, r._sum.amount ?? 0]),
     );
+    const strip = opts?.stripSensitive === true;
     const out = [];
     for (const v of venues) {
       const b = bookingByVenue.get(v.id) ?? { bookings: 0, gmv: 0 };
       const e = eventsByVenue.get(v.id) ?? { views: 0, clicks: 0 };
+      // Delegated venues.onboard operators see the operational
+      // directory — names, statuses, counts — but not owner contact
+      // details, billing state, or money figures.
       out.push({
-        venue: v,
-        billing: await this.plans.billingSummary(v),
+        venue: strip
+          ? { ...v, owner: { id: v.owner.id, name: v.owner.name, status: v.owner.status } }
+          : v,
+        billing: strip ? null : await this.plans.billingSummary(v),
         readiness: venueReadiness(v, v.courts.filter((c) => c.isActive && c.status === 'approved').length),
         stats: {
           bookings: b.bookings,
-          gmv: b.gmv,
+          gmv: strip ? 0 : b.gmv,
           views: e.views,
           clicks: e.clicks,
-          subscriptionRevenue: revenueByVenue.get(v.id) ?? 0,
+          subscriptionRevenue: strip ? 0 : (revenueByVenue.get(v.id) ?? 0),
           openReports: openReportsByVenue.get(v.id) ?? 0,
         },
       });
@@ -1395,7 +1376,7 @@ export class AdminService {
     return offsetPage(out, opts?.page ?? 1, pageLimit(opts?.limit, 50));
   }
 
-  async venueDetailAdmin(venueId: string) {
+  async venueDetailAdmin(venueId: string, opts?: { stripSensitive?: boolean }) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
       include: {
@@ -1509,8 +1490,7 @@ export class AdminService {
         r.courtId,
         {
           bookings: courtTotalsMap.get(r.courtId) ?? 0,
-          revenue:
-            Number(r._sum.totalPrice ?? 0) - Number(r._sum.discountAmount ?? 0),
+          revenue: Number(r._sum.totalPrice ?? 0),
         },
       ]),
     );
@@ -1535,13 +1515,30 @@ export class AdminService {
     const seatPlan =
       venue.plan ??
       (await this.prisma.plan.findFirst({ where: { isDefault: true } }));
+    // Same strip as the directory: delegated operators see operations,
+    // not owner contact, billing, payments, money figures, or the
+    // reporters behind reports/disputes.
+    const strip = opts?.stripSensitive === true;
     return {
-      venue: { ...venue, courts },
+      venue: strip
+        ? {
+            ...venue,
+            owner: { id: venue.owner.id, name: venue.owner.name, status: venue.owner.status },
+            courts: courts.map((c) => ({ ...c, stats: { ...c.stats, revenue: 0 } })),
+          }
+        : { ...venue, courts },
       courtLimit,
       staffLimit,
-      billing,
-      reports,
-      disputes: venueDisputes,
+      billing: strip ? null : billing,
+      reports: strip
+        ? reports.map((r) => ({ ...r, user: r.user ? { name: r.user.name } : null }))
+        : reports,
+      disputes: strip
+        ? venueDisputes.map((d) => ({
+            ...d,
+            raisedBy: d.raisedBy ? { name: d.raisedBy.name } : null,
+          }))
+        : venueDisputes,
       reportCounts: { openReports: openReportsCount, openDisputes: openDisputesCount },
       readiness: venueReadiness(
         venue,
@@ -1553,14 +1550,12 @@ export class AdminService {
         views,
         clicks,
         courtViews,
-        subscriptionRevenue: revenueAgg._sum.amount ?? 0,
-        gmv:
-          Number(gmvAgg._sum.totalPrice ?? 0) -
-          Number(gmvAgg._sum.discountAmount ?? 0),
+        subscriptionRevenue: strip ? 0 : (revenueAgg._sum.amount ?? 0),
+        gmv: strip ? 0 : Number(gmvAgg._sum.totalPrice ?? 0),
         seatsUsed,
         seatsAllowed: staffLimit.limit,
       },
-      payments,
+      payments: strip ? [] : payments,
     };
   }
 
@@ -1641,7 +1636,7 @@ export class AdminService {
       // same definition as every GMV figure in the admin. Pending and
       // no-show bookings count in the state bars, never in revenue.
       if (b.status === 'confirmed' || b.status === 'completed') {
-        row.revenue += Number(b.totalPrice) - Number(b.discountAmount);
+        row.revenue += Number(b.totalPrice);
       }
     }
     for (const e of events) {
@@ -1658,13 +1653,16 @@ export class AdminService {
     venueId: string,
     days: number,
     range?: { from?: string; to?: string },
+    stripRevenue = false,
   ) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
       select: { id: true },
     });
     if (!venue) throw new NotFoundException('Venue not found');
-    return { series: await this.dailySeries({ venueId }, days, range) };
+    const series = await this.dailySeries({ venueId }, days, range);
+    // Delegated operators see counts and traffic, not daily revenue.
+    return { series: stripRevenue ? series.map((s) => ({ ...s, revenue: 0 })) : series };
   }
 
   /** Court detail screen data: court + venue, lifetime totals, chart series, recent bookings. */
@@ -1717,9 +1715,7 @@ export class AdminService {
       totals: {
         bookings: totalBookings,
         upcoming,
-        revenue:
-          Number(revenueAgg._sum.totalPrice ?? 0) -
-          Number(revenueAgg._sum.discountAmount ?? 0),
+        revenue: Number(revenueAgg._sum.totalPrice ?? 0),
         courtViews,
       },
       series: await this.dailySeries({ venueId: court.venueId, courtId }, days, range),
@@ -1729,7 +1725,7 @@ export class AdminService {
         startMinutes: b.startMinutes,
         endMinutes: b.endMinutes,
         status: b.status,
-        amount: Number(b.totalPrice) - Number(b.discountAmount),
+        amount: Number(b.totalPrice),
         player: b.user?.name ?? b.guestName ?? 'Walk-in',
         checkedInAt: b.checkedInAt,
       })),
@@ -2120,6 +2116,14 @@ export class AdminService {
       include: { venue: { select: { name: true, ownerId: true } } },
     });
     if (!court) throw new NotFoundException('Court not found');
+    // Reject is a queue decision, not an un-approve: re-rejecting an
+    // already-rejected court silently overwrote its reason, and
+    // rejecting an approved court un-approved it with no guard.
+    if (court.status !== 'pending') {
+      throw new BadRequestException(
+        `Only a pending court can be rejected (this court is ${court.status})`,
+      );
+    }
     // Rejecting a court with upcoming bookings strands players who
     // already paid (or planned) around it — refuse and name the count.
     const upcoming = await this.prisma.booking.count({
@@ -2284,6 +2288,23 @@ export class AdminService {
     if (dto.name !== undefined && dto.name !== court.name) {
       await this.assertCourtNameFree(court.venueId, dto.name, courtId);
     }
+    // Deactivation refuses upcoming bookings, like archiveVenue and
+    // the owner path: switching a court off with games still booked
+    // would strand players who paid for a slot that no longer exists.
+    if (dto.isActive === false && court.isActive) {
+      const upcoming = await this.prisma.booking.count({
+        where: {
+          courtId,
+          date: { gte: startOfToday() },
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        },
+      });
+      if (upcoming > 0) {
+        throw new ConflictException(
+          `${upcoming} upcoming booking(s) still sit on this court — move or cancel them first`,
+        );
+      }
+    }
     const data: Prisma.CourtUpdateInput = { ...dto };
     if (dto.sport !== undefined)
       data.sport = await this.sports.normalizeSport(dto.sport, court.sport);
@@ -2352,8 +2373,9 @@ export class AdminService {
    * history: completed/no-show/cancelled-undisputed booking rows are
    * deleted in the same transaction (their participants, reschedules,
    * reviews, and game posts cascade; resolved/dismissed disputes are
-   * deleted explicitly because Dispute.bookingId has no onDelete, and
-   * promo redemptions are nulled via PromoRedemption's SetNull).
+   * deleted explicitly because their history goes with the court, and
+   * doomed bookings' promos are refunded first so usedCount does not
+   * stay inflated for games that no longer exist).
    * Consequence to be aware of: deleting a court with history also
    * deletes those bookings' reviews — deactivate instead if the
    * history must survive.
@@ -2372,14 +2394,11 @@ export class AdminService {
         `This court has ${live} live booking(s) — cancel or complete them first, or deactivate it instead of deleting it`,
       );
     }
-    const disputed = await this.prisma.dispute.count({
-      where: { booking: { courtId, status: BookingStatus.cancelled } },
-    });
-    if (disputed > 0) {
-      throw new ConflictException(
-        'This court has cancelled bookings with disputes on record — it cannot be deleted',
-      );
-    }
+    // The old cancelled-booking dispute guard counted RESOLVED and
+    // dismissed disputes too — but those are deleted explicitly in
+    // the transaction below, so they must not block the delete. Only
+    // OPEN disputes block (the guard below); resolved history goes
+    // with the court.
     const openDisputed = await this.prisma.dispute.count({
       where: { booking: { courtId }, status: 'open' },
     });
@@ -2404,11 +2423,24 @@ export class AdminService {
         })
         .catch(() => {});
     }
+    // Deleting the court deletes its bookings — their promos must be
+    // refunded first, or usedCount stays inflated for games that no
+    // longer exist. (Cancelled bookings were already refunded at
+    // cancel time; refundBookingPromo is a no-op for those.)
+    const doomed = await this.prisma.booking.findMany({
+      where: { courtId },
+      select: { id: true },
+    });
+    for (const b of doomed) {
+      await this.bookings.releasePromo(b.id);
+    }
     await this.prisma.$transaction(async (tx) => {
       // Only historical bookings can remain at this point; resolved or
-      // dismissed disputes on them are removed explicitly (no onDelete),
-      // then the bookings themselves (cascades take participants,
-      // reschedules, reviews, and game posts).
+      // dismissed disputes on them are removed explicitly (their
+      // history goes with the court; Dispute.bookingId SetNull is the
+      // backstop for any other delete path), then the bookings
+      // themselves (cascades take participants, reschedules, reviews,
+      // and game posts).
       await tx.dispute.deleteMany({ where: { booking: { courtId } } });
       await tx.booking.deleteMany({ where: { courtId } });
       await tx.slotWaitlist.deleteMany({ where: { courtId } });
@@ -2451,9 +2483,27 @@ export class AdminService {
   }
 
   // ---------------------------------------------------------- venue images
-  async addVenueImage(venueId: string, file: Express.Multer.File, sport?: string) {
+  /**
+   * Delegated venues.onboard operators may mutate images only on
+   * venues they created — an operator must not rewrite another
+   * operator's (or a super admin's) venue photos. '*' passes
+   * everywhere; legacy venues (no creator recorded) are fail-closed
+   * for delegates. Reorder stays '*' only (the controller enforces it).
+   */
+  private assertImageScope(
+    venue: { createdById: string | null },
+    actor: { id: string; permissions: string[] },
+  ) {
+    if (actor.permissions.includes('*')) return;
+    if (venue.createdById !== actor.id) {
+      throw new ForbiddenException('You can only edit photos of venues you onboarded');
+    }
+  }
+
+  async addVenueImage(venueId: string, file: Express.Multer.File, sport: string | undefined, actor: { id: string; permissions: string[] }) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
+    this.assertImageScope(venue, actor);
     const photo = await this.storage.saveVenueImage(venueId, file);
     const entries = [
       ...photoEntriesOf(venue),
@@ -2465,9 +2515,10 @@ export class AdminService {
     });
   }
 
-  async tagVenueImage(venueId: string, url: string, sport: string | null) {
+  async tagVenueImage(venueId: string, url: string, sport: string | null, actor: { id: string; permissions: string[] }) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
+    this.assertImageScope(venue, actor);
     const entries = withSportTag(photoEntriesOf(venue), url, sport);
     await this.prisma.venue.update({
       where: { id: venueId },
@@ -2499,7 +2550,10 @@ export class AdminService {
   }
 
   /** Soft duplicate check for onboarding: same phone, or same name+city. */
-  async onboardDuplicateCheck(q: { phone?: string; name?: string; city?: string }) {
+  async onboardDuplicateCheck(
+    q: { phone?: string; name?: string; city?: string },
+    stripSensitive = false,
+  ) {
     const digits = (q.phone ?? '').replace(/\D/g, '');
     const suffix = digits.length >= 9 ? digits.slice(-9) : null;
     const or: Prisma.VenueWhereInput[] = [];
@@ -2511,17 +2565,23 @@ export class AdminService {
       });
     }
     if (or.length === 0) return { duplicates: [] };
-    const duplicates = await this.prisma.venue.findMany({
+    const rows = await this.prisma.venue.findMany({
       where: { archivedAt: null, OR: or },
       select: { id: true, name: true, city: true, phone: true, status: true },
       take: 5,
     });
+    // The check exists to catch duplicates, not to hand a delegated
+    // operator other venues' contact numbers.
+    const duplicates = stripSensitive
+      ? rows.map(({ phone: _phone, ...rest }) => rest)
+      : rows;
     return { duplicates };
   }
 
-  async removeVenueImage(venueId: string, url: string) {
+  async removeVenueImage(venueId: string, url: string, actor: { id: string; permissions: string[] }) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
+    this.assertImageScope(venue, actor);
     await this.storage.deleteImage(url);
     const entries = photoEntriesOf(venue).filter((e) => e.url !== url);
     await this.prisma.venue.update({
@@ -2658,7 +2718,11 @@ export class AdminService {
       'venue.plan.assign',
       'venue',
       venueId,
-      over.length > 0 ? `plan: ${plan.name} (confirmed below usage: ${over.join(', ')})` : `plan: ${plan.name}`,
+      // restartBilling is the destructive variant (clock reset) — the
+      // audit row must distinguish it from a plain plan change.
+      `plan: ${plan.name}` +
+        (restartBilling ? ' (restartBilling: clock reset)' : '') +
+        (over.length > 0 ? ` (confirmed below usage: ${over.join(', ')})` : ''),
     );
     await this.notifications
       .pushToUser(venue.ownerId, {
@@ -2694,12 +2758,23 @@ export class AdminService {
     });
     const venue = await this.plans.markPaid(venueId, actorId, opts);
     await this.audit(actorId, 'venue.billing.mark_paid', 'venue', venueId);
+    // "Live again" is only true when nothing else still hides the
+    // venue — a moderated, archived, or unapproved arena stays hidden
+    // after payment, and the notice must say so (same qualification
+    // as the moderation-clear message).
+    const liveAgain =
+      before?.billingPaused &&
+      venue.status === VenueStatus.approved &&
+      !venue.archivedAt &&
+      venue.moderationStatus === 'none';
     await this.notifications
       .pushToUser(venue.ownerId, {
         title: 'Payment received',
-        body: before?.billingPaused
-          ? `${venue.name}'s payment was recorded and the arena is live again.`
-          : `${venue.name}'s payment was recorded.`,
+        body: !before?.billingPaused
+          ? `${venue.name}'s payment was recorded.`
+          : liveAgain
+            ? `${venue.name}'s payment was recorded and the arena is live again.`
+            : `${venue.name}'s payment was recorded, but the arena stays hidden for now — it becomes visible once its approval, moderation, and billing state are all clear.`,
         data: { type: 'billing_paid', venueId },
       })
       .catch(() => {});
@@ -2781,16 +2856,26 @@ export class AdminService {
       where: { venueId, isActive: true, status: 'approved' },
     });
     const readiness = venueReadiness(existing, courts);
+    // Same computed-billing rule as approveVenue: an unswept overdue
+    // state must not go live on the strength of a stale flag.
+    const billingOverdue = (await this.plans.billingSummary(existing)).status === 'overdue';
     const canGoLive =
       existing.moderationStatus === 'none' &&
       !existing.archivedAt &&
       !existing.billingPaused &&
+      !billingOverdue &&
       owner?.status === UserStatus.active &&
       readiness.ready;
     const venue = await this.prisma.venue.update({
       where: { id: venueId },
       data: { status: canGoLive ? VenueStatus.approved : VenueStatus.pending },
     });
+    // A reinstated venue with no billing clock never started one (it
+    // was suspended before approval, or its clock was stopped) — start
+    // it now, or the venue goes live unbilled.
+    if (canGoLive && !existing.billingStartAt) {
+      await this.plans.startBilling(venueId);
+    }
     await this.audit(actorId, 'venue.unsuspend', 'venue', venueId);
     await this.notifications
       .pushToUser(venue.ownerId, {
@@ -2884,18 +2969,27 @@ export class AdminService {
   }
 
   // ---------------------------------------------------------------- promos
-  async listPromos(cursor?: string, rawLimit?: number) {
+  async listPromos(cursor?: string, rawLimit?: number, q?: string) {
     const limit = pageLimit(rawLimit, 50);
     const ks = this.keyset(cursor);
+    // Code search composes with the keyset cursor (AND), so paging a
+    // filtered list never walks back into unfiltered rows.
+    const codeFilter =
+      q?.trim() !== '' && q !== undefined
+        ? { code: { contains: q.trim(), mode: 'insensitive' as const } }
+        : null;
     const rows = await this.prisma.promoCode.findMany({
-      where: ks
-        ? {
-            OR: [
-              { createdAt: { lt: ks.createdAt } },
-              { createdAt: ks.createdAt, id: { lt: ks.id } },
-            ],
-          }
-        : {},
+      where: {
+        ...(codeFilter ? codeFilter : {}),
+        ...(ks
+          ? {
+              OR: [
+                { createdAt: { lt: ks.createdAt } },
+                { createdAt: ks.createdAt, id: { lt: ks.id } },
+              ],
+            }
+          : {}),
+      },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: limit + 1,
       include: {
@@ -3531,7 +3625,7 @@ export class AdminService {
         `This booking is ${booking.status} — only pending or confirmed bookings can be cancelled`,
       );
     }
-    const updated = await this.prisma.booking.update({
+    await this.prisma.booking.update({
       where: { id },
       data: { status: BookingStatus.cancelled },
     });
@@ -3550,7 +3644,22 @@ export class AdminService {
     await this.bookings.notifyWaitlist(booking);
     await this.bookings.releasePromo(id);
     await this.audit(actorId, 'booking.cancel', 'booking', id);
-    return updated;
+    // An admin cancel the player never hears about is a player who
+    // shows up anyway — push like the owner cancel path does.
+    if (booking.userId) {
+      const venue = await this.prisma.venue.findUnique({
+        where: { id: booking.venueId },
+        select: { name: true },
+      });
+      await this.notifications
+        .pushToUser(booking.userId, {
+          title: 'Booking cancelled',
+          body: `Your booking at ${venue?.name ?? 'the arena'} on ${booking.date.toISOString().slice(0, 10)} was cancelled by Areana admin. Any promo used has been refunded.`,
+          data: { type: 'booking_cancelled', venueId: booking.venueId },
+        })
+        .catch(() => {});
+    }
+    return this.getBooking(id);
   }
 
   async forceConfirmBooking(actorId: string, id: string) {
@@ -3564,12 +3673,24 @@ export class AdminService {
         `This booking is ${booking.status} — only a pending booking can be force-confirmed`,
       );
     }
-    const updated = await this.prisma.booking.update({
+    await this.prisma.booking.update({
       where: { id },
       data: { status: BookingStatus.confirmed },
     });
     await this.audit(actorId, 'booking.force_confirm', 'booking', id);
-    return updated;
+    // A force-confirm is still a confirmation the player must hear
+    // about — the same push the owner-accept path sends.
+    if (booking.userId) {
+      const venue = await this.prisma.venue.findUnique({
+        where: { id: booking.venueId },
+        select: { name: true },
+      });
+      const when = `${booking.date.toISOString().slice(0, 10)} ${String(Math.floor(booking.startMinutes / 60)).padStart(2, '0')}:${String(booking.startMinutes % 60).padStart(2, '0')}`;
+      await this.notifications
+        .notifyPlayerDecision(booking.userId, true, venue?.name ?? 'the arena', when)
+        .catch(() => {});
+    }
+    return this.getBooking(id);
   }
 
   // --------------------------------------------------------------- settings

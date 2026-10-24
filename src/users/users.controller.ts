@@ -29,16 +29,23 @@ export class UsersController {
   ) {}
 
   @Get('me')
-  getMe(@CurrentUser() user: AuthUser) {
-    return this.prisma.user.findUnique({
+  async getMe(@CurrentUser() user: AuthUser) {
+    // The bcrypt hash must never leave the server: every other user
+    // endpoint strips it, and these two returned the raw row.
+    const { passwordHash: _passwordHash, ...me } = await this.prisma.user.findUniqueOrThrow({
       where: { id: user.id },
       include: { role: { select: { name: true } } },
     });
+    return me;
   }
 
   @Patch('me')
-  updateMe(@CurrentUser() user: AuthUser, @Body() dto: UpdateMeDto) {
-    return this.prisma.user.update({ where: { id: user.id }, data: dto });
+  async updateMe(@CurrentUser() user: AuthUser, @Body() dto: UpdateMeDto) {
+    const { passwordHash: _passwordHash, ...me } = await this.prisma.user.update({
+      where: { id: user.id },
+      data: dto,
+    });
+    return me;
   }
 
   /** Upload (or replace) the signed-in user's profile photo. */

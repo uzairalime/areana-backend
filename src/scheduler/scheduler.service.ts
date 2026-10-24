@@ -65,9 +65,16 @@ export class SchedulerService implements OnModuleInit {
   @Cron('*/15 * * * *', PKT)
   async expirePendingBookings() {
     const hours = parseFloat(await this.setting('pendingExpiryHours', '2'));
-    const cutoff = new Date(Date.now() - hours * 3600_000);
-    const stale = await this.prisma.booking.findMany({
-      where: { status: BookingStatus.pending, createdAt: { lt: cutoff } },
+    // Slot-relative expiry: a pending booking expires at
+    // min(slotStart, max(createdAt + pendingExpiryHours, slotStart − 24h)).
+    // Creation-based expiry cancelled next-day bookings the owner had
+    // barely had time to see, while letting same-day bookings linger
+    // past their slot. The 24h floor keeps a last-minute request alive
+    // until its slot, and the slotStart cap never lets a booking
+    // outlive its game.
+    const now = new Date();
+    const candidates = await this.prisma.booking.findMany({
+      where: { status: BookingStatus.pending },
       select: {
         id: true,
         userId: true,
@@ -75,8 +82,26 @@ export class SchedulerService implements OnModuleInit {
         date: true,
         startMinutes: true,
         endMinutes: true,
+        createdAt: true,
         venue: { select: { name: true } },
       },
+    });
+    const stale = candidates.filter((b) => {
+      const slotStart = new Date(b.date);
+      slotStart.setHours(
+        Math.floor(b.startMinutes / 60),
+        b.startMinutes % 60,
+        0,
+        0,
+      );
+      const expiryAt = Math.min(
+        slotStart.getTime(),
+        Math.max(
+          b.createdAt.getTime() + hours * 3600_000,
+          slotStart.getTime() - 24 * 3600_000,
+        ),
+      );
+      return expiryAt <= now.getTime();
     });
     let expired = 0;
     for (const b of stale) {
@@ -242,18 +267,16 @@ export class SchedulerService implements OnModuleInit {
     playersNeeded: number;
     participants: { userId: string | null }[];
     venue: { name: string } | null;
-    booking: { totalPrice: unknown; discountAmount: unknown } | null;
+    booking: { totalPrice: unknown } | null;
   }) {
     const hh = String(Math.floor(g.startMinutes / 60)).padStart(2, '0');
     const mm = String(g.startMinutes % 60).padStart(2, '0');
     // Joiners owe their share at the venue — say so while there's
     // still time to bring cash. The host collects; they get no line.
+    // totalPrice is already net of any discount.
     let pricePerPlayer: number | null = null;
     if (g.booking) {
-      const fee = Math.max(
-        0,
-        Number(g.booking.totalPrice) - Number(g.booking.discountAmount),
-      );
+      const fee = Math.max(0, Number(g.booking.totalPrice));
       const squad =
         g.squadSize != null
           ? g.squadSize + g.playersNeeded

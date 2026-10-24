@@ -227,6 +227,33 @@ export class VenuesService {
       ? { AND: [{ planId: { notIn: [...featuredIds] } }, { planId: { not: null } }] }
       : { OR: [{ planId: null }, { planId: { notIn: [...featuredIds] } }] };
 
+    // Live-overdue check: the materialized billingPaused flag only
+    // flips on the nightly sweep, so an arena whose grace ended since
+    // the last sweep would still list until then. Exclude venues whose
+    // COMPUTED billing status is overdue — the same live check
+    // getActiveCourt applies to single courts. Totals stay exact
+    // because the filter lands in `where` before any paging.
+    const candidates = await this.prisma.venue.findMany({
+      where,
+      select: {
+        id: true,
+        billingStartAt: true,
+        billingPaidUntil: true,
+        freeUntilOverride: true,
+        billingPeriodStart: true,
+        billingPeriodEnd: true,
+        billingPeriodPrice: true,
+        planId: true,
+        billingPaused: true,
+      },
+    });
+    const liveIds: string[] = [];
+    for (const c of candidates) {
+      const summary = await this.plans.billingSummary(c as any);
+      if (summary.status !== 'overdue') liveIds.push(c.id);
+    }
+    where.id = { in: liveIds };
+
     const findArgs: Prisma.VenueFindManyArgs = {
       where,
       include: {

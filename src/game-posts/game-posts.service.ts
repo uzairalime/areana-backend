@@ -34,13 +34,12 @@ export class GamePostsService {
   private priceView(post: {
     squadSize: number | null;
     playersNeeded: number;
-    booking?: { totalPrice: unknown; discountAmount: unknown } | null;
+    booking?: { totalPrice: unknown } | null;
   }): { courtFee: number | null; pricePerPlayer: number | null } {
     if (!post.booking) return { courtFee: null, pricePerPlayer: null };
-    const courtFee = Math.max(
-      0,
-      Number(post.booking.totalPrice) - Number(post.booking.discountAmount),
-    );
+    // totalPrice is already net of any discount — subtracting
+    // discountAmount again understated every share.
+    const courtFee = Math.max(0, Number(post.booking.totalPrice));
     // The fee splits across the FULL squad: the host's group (squadSize)
     // plus everyone who joins (playersNeeded). squadSize is always sent
     // by the booking flows; the +1 fallback counts a lone host.
@@ -376,11 +375,22 @@ export class GamePostsService {
     }
     let city = dto.city;
     if (dto.venueId) {
-      const venue = await this.prisma.venue.findUnique({
-        where: { id: dto.venueId },
-        include: { owner: { select: { status: true } } },
+      // The full venue visibility predicate (same as venueVisibleWhere's
+      // venue branch): approved + unarchived + billing unpaused +
+      // unmoderated + owner active. The old check (approved + owner)
+      // let admins create curated games at paused venues — posts that
+      // never appear on the board and can never be joined.
+      const venue = await this.prisma.venue.findFirst({
+        where: {
+          id: dto.venueId,
+          status: VenueStatus.approved,
+          archivedAt: null,
+          billingPaused: false,
+          moderationStatus: 'none',
+          owner: { status: UserStatus.active },
+        },
       });
-      if (!venue || venue.status !== 'approved' || venue.owner.status !== 'active') {
+      if (!venue) {
         throw new BadRequestException('That venue is not bookable right now');
       }
       city = venue.city;

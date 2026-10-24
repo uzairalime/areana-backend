@@ -230,6 +230,7 @@ export class PlansService {
           billingPeriodStart: null,
           billingPeriodEnd: null,
           billingPeriodPrice: null,
+          frozenPlanId: null,
           billingPaused: false,
           billingDueNotifiedFor: null,
         },
@@ -244,12 +245,15 @@ export class PlansService {
       // the new plan's freeMonths would retroactively re-anchor every
       // period boundary (a trial venue switched to a 0-free-months plan
       // would instantly go due; a longer-free plan would resurrect an
-      // overdue venue into "trial" with no payment).
+      // overdue venue into "trial" with no payment). The frozen plan
+      // id freezes features/caps the same way: the new plan's limits
+      // apply only once this period ends.
       const ctx = await this.context(venue);
       if (ctx) {
         data.billingPeriodStart = ctx.periodStart;
         data.billingPeriodEnd = ctx.periodEnd;
         data.billingPeriodPrice = ctx.plan.priceYearly;
+        data.frozenPlanId = ctx.plan.id;
       }
     }
     // Deliberately no billingStartAt here: assigning a plan never starts
@@ -289,10 +293,12 @@ export class PlansService {
         // Only un-pause when the venue is actually free again; an
         // extension that still ends in the past must not revive it.
         ...(newFreeUntil > now ? { billingPaused: false } : {}),
-        // A new free anchor re-derives periods — drop any frozen period.
+        // A new free anchor re-derives periods — drop any frozen period
+        // and its frozen plan with it.
         billingPeriodStart: null,
         billingPeriodEnd: null,
         billingPeriodPrice: null,
+        frozenPlanId: null,
       },
       include: { plan: true },
     });
@@ -331,6 +337,16 @@ export class PlansService {
     if (ctx.paidUntil && ctx.paidUntil >= ctx.periodEnd) {
       throw new BadRequestException('This billing period is already paid');
     }
+    // Full settlement only: any positive amount used to settle the
+    // whole year, and a top-up afterwards was impossible (the period
+    // was already marked paid). The panel modal already promises full
+    // settlement, so a mismatched amount is a caller error, not a
+    // partial payment.
+    if (amount !== undefined && amount !== ctx.price) {
+      throw new BadRequestException(
+        `Payment amount must equal the period price (Rs ${ctx.price.toLocaleString('en-PK')}) — partial payments are not accepted`,
+      );
+    }
     const paidUntil =
       ctx.paidUntil && ctx.paidUntil > ctx.periodEnd
         ? ctx.paidUntil
@@ -344,9 +360,9 @@ export class PlansService {
         include: { plan: true },
       });
       // Every settlement lands in the payments ledger, so platform revenue
-      // is a sum of records — never a guess from flags. An explicit
-      // amount records what was actually received (discounted / partial
-      // cash); otherwise the period price in effect applies.
+      // is a sum of records — never a guess from flags. The amount is
+      // always the period price (validated above): a settlement covers
+      // exactly one whole period, never part of one.
       await tx.venuePayment.create({
         data: {
           venueId,
@@ -404,27 +420,38 @@ export class PlansService {
       addMonths(venue.billingStartAt, plan.freeMonths);
     const now = new Date();
     // Yearly periods. When a plan changed without restart, the frozen
-    // period (set by assignPlan) is the anchor: boundaries walk forward
-    // from it, and its locked price applies until that period ends —
-    // the new plan's price applies from the next period, not this one.
+    // period (set by assignPlan) is the anchor: its locked price
+    // applies while that period is current — the new plan's price
+    // applies from the next period, not this one.
+    //
+    // FREEZE RULE: periods advance only while PAID. The old
+    // now-driven walk silently erased arrears: each anniversary moved
+    // the due date forward, an overdue venue auto-resumed, and the
+    // unpaid year vanished from every figure. Now the walk stops at
+    // the first unpaid period and the venue stays due/overdue until
+    // that period is settled — no auto-resume without payment.
     let periodStart: Date;
     let periodEnd: Date;
     let price: number;
     if (venue.billingPeriodStart && venue.billingPeriodEnd) {
       periodStart = venue.billingPeriodStart;
       periodEnd = venue.billingPeriodEnd;
-      while (now >= periodEnd) {
+      while (venue.billingPaidUntil && venue.billingPaidUntil >= periodEnd) {
         periodStart = periodEnd;
         periodEnd = addMonths(periodStart, 12);
       }
+      // The locked price belongs to the frozen period itself: once the
+      // walk advances past it (because it was paid), the current
+      // plan's price applies to the new period.
       price =
-        now < venue.billingPeriodEnd && venue.billingPeriodPrice != null
+        periodStart.getTime() === venue.billingPeriodStart.getTime() &&
+        venue.billingPeriodPrice != null
           ? venue.billingPeriodPrice
           : plan.priceYearly;
     } else {
       periodStart = freeUntil;
       periodEnd = addMonths(freeUntil, 12);
-      while (now >= periodEnd) {
+      while (venue.billingPaidUntil && venue.billingPaidUntil >= periodEnd) {
         periodStart = periodEnd;
         periodEnd = addMonths(periodStart, 12);
       }
@@ -474,7 +501,9 @@ export class PlansService {
         nextDueAt: prepaid
           ? paidUntil.toISOString()
           : freeUntil.toISOString(),
-        amountDue: prepaid ? 0 : ctx.price,
+        // Trial means nothing is due yet — the yearly price is the
+        // upcoming amount (shown via priceYearly), never a current due.
+        amountDue: 0,
       };
     }
     if (paidUntil && paidUntil > now) {
@@ -522,6 +551,22 @@ export class PlansService {
           where: { id: venue.id },
           data: { billingPaused: shouldPause },
         });
+        // The pause that hides a venue (and cancels its bookings) had
+        // no audit trail at all. System rows carry a null actor — the
+        // panel renders those as "System / automated".
+        await this.prisma.auditLog
+          .create({
+            data: {
+              actorId: null,
+              action: shouldPause ? 'venue.billing.paused' : 'venue.billing.resumed',
+              entity: 'venue',
+              entityId: venue.id,
+              details: shouldPause
+                ? `overdue: Rs ${summary.amountDue.toLocaleString('en-PK')} due for period ${summary.nextDueAt ?? 'unknown'}`
+                : `status: ${summary.status}`,
+            },
+          })
+          .catch(() => {});
         if (shouldPause) {
           paused++;
           // Overdue-pause follows the sanction policy: upcoming
@@ -538,13 +583,22 @@ export class PlansService {
             .catch(() => {});
         } else {
           // A venue that was paused and is no longer overdue (paid,
-          // free-extended, or plan-changed) is live again — tell the
-          // owner, since the pause notice is what they last heard.
+          // free-extended, or plan-changed) may be live again — but
+          // only if nothing else still hides it. The notice says so
+          // only when the full live predicate holds (approved +
+          // unarchived + unmoderated); otherwise it says the pause
+          // lifted without promising visibility.
           resumed++;
+          const liveAgain =
+            venue.status === 'approved' &&
+            !venue.archivedAt &&
+            venue.moderationStatus === 'none';
           await this.notifications
             .pushToUser(venue.ownerId, {
-              title: 'Venue live again',
-              body: `${venue.name} is no longer billing-paused and is visible to players again.`,
+              title: liveAgain ? 'Venue live again' : 'Billing pause lifted',
+              body: liveAgain
+                ? `${venue.name} is no longer billing-paused and is visible to players again.`
+                : `${venue.name} is no longer billing-paused, but it stays hidden for now — it becomes visible once its approval, moderation, and billing state are all clear.`,
               data: { type: 'billing_resumed' },
             })
             .catch(() => {});
@@ -582,13 +636,47 @@ export class PlansService {
   }
 
   // ----------------------------------------------------------------- gating
+  /**
+   * Plan whose features/caps actually apply right now. A plan change
+   * without restart freezes the OLD plan (frozenPlanId) for the frozen
+   * period: the new plan's features/caps apply only once that period
+   * ends — i.e. once the paid-advance walk in context() moves past
+   * the frozen period's end. Before the freeze existed (or after a
+   * restart / free-extension, which clear it), the current plan
+   * applies directly.
+   */
+  private async planInEffect(venueId: string) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: {
+        planId: true,
+        frozenPlanId: true,
+        billingPeriodStart: true,
+        billingPeriodEnd: true,
+        billingPaidUntil: true,
+      },
+    });
+    if (!venue) return this.defaultPlan();
+    const current = await this.effectivePlan(venue);
+    if (!venue.frozenPlanId || !venue.billingPeriodStart || !venue.billingPeriodEnd) {
+      return current;
+    }
+    // Settled frozen period → the walk has moved on; the current plan
+    // governs the new period. Unsettled → still the frozen period.
+    const settled =
+      venue.billingPaidUntil && venue.billingPaidUntil >= venue.billingPeriodEnd;
+    if (settled) return current;
+    const frozen = await this.prisma.plan.findUnique({ where: { id: venue.frozenPlanId } });
+    return frozen ?? current;
+  }
+
   async featuresForVenue(venueId: string): Promise<string[]> {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
-      select: { planId: true },
+      select: { id: true },
     });
     if (!venue) return [];
-    const plan = await this.effectivePlan(venue);
+    const plan = await this.planInEffect(venueId);
     return plan ? this.asKeys(plan.features) : [];
   }
 
@@ -617,7 +705,7 @@ export class PlansService {
     if (venue.courtLimitOverride !== null && venue.courtLimitOverride !== undefined) {
       return { limit: venue.courtLimitOverride, source: 'override', override: venue.courtLimitOverride };
     }
-    const plan = await this.effectivePlan(venue);
+    const plan = await this.planInEffect(venueId);
     return { limit: plan?.maxCourts ?? null, source: 'plan', override: null };
   }
 
@@ -635,7 +723,7 @@ export class PlansService {
     if (venue.staffLimitOverride !== null && venue.staffLimitOverride !== undefined) {
       return { limit: venue.staffLimitOverride, source: 'override', override: venue.staffLimitOverride };
     }
-    const plan = await this.effectivePlan(venue);
+    const plan = await this.planInEffect(venueId);
     return { limit: plan?.maxStaff ?? null, source: 'plan', override: null };
   }
 

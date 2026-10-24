@@ -10,6 +10,34 @@ async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
   const config = app.get(ConfigService);
 
+  // Every date helper in this codebase (startOfToday,
+  // minutesSinceMidnight, PKT day bounds) assumes the process runs in
+  // Asia/Karachi. A production process in any other TZ silently shifts
+  // every play date, slot window, and billing boundary — so production
+  // hard-fails on a wrong TZ instead of booting into wrong dates.
+  // Dev only warns: local machines legitimately run other zones.
+  const tz = process.env.TZ;
+  if (tz !== 'Asia/Karachi') {
+    const msg = `TZ must be Asia/Karachi (got ${tz ?? 'unset'}) — all date math assumes Pakistan time.`;
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(`[BOOT] ${msg}`);
+    }
+    console.warn(`[BOOT WARNING] ${msg}`);
+  }
+
+  // CORS: the default origin is '*' (config.ts), which is fine for
+  // local dev but must never ship — production requires an explicit,
+  // env-driven origin list, or the API boots open to every site.
+  const corsOrigin = config.get<string[]>('corsOrigin') ?? [];
+  if (process.env.NODE_ENV === 'production') {
+    const open = corsOrigin.length === 0 || corsOrigin.includes('*');
+    if (open) {
+      throw new Error(
+        '[BOOT] CORS_ORIGIN must list explicit origins in production (got * or unset) — refusing to boot open to every site.',
+      );
+    }
+  }
+
   // Behind a reverse proxy (production VPS: nginx/Caddy), Express must
   // trust X-Forwarded-For or every visitor shares the proxy's IP — which
   // would pool the rate limits and the per-IP OTP cap across all users.

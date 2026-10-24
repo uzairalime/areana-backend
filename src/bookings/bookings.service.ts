@@ -328,6 +328,18 @@ export class BookingsService {
       });
       if (full) await this.notifyWaitlist(full);
     }
+    // The series player gets the same booking_cancelled signal as any
+    // other cancellation, so a cancelled series never silently stands
+    // on their calendar.
+    if (res.count > 0) {
+      await this.notifications
+        .pushToUser(userId, {
+          title: 'Recurring series cancelled',
+          body: `${res.count} booking${res.count === 1 ? '' : 's'} in your recurring series were cancelled. Any promos used have been refunded.`,
+          data: { type: 'booking_cancelled' },
+        })
+        .catch(() => {});
+    }
     return { cancelled: res.count };
   }
 
@@ -584,9 +596,64 @@ export class BookingsService {
   }
 
   // ------------------------------------------------------- owner operations
+  /**
+   * True once a slot has started — or the player already checked in
+   * (check-in opens 30 minutes early, so a checked-in booking is live
+   * even before its start minute). Shared by every cascade that must
+   * not cancel games already in play.
+   */
+  private slotLive(b: {
+    date: Date;
+    startMinutes: number;
+    checkedInAt?: Date | null;
+  }): boolean {
+    if (b.checkedInAt) return true;
+    const now = new Date();
+    return (
+      b.date < startOfToday() ||
+      (isSameDay(b.date, now) && b.startMinutes <= minutesSinceMidnight(now))
+    );
+  }
+
   /** Owner/staff act on bookings of their venues (ownership verified by caller). */
   async acceptBooking(bookingId: string) {
     const booking = await this.getPending(bookingId);
+    // Re-validate slot fit at accept time: the world may have changed
+    // since the request was made (hours shrunk, a block added, another
+    // booking confirmed into the slot). A booking that no longer fits
+    // stays pending for the owner to reject — it must not confirm into
+    // a window that no longer exists. Same checks as reschedule-accept.
+    const court = await this.prisma.court.findUnique({ where: { id: booking.courtId } });
+    if (!court) throw new NotFoundException('Court not found');
+    const endMinutes = booking.endMinutes;
+    const windows = await this.courts.windowsForDate(court, booking.date);
+    const fits = windows.some(
+      (w) =>
+        booking.startMinutes >= w.startMinutes &&
+        endMinutes <= w.endMinutes &&
+        (booking.startMinutes - w.startMinutes) % court.slotMinutes === 0,
+    );
+    if (!fits) {
+      throw new BadRequestException('This booking no longer fits the court hours');
+    }
+    const blocked = await this.courts.blockedRangesForDate(booking.courtId, booking.date);
+    if (
+      blocked.some((r) => booking.startMinutes < r.endMinutes && endMinutes > r.startMinutes)
+    ) {
+      throw new ConflictException('This slot is blocked by the arena');
+    }
+    const clash = await this.prisma.booking.findFirst({
+      where: {
+        id: { not: bookingId },
+        courtId: booking.courtId,
+        date: booking.date,
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        startMinutes: { lt: endMinutes },
+        endMinutes: { gt: booking.startMinutes },
+      },
+      select: { id: true },
+    });
+    if (clash) throw new ConflictException('This slot is no longer available');
     // Atomic claim: only one decider can move the booking out of pending;
     // a simultaneous second decision gets 'already decided' instead of
     // silently overwriting the first.
@@ -629,17 +696,37 @@ export class BookingsService {
     const accepted: string[] = [];
     const skipped: { id: string; reason: string }[] = [];
     for (const b of pendings) {
-      try {
-        await this.assertNoOverlap(b.courtId, b.date, b.startMinutes, b.endMinutes);
-        await this.prisma.booking.update({ where: { id: b.id }, data: { status: BookingStatus.confirmed } });
-        accepted.push(b.id);
-        if (b.userId) {
-          await this.notifications.notifyPlayerDecision(b.userId, true, b.venue.name, this.fmtWhen(b)).catch(() => {});
+      // Per-occurrence gates, like single accept: the court must still
+      // be bookable and the slot must not have started while the
+      // series sat pending. A failure skips (cancels) just that
+      // occurrence — the rest of the series still confirms.
+      let skipReason: string | null = null;
+      if (this.slotLive(b)) {
+        skipReason = 'Slot already started';
+      } else {
+        try {
+          await this.courts.getActiveCourt(b.courtId);
+        } catch {
+          skipReason = 'Court is no longer bookable';
         }
-      } catch {
+        if (!skipReason) {
+          try {
+            await this.assertNoOverlap(b.courtId, b.date, b.startMinutes, b.endMinutes);
+          } catch {
+            skipReason = 'Slot no longer available';
+          }
+        }
+      }
+      if (skipReason) {
         await this.prisma.booking.update({ where: { id: b.id }, data: { status: BookingStatus.cancelled } });
         await this.releasePromo(b.id);
-        skipped.push({ id: b.id, reason: 'Slot no longer available' });
+        skipped.push({ id: b.id, reason: skipReason });
+        continue;
+      }
+      await this.prisma.booking.update({ where: { id: b.id }, data: { status: BookingStatus.confirmed } });
+      accepted.push(b.id);
+      if (b.userId) {
+        await this.notifications.notifyPlayerDecision(b.userId, true, b.venue.name, this.fmtWhen(b)).catch(() => {});
       }
     }
     return { accepted, skipped };
@@ -678,7 +765,7 @@ export class BookingsService {
     const booking = await this.prisma.booking.findFirst({
       where: { checkInCode, venueId },
       include: {
-        court: { select: { name: true } },
+        court: { select: { name: true, isActive: true } },
         user: { select: { name: true, phone: true } },
       },
     });
@@ -687,14 +774,15 @@ export class BookingsService {
     // Scan responses used to return bare booking details, leaving the
     // panel to guess whether check-in would succeed. The flag mirrors
     // checkIn's own rules exactly: confirmed, not already checked in,
-    // game day, and inside [start − 30min, end]. Non-confirmed codes
-    // are always false — a pending/cancelled booking is never
-    // check-in-able, whatever the clock says.
+    // game day, inside [start − 30min, end], and on an active court.
+    // Non-confirmed codes are always false — a pending/cancelled
+    // booking is never check-in-able, whatever the clock says.
     const now = new Date();
     const nowMin = minutesSinceMidnight(now);
     const canCheckIn =
       booking.status === BookingStatus.confirmed &&
       !booking.checkedInAt &&
+      booking.court.isActive &&
       isSameDay(booking.date, now) &&
       nowMin >= booking.startMinutes - 30 &&
       nowMin <= booking.endMinutes;
@@ -705,6 +793,15 @@ export class BookingsService {
     const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
     if (!booking) throw new NotFoundException('Booking not found');
     await this.assertVenueAcceptsCheckIns(booking.venueId);
+    // A deactivated court takes no check-ins, even for bookings made
+    // while it was live (deactivation refuses upcoming bookings, but
+    // courts deactivated before that guard — or by direct edit — can
+    // still hold a confirmed booking).
+    const court = await this.prisma.court.findUnique({
+      where: { id: booking.courtId },
+      select: { isActive: true },
+    });
+    if (!court?.isActive) throw new BadRequestException('This court is no longer active');
     if (booking.checkedInAt) {
       throw new BadRequestException('This booking is already checked in');
     }
@@ -772,9 +869,34 @@ export class BookingsService {
   }
 
   /**
+   * Tell a player about a no-show strike — every strike, not just the
+   * suspending one. Shared by markNoShow and the dispute path, which
+   * increments the count inside its own transaction.
+   */
+  async pushNoShowStrike(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { noShowCount: true },
+    });
+    if (!user) return;
+    const limit = parseInt(
+      (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value ?? '3',
+      10,
+    );
+    await this.notifications
+      .pushToUser(userId, {
+        title: 'No-show recorded',
+        body: `You were marked as a no-show — strike ${user.noShowCount} of ${limit}. At ${limit} strikes your account is suspended.`,
+        data: { type: 'no_show_strike' },
+      })
+      .catch(() => {});
+  }
+
+  /**
    * One no-show strike, shared by the owner path (markNoShow) and the
-   * dispute path (admin confirm_no_show): increment, then suspend at
-   * the configured strike limit with the full cascade.
+   * dispute path (admin confirm_no_show): increment, push the strike
+   * notice, then suspend at the configured strike limit with the full
+   * cascade.
    */
   async recordNoShowStrike(userId: string) {
     const user = await this.prisma.user.update({
@@ -785,6 +907,7 @@ export class BookingsService {
       (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value ?? '3',
       10,
     );
+    await this.pushNoShowStrike(userId);
     if (user.noShowCount >= limit && user.status === UserStatus.active) {
       await this.suspendPlayerWithCascade(userId);
     }
@@ -800,14 +923,16 @@ export class BookingsService {
    * Sanction / suspension / overdue-pause policy: when a venue stops
    * being bookable, its upcoming bookings do not stand — they are
    * cancelled, their game posts and waitlists are cleaned up, promos
-   * are refunded, and every affected player is told why.
+   * are refunded, and every affected player is told why. "Upcoming"
+   * means not yet started and not checked in: cancelling a game
+   * already in play would strand players mid-game.
    */
   async cancelVenueUpcomingBookings(venueId: string, reason: string) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
       select: { name: true },
     });
-    const upcoming = await this.prisma.booking.findMany({
+    const candidates = await this.prisma.booking.findMany({
       where: {
         venueId,
         date: { gte: startOfToday() },
@@ -820,8 +945,10 @@ export class BookingsService {
         courtId: true,
         startMinutes: true,
         endMinutes: true,
+        checkedInAt: true,
       },
     });
+    const upcoming = candidates.filter((b) => !this.slotLive(b));
     for (const b of upcoming) {
       await this.prisma.booking.update({
         where: { id: b.id },
@@ -845,19 +972,14 @@ export class BookingsService {
   }
 
   /**
-   * Suspends a player and unwinds their future: upcoming bookings are
-   * cancelled, the player is told once, and each affected venue owner
-   * gets an email. (Owner suspensions deliberately do NOT use this —
-   * their bookings stand and venues pause; see round-3 policy.)
-   */
-  /**
    * Cancel every future booking of a player, with the full wake: linked
    * game posts deleted + squads notified, freed slots pinged to their
    * waitlists, venue owners emailed. Shared by suspension + deletion.
-   * Returns how many bookings were cancelled.
+   * Started and checked-in bookings are history, not cancellations —
+   * they are left alone. Returns how many bookings were cancelled.
    */
   async cancelFutureBookings(userId: string, ownerNote: string) {
-    const future = await this.prisma.booking.findMany({
+    const candidates = await this.prisma.booking.findMany({
       where: {
         userId,
         date: { gte: startOfToday() },
@@ -867,6 +989,7 @@ export class BookingsService {
         venue: { select: { name: true, owner: { select: { email: true } } } },
       },
     });
+    const future = candidates.filter((b) => !this.slotLive(b));
     for (const b of future) {
       await this.prisma.booking.update({
         where: { id: b.id },
@@ -1021,6 +1144,22 @@ export class BookingsService {
     await this.cleanupGamePost(bookingId, 'The venue cancelled the booking, so this game is off.');
     await this.notifyWaitlist(booking);
     await this.releasePromo(bookingId);
+    // A cancelled game the player never hears about is a player who
+    // shows up anyway — the venue cancel pushes like the venue
+    // suspension cascade does.
+    if (booking.userId) {
+      const venue = await this.prisma.venue.findUnique({
+        where: { id: booking.venueId },
+        select: { name: true },
+      });
+      await this.notifications
+        .pushToUser(booking.userId, {
+          title: 'Booking cancelled',
+          body: `Your booking at ${venue?.name ?? 'the arena'} on ${booking.date.toISOString().slice(0, 10)} was cancelled by the arena. Any promo used has been refunded.`,
+          data: { type: 'booking_cancelled', venueId: booking.venueId },
+        })
+        .catch(() => {});
+    }
     return updated;
   }
 

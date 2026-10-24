@@ -115,15 +115,33 @@ export class DisputesService {
     if (dispute.status !== 'open') {
       throw new BadRequestException('Dispute is already resolved');
     }
+    // Narrowed once, before the transaction: the booking id is a
+    // nullable FK (SetNull backstop), and a dispute with no booking
+    // cannot be confirmed as a no-show.
+    const bookingId = dispute.bookingId;
+    const bookingUserId = dispute.booking?.userId ?? null;
+    if (action === 'confirm_no_show') {
+      if (!bookingId || !dispute.booking) {
+        throw new NotFoundException('Dispute has no booking');
+      }
+      // The owner path (markNoShow) rejects checked-in bookings; the
+      // dispute path must not be the back door around it — a player
+      // who checked in played the game.
+      if (dispute.booking.checkedInAt) {
+        throw new BadRequestException('A checked-in booking cannot be confirmed as a no-show');
+      }
+    }
 
     let strikeUserId: string | null = null;
     const resolved = await this.prisma.$transaction(async (tx) => {
       if (action === 'confirm_no_show') {
-        // Atomic claim: only a completed booking can become a no-show,
-        // and only once — a booking the owner already marked no-show
-        // must not earn a second strike from the same game.
+        // Atomic claim: only a completed, not-checked-in booking can
+        // become a no-show, and only once — a booking the owner
+        // already marked no-show must not earn a second strike from
+        // the same game. The checkedInAt condition is the race
+        // backstop for the pre-transaction check above.
         const claimed = await tx.booking.updateMany({
-          where: { id: dispute.bookingId, status: BookingStatus.completed },
+          where: { id: bookingId, status: BookingStatus.completed, checkedInAt: null },
           data: { status: BookingStatus.no_show },
         });
         if (claimed.count === 0) {
@@ -134,16 +152,16 @@ export class DisputesService {
         // A no-showed booking must never be resurrected by a stale
         // pending reschedule request.
         await tx.rescheduleRequest.updateMany({
-          where: { bookingId: dispute.bookingId, status: 'pending' },
+          where: { bookingId, status: 'pending' },
           data: {
             status: 'rejected',
             reason: 'Booking is no longer active',
             decidedAt: new Date(),
           },
         });
-        if (dispute.booking.userId) {
+        if (bookingUserId) {
           const struck = await tx.user.update({
-            where: { id: dispute.booking.userId },
+            where: { id: bookingUserId },
             data: { noShowCount: { increment: 1 } },
           });
           strikeUserId = struck.id;
@@ -171,9 +189,12 @@ export class DisputesService {
       return updated;
     });
 
-    // Strike-limit suspension runs after the transaction (it has its own
-    // cascade); the strike count itself is already durable above.
+    // The strike notice goes out for every strike (not just the
+    // suspending one), then strike-limit suspension runs after the
+    // transaction (it has its own cascade); the strike count itself
+    // is already durable above.
     if (strikeUserId) {
+      await this.bookings.pushNoShowStrike(strikeUserId);
       const user = await this.prisma.user.findUnique({
         where: { id: strikeUserId },
         select: { status: true, noShowCount: true },

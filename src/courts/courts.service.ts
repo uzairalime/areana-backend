@@ -151,19 +151,22 @@ export class CourtsService {
     const now = new Date();
     if (now < freeUntil) return false;
     if (venue.billingPaidUntil && venue.billingPaidUntil > now) return false;
+    // Mirrors plans.context()'s freeze rule: periods advance only while
+    // PAID, so an unpaid period keeps the venue overdue instead of
+    // silently walking the due date forward past the arrears.
     let periodStart: Date;
     let periodEnd: Date;
     if (venue.billingPeriodStart && venue.billingPeriodEnd) {
       periodStart = venue.billingPeriodStart;
       periodEnd = venue.billingPeriodEnd;
-      while (now >= periodEnd) {
+      while (venue.billingPaidUntil && venue.billingPaidUntil >= periodEnd) {
         periodStart = periodEnd;
         periodEnd = addMonths(periodStart, 12);
       }
     } else {
       periodStart = freeUntil;
       periodEnd = addMonths(freeUntil, 12);
-      while (now >= periodEnd) {
+      while (venue.billingPaidUntil && venue.billingPaidUntil >= periodEnd) {
         periodStart = periodEnd;
         periodEnd = addMonths(periodStart, 12);
       }

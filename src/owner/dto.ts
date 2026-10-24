@@ -1,4 +1,4 @@
-import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, Min, ValidateNested } from 'class-validator';
+import { IsArray, IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min, MinLength, ValidateNested } from 'class-validator';
 import { OffsetQueryDto } from '../common/pagination';
 import { Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
@@ -97,7 +97,7 @@ export class CheckInScanDto {
 export class CreateStaffDto {
   @ApiProperty() @IsString() email: string;
   @ApiProperty() @IsString() name: string;
-  @ApiProperty() @IsString() password: string;
+  @ApiProperty() @IsString() @MinLength(8) @MaxLength(72) password: string;
   @ApiProperty({ description: 'Must be one of the venue’s allowed roles' })
   @IsString()
   roleId: string;

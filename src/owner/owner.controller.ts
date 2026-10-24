@@ -64,12 +64,14 @@ export class OwnerController {
   // ---------------------------------------------------------------- venues
   @ApiTags('owner · venues & courts')
   @Get('venues/check-duplicate')
+  @RequirePerm('venues.manage')
   duplicateVenueCheck(
+    @CurrentUser() user: AuthUser,
     @Query('name') name?: string,
     @Query('city') city?: string,
     @Query('excludeId') excludeId?: string,
   ) {
-    return this.owner.duplicateVenueCheck(name, city, excludeId);
+    return this.owner.duplicateVenueCheck(user, name, city, excludeId);
   }
 
   @Get('venues')

@@ -9,7 +9,9 @@ import {
   IsString,
   Matches,
   Max,
+  MaxLength,
   Min,
+  MinLength,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -18,7 +20,7 @@ export class CreateUserDto {
   @ApiProperty() @IsString() email: string;
   @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() @Matches(/^\+?[0-9\s()\-]{7,20}$/, { message: 'Phone must be 7–20 characters of digits, spaces, +, - or ()' }) phone?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() password?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() @MinLength(8) @MaxLength(72) password?: string;
   @ApiProperty({ description: 'Role id' }) @IsString() roleId: string;
 }
 
@@ -164,6 +166,8 @@ export class OnboardArenaDto {
   @ApiPropertyOptional() @IsOptional() @IsString() @Matches(/^\+?[0-9\s()\-]{7,20}$/, { message: 'Phone must be 7–20 characters of digits, spaces, +, - or ()' }) ownerPhone?: string;
   @ApiProperty({ description: 'Initial password for the owner login' })
   @IsString()
+  @MinLength(8)
+  @MaxLength(72)
   ownerPassword: string;
   // venue
   @ApiProperty() @IsString() venueName: string;

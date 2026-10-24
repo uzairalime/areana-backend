@@ -5,7 +5,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { BookingStatus, VenueStatus, type Prisma } from '@prisma/client';
+import { BookingStatus, VenueStatus, type Prisma, type PromoCode } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { AuthUser } from '../common/auth';
 import { PrismaService } from '../common/prisma';
@@ -58,20 +58,25 @@ export class OwnerService {
   ) {}
 
   // ------------------------------------------------------------ access scope
-  /** Venue ids the user may operate: owned (owner) or assigned (staff). */
+  /**
+   * Venue ids the user may operate: owned venues PLUS staff-linked
+   * venues. The old code returned ONLY owned venues for anyone holding
+   * venues.manage — an owner who also staffed another arena (or a
+   * staffer granted venues.manage) silently lost their linked venues.
+   */
   async venueIds(user: AuthUser): Promise<string[]> {
-    if (user.permissions.includes('venues.manage')) {
-      const vs = await this.prisma.venue.findMany({
-        where: { ownerId: user.id },
-        select: { id: true },
-      });
-      return vs.map((v) => v.id);
-    }
+    const ids = new Set<string>();
+    const owned = await this.prisma.venue.findMany({
+      where: { ownerId: user.id },
+      select: { id: true },
+    });
+    for (const v of owned) ids.add(v.id);
     const links = await this.prisma.venueStaff.findMany({
       where: { userId: user.id },
       select: { venueId: true },
     });
-    return links.map((l) => l.venueId);
+    for (const l of links) ids.add(l.venueId);
+    return [...ids];
   }
 
   async assertVenue(user: AuthUser, venueId: string) {
@@ -80,6 +85,29 @@ export class OwnerService {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
     return venue;
+  }
+
+  /**
+   * Billing/revenue visibility: a venue's owner always sees its money;
+   * a staff-linked venue only when the caller holds billing.view.
+   * Owners are covered by the ownership rule, so existing owner roles
+   * that lack the new key do not break — and staff without the key
+   * still see bookings and occupancy, just not money.
+   */
+  private async moneyVenueIds(user: AuthUser): Promise<string[]> {
+    const owned = await this.prisma.venue.findMany({
+      where: { ownerId: user.id },
+      select: { id: true },
+    });
+    const ids = new Set(owned.map((v) => v.id));
+    if (user.permissions.includes('billing.view') || user.permissions.includes('*')) {
+      const links = await this.prisma.venueStaff.findMany({
+        where: { userId: user.id },
+        select: { venueId: true },
+      });
+      for (const l of links) ids.add(l.venueId);
+    }
+    return [...ids];
   }
 
   private async ownedBooking(user: AuthUser, bookingId: string) {
@@ -95,6 +123,10 @@ export class OwnerService {
     const date = dateStr ? parseDateOnly(dateStr) : startOfToday();
     const monthStart = new Date(date.getFullYear(), date.getMonth(), 1);
 
+    // Revenue is masked to money-visible venues (owned, or linked +
+    // billing.view); bookings and occupancy stay visible for all
+    // in-scope venues.
+    const moneyIds = new Set(await this.moneyVenueIds(user));
     const [todayBookings, monthBookings, courts] = await Promise.all([
       this.prisma.booking.findMany({
         where: { venueId: { in: ids }, date },
@@ -106,7 +138,7 @@ export class OwnerService {
       }),
       this.prisma.booking.findMany({
         where: {
-          venueId: { in: ids },
+          venueId: { in: [...moneyIds] },
           date: { gte: monthStart },
           status: { in: [BookingStatus.confirmed, BookingStatus.completed] },
         },
@@ -119,7 +151,11 @@ export class OwnerService {
     ]);
 
     const revenueToday = todayBookings
-      .filter((b) => b.status === BookingStatus.confirmed || b.status === BookingStatus.completed)
+      .filter(
+        (b) =>
+          moneyIds.has(b.venueId) &&
+          (b.status === BookingStatus.confirmed || b.status === BookingStatus.completed),
+      )
       .reduce((s, b) => s + Number(b.totalPrice), 0);
     const revenueMonth = monthBookings.reduce((s, b) => s + Number(b.totalPrice), 0);
     const totalSlotMin = courts.reduce((s, c) => s + Math.max(0, c.closeMinutes - c.openMinutes), 0);
@@ -214,27 +250,41 @@ export class OwnerService {
    * name in the same city (any owner, not archived). Warning only —
    * legit branches share names, so creation is never blocked.
    */
-  async duplicateVenueCheck(name?: string, city?: string, excludeId?: string) {
+  async duplicateVenueCheck(user: AuthUser, name?: string, city?: string, excludeId?: string) {
     const n = (name ?? '').trim();
     const c = (city ?? '').trim();
     if (!n || !c) return { duplicates: [] };
-    const duplicates = await this.prisma.venue.findMany({
+    const rows = await this.prisma.venue.findMany({
       where: {
         archivedAt: null,
         ...(excludeId ? { id: { not: excludeId } } : {}),
         name: { equals: n, mode: 'insensitive' },
         city: { equals: c, mode: 'insensitive' },
       },
-      select: { id: true, name: true, city: true, status: true },
+      select: { id: true, name: true, city: true, status: true, ownerId: true },
       take: 5,
     });
+    // The check exists to warn about name clashes, not to leak other
+    // owners' pipeline state: status is shown only for the caller's
+    // own venues (or to '*' platform callers).
+    const canSeeStatus = user.permissions.includes('*');
+    const duplicates = rows.map(({ ownerId, status, ...rest }) => ({
+      ...rest,
+      ...(ownerId === user.id || canSeeStatus ? { status } : {}),
+    }));
     return { duplicates };
   }
 
   async updateVenue(user: AuthUser, venueId: string, dto: UpdateVenueDto) {
-    await this.assertVenue(user, venueId);
+    const scoped = await this.assertVenue(user, venueId);
     if (!user.permissions.includes('venues.manage')) {
       throw new ForbiddenException('Only the owner can edit venue settings');
+    }
+    // venues.manage is not an owner proxy: a staffer holding the key
+    // (or an owner staffing another arena) must not edit someone
+    // else's venue. Identity edits are owner-only, by ownership.
+    if (scoped.ownerId !== user.id) {
+      throw new ForbiddenException('Only the venue owner can edit venue settings');
     }
     // Identity edits on a LIVE venue go back through approval: approvals
     // guard what a venue claims to be, so a name/address/city/pin change
@@ -317,6 +367,11 @@ export class OwnerService {
     const venue = await this.assertVenue(user, venueId);
     if (!user.permissions.includes('venues.manage')) {
       throw new ForbiddenException('Only the owner can submit a venue');
+    }
+    // Same owner-proxy fix as updateVenue: venues.manage alone must
+    // not let a staffer submit another owner's venue.
+    if (venue.ownerId !== user.id) {
+      throw new ForbiddenException('Only the venue owner can submit a venue');
     }
     // Only a draft or a rejected venue can (re-)enter the queue: a live
     // venue must not delist itself by accident, and a suspended or
@@ -591,6 +646,24 @@ export class OwnerService {
     await this.assertVenue(user, court.venueId);
     if (dto.name !== undefined && dto.name !== court.name) {
       await this.assertCourtNameFree(court.venueId, dto.name, courtId);
+    }
+    // Deactivation refuses upcoming bookings, like archiveVenue:
+    // switching a court off with games still booked would strand
+    // players who paid for a slot that no longer exists. (The panel
+    // warns before save; the API is the enforcement.)
+    if (dto.isActive === false && court.isActive) {
+      const upcoming = await this.prisma.booking.count({
+        where: {
+          courtId,
+          date: { gte: startOfToday() },
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        },
+      });
+      if (upcoming > 0) {
+        throw new ConflictException(
+          `${upcoming} upcoming booking(s) still sit on this court — move or cancel them first`,
+        );
+      }
     }
     const data = { ...dto };
     if (data.openMinutes != null || data.closeMinutes != null) {
@@ -1213,6 +1286,18 @@ export class OwnerService {
     if (req.booking.status !== BookingStatus.confirmed) {
       throw new BadRequestException('Only confirmed bookings can be rescheduled');
     }
+    // The ORIGINAL slot is re-checked too: a booking that already
+    // started (or was checked in) must not be moved — moving it would
+    // rewrite a game already in play. Like every other failure here,
+    // this auto-rejects the request.
+    const now = new Date();
+    const origStarted =
+      req.booking.date < startOfToday() ||
+      (isSameDay(req.booking.date, now) &&
+        req.booking.startMinutes <= minutesSinceMidnight(now));
+    if (origStarted || req.booking.checkedInAt) {
+      throw new BadRequestException('The original slot has already started and cannot be moved');
+    }
     // Re-run the booking choke point + venue-actionable gates.
     const court = await this.courtsSvc.getActiveCourt(req.booking.courtId);
     await this.assertVenueActionable(req.booking.venueId);
@@ -1257,10 +1342,13 @@ export class OwnerService {
     // Re-validate any promo the booking carries (expiry, venue scope,
     // per-user limit). The per-user count excludes this booking's own
     // redemption — otherwise a perUserLimit of 1 would always fail its
-    // own booking.
-    let discount = Number(req.booking.discountAmount ?? 0);
+    // own booking. The promo row itself is returned so the accept path
+    // can RECOMPUTE the discount from its kind against the new gross
+    // — carrying the old flat amount forward silently re-priced
+    // percent promos as flat ones.
+    let promo: PromoCode | null = null;
     if (req.booking.promoCodeId) {
-      const promo = await this.prisma.promoCode.findUnique({
+      promo = await this.prisma.promoCode.findUnique({
         where: { id: req.booking.promoCodeId },
       });
       if (!promo || !promo.isActive) {
@@ -1286,7 +1374,7 @@ export class OwnerService {
         }
       }
     }
-    return { court, startMinutes, endMinutes, discount };
+    return { court, startMinutes, endMinutes, promo };
   }
 
   async acceptReschedule(user: AuthUser, requestId: string) {
@@ -1296,7 +1384,7 @@ export class OwnerService {
     });
     if (!req) throw new NotFoundException('Request not found');
     if (req.status !== 'pending') throw new BadRequestException('Request already decided');
-    await this.assertVenue(user, req.booking.venueId);
+    const venue = await this.assertVenue(user, req.booking.venueId);
 
     // Any accept-time validation failure auto-rejects the request with
     // the reason, instead of leaving it pending forever (which would
@@ -1306,7 +1394,7 @@ export class OwnerService {
       court: Awaited<ReturnType<CourtsService['getActiveCourt']>>;
       startMinutes: number;
       endMinutes: number;
-      discount: number;
+      promo: PromoCode | null;
     };
     try {
       validated = await this.validateRescheduleAccept(req);
@@ -1321,17 +1409,26 @@ export class OwnerService {
           where: { id: requestId, status: 'pending' },
           data: { status: 'rejected', reason: err.message, decidedAt: new Date() },
         });
+        // An auto-reject is still a decision the player must hear
+        // about — otherwise they keep waiting on a dead request.
+        if (req.booking.userId) {
+          await this.notifications
+            .pushToUser(req.booking.userId, {
+              title: 'Reschedule declined',
+              body: `Your reschedule request at ${venue.name} could not be honoured: ${err.message}`,
+              data: { type: 'reschedule_decision' },
+            })
+            .catch(() => {});
+        }
       }
       throw err;
     }
     const { court, startMinutes, endMinutes } = validated;
 
     // Re-price at the new slot with the same per-slot engine as booking
-    // creation (peak/off-peak windows on the requested date), keeping
-    // any promo discount the player already had, capped at the new
-    // gross so the total can never go negative. Without this the moved
-    // booking kept its old price — an off-peak booking could move into
-    // peak hours, or a longer duration, for free.
+    // creation (peak/off-peak windows on the requested date). Without
+    // this the moved booking kept its old price — an off-peak booking
+    // could move into peak hours, or a longer duration, for free.
     const priceWindows = await this.courtsSvc.priceWindowsForDate(
       court.id,
       req.requestedDate,
@@ -1346,7 +1443,24 @@ export class OwnerService {
     // Same 2dp rounding as booking creation — fractional paisa must
     // never reach a stored total.
     gross = Math.round(gross * 100) / 100;
-    const discount = Math.min(validated.discount, gross);
+    // Recompute the discount from the promo KIND against the new gross
+    // (percent × new gross, capped by maxDiscount; flat at most its
+    // value, also capped by maxDiscount), then cap at the new gross so
+    // the total can never go negative.
+    let discount = 0;
+    const promo = validated.promo;
+    if (promo) {
+      if (promo.kind === 'percent') {
+        discount = (gross * Number(promo.value)) / 100;
+      } else {
+        discount = Number(promo.value);
+      }
+      if (promo.maxDiscount != null) {
+        discount = Math.min(discount, Number(promo.maxDiscount));
+      }
+      discount = Math.round(discount * 100) / 100;
+    }
+    discount = Math.min(discount, gross);
     const newTotal = Math.max(0, gross - discount);
 
     const [booking] = await this.prisma.$transaction([
@@ -1424,6 +1538,13 @@ export class OwnerService {
           .catch(() => {});
       }
     }
+    // The requesting player hears the decision itself, not just the
+    // squad chatter — accept and reject were both silent before.
+    if (req.booking.userId) {
+      await this.notifications
+        .notifyRescheduleDecision(req.booking.userId, true, venue.name)
+        .catch(() => {});
+    }
     return booking;
   }
 
@@ -1434,11 +1555,17 @@ export class OwnerService {
     });
     if (!req) throw new NotFoundException('Request not found');
     if (req.status !== 'pending') throw new BadRequestException('Request already decided');
-    await this.assertVenue(user, req.booking.venueId);
-    return this.prisma.rescheduleRequest.update({
+    const venue = await this.assertVenue(user, req.booking.venueId);
+    const rejected = await this.prisma.rescheduleRequest.update({
       where: { id: requestId },
       data: { status: 'rejected', reason, decidedAt: new Date() },
     });
+    if (req.booking.userId) {
+      await this.notifications
+        .notifyRescheduleDecision(req.booking.userId, false, venue.name)
+        .catch(() => {});
+    }
+    return rejected;
   }
 
   // ------------------------------------------------------------------ staff
@@ -1531,7 +1658,16 @@ export class OwnerService {
    * to the real owner.
    */
   private async resolveRoleOwnerId(user: AuthUser): Promise<string> {
-    if (user.roleName === 'owner' || user.permissions.includes('*')) return user.id;
+    // Ownership is a fact about venues, never a role NAME: a staffer
+    // whose role happens to be called 'owner' is not an owner, and a
+    // super admin ('*') owns no venues at all. A user who owns ≥1
+    // venue resolves to themselves; anyone else resolves to the single
+    // owner they serve as staff.
+    const owned = await this.prisma.venue.findMany({
+      where: { ownerId: user.id },
+      select: { id: true },
+    });
+    if (owned.length > 0) return user.id;
     const links = await this.prisma.venueStaff.findMany({
       where: { userId: user.id },
       select: { venueId: true },
@@ -1555,10 +1691,11 @@ export class OwnerService {
   /**
    * A non-owner may only grant permissions they hold themselves —
    * otherwise a manager holding only staff.manage could mint a role
-   * with full arena control and log into it.
+   * with full arena control and log into it. Owners (by actual venue
+   * ownership, not role name) and '*' pass.
    */
-  private assertCallerMayGrant(user: AuthUser, permissions: string[]) {
-    if (user.permissions.includes('*') || user.roleName === 'owner') return;
+  private assertCallerMayGrant(user: AuthUser, permissions: string[], isOwner: boolean) {
+    if (user.permissions.includes('*') || isOwner) return;
     const missing = permissions.filter((p) => !user.permissions.includes(p));
     if (missing.length > 0) {
       throw new ForbiddenException(
@@ -1570,7 +1707,7 @@ export class OwnerService {
   async createMyRole(user: AuthUser, dto: CreateMyRoleDto) {
     this.assertGrantable(dto.permissions);
     const ownerId = await this.resolveRoleOwnerId(user);
-    this.assertCallerMayGrant(user, dto.permissions);
+    this.assertCallerMayGrant(user, dto.permissions, ownerId === user.id);
     const name = dto.name.trim();
     if (!name) throw new BadRequestException('Role name is required');
     const clash = await this.prisma.role.findFirst({
@@ -1629,7 +1766,7 @@ export class OwnerService {
     // staff must not fail on keys the role already holds.
     if (dto.permissions) {
       this.assertGrantable(dto.permissions);
-      this.assertCallerMayGrant(user, dto.permissions);
+      this.assertCallerMayGrant(user, dto.permissions, ownerId === user.id);
     }
     if (dto.name && dto.name.trim().toLowerCase() !== role.name.toLowerCase()) {
       const clash = await this.prisma.role.findFirst({
@@ -1855,13 +1992,25 @@ export class OwnerService {
     if (exists) {
       // Re-hiring someone who was removed: their account was suspended
       // when the last venue link went away — revive it in place rather
-      // than dead-ending on 'email already registered'.
+      // than dead-ending on 'email already registered'. Revival is
+      // ONLY for ex-staff: a suspended OWNER or PLAYER must never be
+      // revived through this path — an admin suspension is not an
+      // owner decision to undo, and the old check (any suspended
+      // arena-scope account with no links) reactivated suspended
+      // owners outright. A platform role (owner/player) or any venues
+      // owned therefore blocks revival.
+      const ownedCount = await this.prisma.venue.count({
+        where: { ownerId: exists.id },
+      });
       const linkCount = await this.prisma.venueStaff.count({
         where: { userId: exists.id },
       });
       if (
         exists.status === 'suspended' &&
         exists.role.scope === 'arena' &&
+        exists.role.name !== 'owner' &&
+        exists.role.name !== 'player' &&
+        ownedCount === 0 &&
         linkCount === 0
       ) {
         const passwordHash = await bcrypt.hash(dto.password, 10);
@@ -1915,7 +2064,12 @@ export class OwnerService {
    * are revoked — exactly like changePassword. Audited.
    */
   async resetStaffPassword(user: AuthUser, staffId: string, newPassword: string) {
-    if (user.roleName !== 'owner') {
+    // Owner by actual venue ownership, never by role name: a staffer
+    // whose role happens to be called 'owner' is not an owner. (The
+    // link check below enforces the same fact per-venue; this gate
+    // fails fast with the right error.)
+    const owned = await this.prisma.venue.count({ where: { ownerId: user.id } });
+    if (owned === 0) {
       throw new ForbiddenException('Only the venue owner can reset a team member password');
     }
     const target = await this.prisma.user.findUnique({
@@ -1976,6 +2130,24 @@ export class OwnerService {
         await this.prisma.refreshSession.deleteMany({
           where: { userId: link.userId },
         });
+        // A suspension the member never hears about looks like a
+        // broken login — push and audit it like any other suspension.
+        await this.notifications
+          .pushToUser(link.userId, {
+            title: 'Team access removed',
+            body: 'You were removed from your last arena team, so your account is suspended. An arena owner can re-add you at any time.',
+            data: { type: 'staff_removed' },
+          })
+          .catch(() => {});
+        await this.prisma.auditLog.create({
+          data: {
+            actorId: user.id,
+            action: 'staff.suspended',
+            entity: 'user',
+            entityId: link.userId,
+            details: 'Last venue link removed — account suspended',
+          },
+        });
       }
     }
     return deleted;
@@ -2035,7 +2207,15 @@ export class OwnerService {
   // ---------------------------------------------------------------- reviews
   /** Plan + billing state for every venue the user operates. */
   async billing(user: AuthUser) {
-    const ids = await this.venueIds(user);
+    // Billing is money: only owned venues, plus linked venues when the
+    // caller holds billing.view. A staffer with no money-visible venue
+    // gets a clean denial instead of an empty page that looks broken.
+    const ids = await this.moneyVenueIds(user);
+    if (ids.length === 0) {
+      throw new ForbiddenException(
+        'Billing is only visible to venue owners and team members with billing access',
+      );
+    }
     const venues = await this.prisma.venue.findMany({
       where: { id: { in: ids } },
       include: { plan: true },

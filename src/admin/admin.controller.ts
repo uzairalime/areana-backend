@@ -246,6 +246,7 @@ export class AdminController {
   @RequirePerm('venues.onboard')
   @Get('venues')
   listVenuesAdmin(
+    @CurrentUser() u: AuthUser,
     @Query('sort') sort?: string,
     @Query('range') range?: string,
     @Query('status') status?: string,
@@ -257,6 +258,9 @@ export class AdminController {
       status,
       page: query?.page,
       limit: query?.limit,
+      // Delegated operators see operations, not owner contact,
+      // billing state, or money figures.
+      stripSensitive: !u.permissions.includes('*'),
     });
   }
 
@@ -272,22 +276,30 @@ export class AdminController {
   @ApiTags('admin · venues')
   @Get('venues/:id/series')
   venueSeries(
+    @CurrentUser() u: AuthUser,
     @Param('id') id: string,
     @Query('days') days?: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
   ) {
-    return this.admin.venueSeries(id, days ? parseInt(days, 10) : 30, {
-      from,
-      to,
-    });
+    return this.admin.venueSeries(
+      id,
+      days ? parseInt(days, 10) : 30,
+      {
+        from,
+        to,
+      },
+      !u.permissions.includes('*'),
+    );
   }
 
   @ApiTags('admin · venues')
   @RequirePerm('venues.onboard')
   @Get('venues/:id')
-  venueDetailAdmin(@Param('id') id: string) {
-    return this.admin.venueDetailAdmin(id);
+  venueDetailAdmin(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.admin.venueDetailAdmin(id, {
+      stripSensitive: !u.permissions.includes('*'),
+    });
   }
 
   @ApiTags('admin · venues')
@@ -326,11 +338,12 @@ export class AdminController {
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(FileInterceptor('image'))
   addVenueImage(
+    @CurrentUser() u: AuthUser,
     @Param('id') id: string,
     @UploadedFile() file: Express.Multer.File,
     @Body('sport') sport?: string,
   ) {
-    return this.admin.addVenueImage(id, file, sport);
+    return this.admin.addVenueImage(id, file, sport, u);
   }
 
   @ApiTags('admin · venues')
@@ -346,22 +359,27 @@ export class AdminController {
   @RequirePerm('venues.onboard')
   @Get('venues/onboard/check')
   onboardCheck(
+    @CurrentUser() u: AuthUser,
     @Query('phone') phone?: string,
     @Query('name') name?: string,
     @Query('city') city?: string,
   ) {
-    return this.admin.onboardDuplicateCheck({ phone, name, city });
+    return this.admin.onboardDuplicateCheck(
+      { phone, name, city },
+      !u.permissions.includes('*'),
+    );
   }
 
   @ApiTags('admin · venues')
   @RequirePerm('venues.onboard')
   @Patch('venues/:id/images/tag')
   tagVenueImage(
+    @CurrentUser() u: AuthUser,
     @Param('id') id: string,
     @Body('url') url: string,
     @Body('sport') sport: string | null,
   ) {
-    return this.admin.tagVenueImage(id, url, sport ?? null);
+    return this.admin.tagVenueImage(id, url, sport ?? null, u);
   }
 
   @ApiTags('admin · venues')
@@ -399,8 +417,8 @@ export class AdminController {
   @ApiTags('admin · venues')
   @RequirePerm('venues.onboard')
   @Delete('venues/:id/images')
-  removeVenueImage(@Param('id') id: string, @Body('url') url: string) {
-    return this.admin.removeVenueImage(id, url);
+  removeVenueImage(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body('url') url: string) {
+    return this.admin.removeVenueImage(id, url, u);
   }
 
   @ApiTags('admin · venues')
@@ -460,8 +478,8 @@ export class AdminController {
   // ------------------------------------------------------------------ promos
   @ApiTags('admin · promos')
   @Get('promos')
-  listPromos(@Query() query: CursorQueryDto) {
-    return this.admin.listPromos(query.cursor, query.limit);
+  listPromos(@Query() query: CursorQueryDto, @Query('q') q?: string) {
+    return this.admin.listPromos(query.cursor, query.limit, q);
   }
 
   @ApiTags('admin · promos')
