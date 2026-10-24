@@ -25,6 +25,23 @@ export function parseDateOnly(s: string): Date {
   return date;
 }
 
+/**
+ * Month arithmetic clamped to the target month's last day: raw
+ * setMonth() overflows (31 Jan + 3 months lands on 1 May, not 30 Apr).
+ * ONE shared implementation — plans billing and the courts/booking-gate
+ * path used to carry separate copies, one clamped and one not, so a 31
+ * Jan approval billed to 30 Apr while the booking gate said 1 May.
+ */
+export function addMonths(d: Date, months: number): Date {
+  const day = d.getDate();
+  const out = new Date(d);
+  out.setDate(1);
+  out.setMonth(out.getMonth() + months);
+  const last = new Date(out.getFullYear(), out.getMonth() + 1, 0).getDate();
+  out.setDate(Math.min(day, last));
+  return out;
+}
+
 export function startOfToday(): Date {
   const n = new Date();
   return new Date(n.getFullYear(), n.getMonth(), n.getDate());

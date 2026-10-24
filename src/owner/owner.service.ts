@@ -204,31 +204,38 @@ export class OwnerService {
   }
 
   async createVenue(user: AuthUser, dto: CreateVenueDto) {
-    const limit = await this.plans.venueLimitForOwner(user.id);
-    if (limit !== null) {
-      const count = await this.prisma.venue.count({ where: { ownerId: user.id } });
-      if (count >= limit) {
-        throw new ForbiddenException(
-          `Your plan allows ${limit} venue(s). Ask Areana about upgrading to add more.`,
-        );
-      }
-    }
     assertPakistanCoords(dto.lat, dto.lng);
     const sports = await this.sports.normalizeSports(dto.sports ?? []);
     const amenities = await this.amenities.normalizeAmenities(dto.amenities ?? []);
-    const venue = await this.prisma.venue.create({
-      data: {
-        ownerId: user.id,
-        name: dto.name,
-        address: dto.address,
-        city: dto.city,
-        phone: dto.phone,
-        lat: dto.lat,
-        lng: dto.lng,
-        sports,
-        amenities,
-        status: VenueStatus.draft,
-      },
+    // Count check + create under a per-owner advisory lock: there is
+    // no venue row to lock before creation, so the owner-scoped lock
+    // is the equivalent serialization — two tabs double-submitting at
+    // limit−1 used to both pass the count and land over cap.
+    const limit = await this.plans.venueLimitForOwner(user.id);
+    const venue = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${user.id}))`;
+      if (limit !== null) {
+        const count = await tx.venue.count({ where: { ownerId: user.id } });
+        if (count >= limit) {
+          throw new ForbiddenException(
+            `Your plan allows ${limit} venue(s). Ask Areana about upgrading to add more.`,
+          );
+        }
+      }
+      return tx.venue.create({
+        data: {
+          ownerId: user.id,
+          name: dto.name,
+          address: dto.address,
+          city: dto.city,
+          phone: dto.phone,
+          lat: dto.lat,
+          lng: dto.lng,
+          sports,
+          amenities,
+          status: VenueStatus.draft,
+        },
+      });
     });
     // Default staff roles: platform arena roles only. Owner-created
     // roles belong to their own owner — attaching them here would let
@@ -412,30 +419,74 @@ export class OwnerService {
   }
 
   async addVenueImage(user: AuthUser, venueId: string, file: Express.Multer.File, sport?: string) {
-    const venue = await this.assertVenue(user, venueId);
+    await this.assertVenue(user, venueId);
     const photo = await this.storage.saveVenueImage(venueId, file);
-    const entries = [
-      ...this.photoEntries(venue),
-      { ...photo, sport: sport && sport.trim() ? sport.trim() : undefined },
-    ];
-    return this.prisma.venue.update({
-      where: { id: venueId },
-      data: { images: entries.map((e) => e.url), photos: entries },
+    // Photo arrays are read-modify-write: two concurrent uploads used
+    // to both read the same array and each write back only their own
+    // photo, losing the other. The venue row lock serializes them.
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+      const fresh = await tx.venue.findUniqueOrThrow({ where: { id: venueId } });
+      const entries = [
+        ...photoEntriesOf(fresh),
+        { ...photo, sport: sport && sport.trim() ? sport.trim() : undefined },
+      ];
+      return tx.venue.update({
+        where: { id: venueId },
+        data: { images: entries.map((e) => e.url), photos: entries },
+      });
     });
   }
 
   /** Tag (or untag) one photo with a sport — every sport a venue offers
    * needs at least one tagged photo before the venue can go live. */
   async tagVenueImage(user: AuthUser, venueId: string, url: string, sport: string | null) {
-    const venue = await this.assertVenue(user, venueId);
-    const entries = withSportTag(this.photoEntries(venue), url, sport);
-    await this.prisma.venue.update({
-      where: { id: venueId },
-      data: { photos: entries },
+    await this.assertVenue(user, venueId);
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+      const fresh = await tx.venue.findUniqueOrThrow({ where: { id: venueId } });
+      const entries = withSportTag(photoEntriesOf(fresh), url, sport);
+      await tx.venue.update({
+        where: { id: venueId },
+        data: { photos: entries },
+      });
     });
     // Untagging can break the per-sport photo rule for an approved venue.
     await this.dropVenueIfUnready(venueId);
     return this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
+  }
+
+  /**
+   * "Upcoming" for the archive guard means the slot's END instant is
+   * still in the future — not merely "date is today or later". The old
+   * date-only count blocked archiving over a booking already played
+   * earlier today, and missed yesterday's overnight booking still in
+   * play past midnight (endMinutes > 1440 on yesterday's date).
+   */
+  private async upcomingBookingCount(
+    venueId: string,
+    tx?: Prisma.TransactionClient,
+  ): Promise<number> {
+    const db = tx ?? this.prisma;
+    const yesterday = startOfToday();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const candidates = await db.booking.findMany({
+      where: {
+        venueId,
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        date: { gte: yesterday },
+      },
+      select: { date: true, endMinutes: true },
+    });
+    const now = Date.now();
+    return candidates.filter((b) => {
+      const dayStart = new Date(
+        b.date.getFullYear(),
+        b.date.getMonth(),
+        b.date.getDate(),
+      );
+      return dayStart.getTime() + b.endMinutes * 60_000 > now;
+    }).length;
   }
 
   /** Retire a venue: hidden from players everywhere, history kept. */
@@ -443,13 +494,7 @@ export class OwnerService {
     const venue = await this.assertVenue(user, venueId);
     // Archiving hides the arena everywhere at once — it must not strand
     // players holding live bookings (same policy as court delete).
-    const upcoming = await this.prisma.booking.count({
-      where: {
-        venueId,
-        status: { in: ['pending', 'confirmed'] },
-        date: { gte: startOfToday() },
-      },
-    });
+    const upcoming = await this.upcomingBookingCount(venueId);
     if (upcoming > 0) {
       throw new ConflictException(
         `This arena has ${upcoming} upcoming booking(s) — cancel or complete them before archiving`,
@@ -462,13 +507,7 @@ export class OwnerService {
     return this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venue.id} FOR UPDATE`;
       await tx.$queryRaw`SELECT id FROM "Court" WHERE "venueId" = ${venue.id} FOR UPDATE`;
-      const upcomingNow = await tx.booking.count({
-        where: {
-          venueId,
-          status: { in: ['pending', 'confirmed'] },
-          date: { gte: startOfToday() },
-        },
-      });
+      const upcomingNow = await this.upcomingBookingCount(venueId, tx);
       if (upcomingNow > 0) {
         throw new ConflictException(
           `This arena has ${upcomingNow} upcoming booking(s) — cancel or complete them before archiving`,
@@ -547,12 +586,16 @@ export class OwnerService {
   }
 
   async removeVenueImage(user: AuthUser, venueId: string, url: string) {
-    const venue = await this.assertVenue(user, venueId);
+    await this.assertVenue(user, venueId);
     await this.storage.deleteImage(url);
-    const entries = this.photoEntries(venue).filter((e) => e.url !== url);
-    await this.prisma.venue.update({
-      where: { id: venueId },
-      data: { images: entries.map((e) => e.url), photos: entries },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+      const fresh = await tx.venue.findUniqueOrThrow({ where: { id: venueId } });
+      const entries = photoEntriesOf(fresh).filter((e) => e.url !== url);
+      await tx.venue.update({
+        where: { id: venueId },
+        data: { images: entries.map((e) => e.url), photos: entries },
+      });
     });
     // Removing a photo can drop an approved venue below 4 photos or
     // remove the only tagged photo for a sport.
@@ -562,20 +605,27 @@ export class OwnerService {
 
   /** Reorder a venue's photos (the first photo is the cover everywhere). */
   async reorderVenueImages(user: AuthUser, venueId: string, urls: string[]) {
-    const venue = await this.assertVenue(user, venueId);
-    const entries = this.photoEntries(venue);
-    const current = entries.map((e) => e.url);
-    const sameSet =
-      urls.length === current.length &&
-      [...urls].sort().join('|') === [...current].sort().join('|');
-    if (!sameSet) {
-      throw new BadRequestException('Photo order must contain exactly the current photos');
-    }
-    const byUrl = new Map(entries.map((e) => [e.url, e]));
-    const ordered = urls.map((u) => byUrl.get(u) as { url: string });
-    return this.prisma.venue.update({
-      where: { id: venueId },
-      data: { images: urls, photos: ordered },
+    await this.assertVenue(user, venueId);
+    // Same venue-row-lock pattern as the other photo writes: the
+    // same-set guard must run against fresh state, or a concurrent
+    // upload's photo is silently dropped from the order.
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+      const fresh = await tx.venue.findUniqueOrThrow({ where: { id: venueId } });
+      const entries = photoEntriesOf(fresh);
+      const current = entries.map((e) => e.url);
+      const sameSet =
+        urls.length === current.length &&
+        [...urls].sort().join('|') === [...current].sort().join('|');
+      if (!sameSet) {
+        throw new BadRequestException('Photo order must contain exactly the current photos');
+      }
+      const byUrl = new Map(entries.map((e) => [e.url, e]));
+      const ordered = urls.map((u) => byUrl.get(u) as { url: string });
+      return tx.venue.update({
+        where: { id: venueId },
+        data: { images: urls, photos: ordered },
+      });
     });
   }
 
@@ -619,6 +669,23 @@ export class OwnerService {
     // admin set, or whose court was deactivated) must not silently vanish
     // because a court was added or edited.
     const sports = [...new Set([...(venue?.sports ?? []), ...courts.map((c) => c.sport)])];
+    await this.prisma.venue.update({ where: { id: venueId }, data: { sports } });
+  }
+
+  /**
+   * Recompute (not union) venue sports from the courts still active.
+   * Used ONLY on court delete/deactivate: the union above would leave
+   * a deleted court's sport listed forever, so players filter by it,
+   * find the venue, and find no such court. Admin-set sports with no
+   * court are dropped here too — a listed sport with no court to play
+   * it on is a dead filter either way.
+   */
+  private async recomputeVenueSports(venueId: string) {
+    const courts = await this.prisma.court.findMany({
+      where: { venueId, isActive: true },
+      select: { sport: true },
+    });
+    const sports = [...new Set(courts.map((c) => c.sport))];
     await this.prisma.venue.update({ where: { id: venueId }, data: { sports } });
   }
 
@@ -764,7 +831,16 @@ export class OwnerService {
             where: { id: courtId },
             data: requeue ? { ...data, status: 'pending', rejectionReason: null } : data,
           });
-    await this.syncVenueSports(court.venueId);
+    if (dto.isActive === false && court.isActive) {
+      // Deactivating the last active court must not leave a billing-
+      // accruing, admin-visible, player-invisible zombie: drop sports
+      // with no court left, and drop an approved venue that no longer
+      // meets the go-live checklist back to pending.
+      await this.recomputeVenueSports(court.venueId);
+      await this.dropVenueIfUnready(court.venueId);
+    } else {
+      await this.syncVenueSports(court.venueId);
+    }
     return updated;
   }
 
@@ -952,6 +1028,19 @@ export class OwnerService {
    */
   async setWeeklyHours(user: AuthUser, courtId: string, dto: SetWeeklyHoursDto) {
     const court = await this.assertCourt(user, courtId);
+    // Duplicate weekday entries bypassed the overlap/conflict checks:
+    // validation ran within each day entry only, and the conflict scan
+    // used dto.days.find(...) (first entry wins), so two Tuesday
+    // entries with overlapping windows both saved.
+    const seenWeekdays = new Set<number>();
+    for (const d of dto.days) {
+      if (seenWeekdays.has(d.weekday)) {
+        throw new BadRequestException(
+          `Duplicate entry for weekday ${d.weekday} — merge the windows into one entry`,
+        );
+      }
+      seenWeekdays.add(d.weekday);
+    }
     // Split shifts (more than one window in a day) are a plan feature.
     if (dto.days.some((d) => d.windows.length > 1)) {
       await this.plans.requireFeature(court.venueId, 'advanced_availability');
@@ -1273,10 +1362,18 @@ export class OwnerService {
       guestName: dto.guestName,
       skipWindowCheck: true, // the guest is physically at the venue
     });
-    // Walk-ins skip approval — confirmed immediately, then marked checked-in.
+    // Walk-ins skip approval — confirmed immediately. The checked-in
+    // stamp applies ONLY when the slot is today: a walk-in entered for
+    // a future date used to be stamped checked-in weeks early, so the
+    // real check-in on arrival day failed ("already checked in") and
+    // attendance showed a check-in before the game existed.
+    const isToday = isSameDay(slotDate, now);
     await this.prisma.booking.update({
       where: { id: booking.id },
-      data: { status: BookingStatus.confirmed, checkedInAt: new Date() },
+      data: {
+        status: BookingStatus.confirmed,
+        ...(isToday ? { checkedInAt: new Date() } : {}),
+      },
     });
     return this.prisma.booking.findUnique({ where: { id: booking.id } });
   }
@@ -1492,7 +1589,8 @@ export class OwnerService {
     // creation (peak/off-peak windows on the requested date). Without
     // this the moved booking kept its old price — an off-peak booking
     // could move into peak hours, or a longer duration, for free.
-    const priceWindows = await this.courtsSvc.priceWindowsForDate(
+    // Post-midnight slots price from the morning's weekday windows.
+    const priceWindows = await this.courtsSvc.priceWindowsForDateRange(
       court.id,
       req.requestedDate,
     );
@@ -1500,7 +1598,7 @@ export class OwnerService {
     let gross = 0;
     for (let s = startMinutes; s < endMinutes; s += court.slotMinutes) {
       gross +=
-        this.courtsSvc.priceRateForSlot(priceWindows, baseRate, s) *
+        this.courtsSvc.rateForSlotPair(priceWindows, baseRate, s) *
         (court.slotMinutes / 60);
     }
     // Same 2dp rounding as booking creation — fractional paisa must
@@ -1965,6 +2063,22 @@ export class OwnerService {
     if (dto.kind === 'flat' && dto.value < 1) {
       throw new BadRequestException('Flat promo value must be at least Rs 1');
     }
+    // A maxDiscount of 0 caps every discount at Rs 0 — a promo that
+    // gives nothing but still burns the redemption. Omit it for no cap.
+    if (dto.maxDiscount === 0) {
+      throw new BadRequestException('maxDiscount of 0 would make the promo give nothing — omit it for no cap');
+    }
+    // A per-user limit above maxUses can never bind (or lets one user
+    // drain a multi-player promo when maxUses is the smaller number).
+    if (
+      dto.maxUses != null &&
+      dto.perUserLimit != null &&
+      dto.perUserLimit > dto.maxUses
+    ) {
+      throw new BadRequestException(
+        `perUserLimit (${dto.perUserLimit}) cannot exceed maxUses (${dto.maxUses})`,
+      );
+    }
     const exists = await this.prisma.promoCode.findUnique({ where: { code } });
     if (exists) throw new ConflictException('This code is already in use');
     const validTo = new Date(dto.validTo);
@@ -2032,6 +2146,16 @@ export class OwnerService {
     }
     if (dto.value !== undefined && existing.kind === 'flat' && dto.value < 1) {
       throw new BadRequestException('Flat promo value must be at least Rs 1');
+    }
+    if (dto.maxDiscount === 0) {
+      throw new BadRequestException('maxDiscount of 0 would make the promo give nothing — omit it for no cap');
+    }
+    const effMaxUses = dto.maxUses ?? existing.maxUses;
+    const effPerUser = dto.perUserLimit ?? existing.perUserLimit;
+    if (effMaxUses != null && effPerUser > effMaxUses) {
+      throw new BadRequestException(
+        `perUserLimit (${effPerUser}) cannot exceed maxUses (${effMaxUses})`,
+      );
     }
     const validFrom = dto.validFrom ? new Date(dto.validFrom) : undefined;
     const validTo = dto.validTo ? new Date(dto.validTo) : undefined;

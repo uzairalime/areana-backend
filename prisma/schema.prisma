@@ -41,7 +41,10 @@ model Role {
   id          String    @id @default(cuid())
   // No longer globally unique: an owner-created role only needs a unique
   // name within that owner's roles (@@unique below); system role names
-  // are kept unique in code.
+  // are kept unique by the partial index in migration
+  // 20261025034800_system_role_name_unique (name WHERE ownerId IS NULL)
+  // plus the createRole pre-check + P2002 mapping — Postgres treats
+  // NULLs as distinct in @@unique, so the index is the real backstop.
   name        String
   scope       RoleScope @default(arena)
   description String?

@@ -562,6 +562,16 @@ export class AdminController {
     return this.admin.markVenuePaid(u.id, id, body);
   }
 
+  @ApiTags('admin · plans')
+  @Post('venues/:id/billing/:paymentId/void')
+  voidVenuePayment(
+    @CurrentUser() u: AuthUser,
+    @Param('id') id: string,
+    @Param('paymentId') paymentId: string,
+  ) {
+    return this.admin.voidVenuePayment(u.id, id, paymentId);
+  }
+
   // ------------------------------------------------------------------ badges
   @ApiTags('admin · badges')
   @Get('badges')

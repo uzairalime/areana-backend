@@ -6,10 +6,20 @@ import {
 } from '@nestjs/common';
 import { Prisma, Venue } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
+import { addMonths } from '../common/date.util';
 import { NotificationsService } from '../notifications/notifications.service';
 import { BookingsService } from '../bookings/bookings.service';
 
 const PAYMENT_METHODS = ['bank', 'raast', 'cash', 'other'];
+
+/**
+ * Transaction-scoped advisory lock key serializing plan writes
+ * (create/update/delete). Two concurrent plan writes used to lose each
+ * other — lost free months, two coexisting defaults with a
+ * nondeterministic findFirst. pg_advisory_xact_lock is released at
+ * transaction end, so every plan write takes it first.
+ */
+const PLAN_WRITE_LOCK = 727001;
 
 /**
  * Subscription plans + venue billing.
@@ -49,17 +59,9 @@ export interface BillingSummary {
   graceEndsAt: string | null;
 }
 
-function addMonths(d: Date, months: number): Date {
-  // Clamp to the target month's last day: raw setMonth() overflows
-  // (31 Jan + 3 months landed on 1 May, not 30 Apr).
-  const day = d.getDate();
-  const out = new Date(d);
-  out.setDate(1);
-  out.setMonth(out.getMonth() + months);
-  const last = new Date(out.getFullYear(), out.getMonth() + 1, 0).getDate();
-  out.setDate(Math.min(day, last));
-  return out;
-}
+// Shared month arithmetic lives in common/date.util — plans billing
+// and the courts/booking-gate path must agree to the day, and separate
+// copies once diverged by ~10.5h on month-end approvals.
 
 @Injectable()
 export class PlansService {
@@ -91,6 +93,7 @@ export class PlansService {
   }) {
     this.assertFeatures(dto.features ?? []);
     const plan = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(${PLAN_WRITE_LOCK})`;
       // The first plan must be the default: with no default, venues
       // approve with billing running but no plan and no gates. An
       // explicit isDefault=false is overridden only when no default
@@ -100,13 +103,18 @@ export class PlansService {
       if (makeDefault) {
         await tx.plan.updateMany({ data: { isDefault: false } });
       }
+      // A maxVenues of 0 locks out every new owner (0 venues >= 0
+      // limit blocks the first venue) — 0 is not a meaningful cap
+      // here, so it floors to 1. (maxStaff 0 stays valid: Basic's
+      // "no staff" is a real tier, unlike a venue cap of zero.)
+      const maxVenues = dto.maxVenues === 0 ? 1 : (dto.maxVenues ?? null);
       return tx.plan.create({
         data: {
           name: dto.name.trim(),
           priceYearly: Math.round(dto.priceYearly),
           freeMonths: dto.freeMonths ?? 3,
           features: dto.features ?? [],
-          maxVenues: dto.maxVenues ?? null,
+          maxVenues,
           maxCourts: dto.maxCourts ?? null,
           maxStaff: dto.maxStaff ?? null,
           isDefault: makeDefault,
@@ -133,22 +141,34 @@ export class PlansService {
     const existing = await this.prisma.plan.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Plan not found');
     if (dto.features) this.assertFeatures(dto.features);
-    // The platform must never be left with zero default plans: venues
-    // without their own plan would silently stop being billed or paused.
-    if (dto.isDefault === false && existing.isDefault) {
-      const others = await this.prisma.plan.count({
-        where: { isDefault: true, id: { not: id } },
-      });
-      if (others === 0) {
-        throw new BadRequestException(
-          'At least one plan must stay the default — make another plan the default first',
-        );
-      }
-    }
     const plan = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(${PLAN_WRITE_LOCK})`;
+      // The platform must never be left with zero default plans: venues
+      // without their own plan would silently stop being billed or paused.
+      // The guard runs inside the locked transaction — two concurrent
+      // updates used to both pass the outside read and leave two
+      // defaults (or none) behind.
+      if (dto.isDefault === false && existing.isDefault) {
+        const others = await tx.plan.count({
+          where: { isDefault: true, id: { not: id } },
+        });
+        if (others === 0) {
+          throw new BadRequestException(
+            'At least one plan must stay the default — make another plan the default first',
+          );
+        }
+      }
       if (dto.isDefault) {
         await tx.plan.updateMany({ data: { isDefault: false } });
       }
+      // maxVenues 0 floors to 1 (see createPlan) — a zero venue cap
+      // locks out every new owner.
+      const maxVenues =
+        dto.maxVenues === undefined
+          ? undefined
+          : dto.maxVenues === 0
+            ? 1
+            : dto.maxVenues;
       return tx.plan.update({
         where: { id },
         data: {
@@ -158,7 +178,7 @@ export class PlansService {
             : {}),
           ...(dto.freeMonths !== undefined ? { freeMonths: dto.freeMonths } : {}),
           ...(dto.features !== undefined ? { features: dto.features } : {}),
-          ...(dto.maxVenues !== undefined ? { maxVenues: dto.maxVenues } : {}),
+          ...(maxVenues !== undefined ? { maxVenues } : {}),
           ...(dto.maxCourts !== undefined ? { maxCourts: dto.maxCourts } : {}),
           ...(dto.maxStaff !== undefined ? { maxStaff: dto.maxStaff } : {}),
           ...(dto.isDefault !== undefined ? { isDefault: dto.isDefault } : {}),
@@ -169,34 +189,98 @@ export class PlansService {
   }
 
   async deletePlan(id: string) {
-    const plan = await this.prisma.plan.findUnique({
-      where: { id },
-      include: { _count: { select: { venues: true, payments: true } } },
+    // Guards + delete under the plan-write lock: two concurrent
+    // deletes used to both pass the "sole plan" read.
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(${PLAN_WRITE_LOCK})`;
+      const plan = await tx.plan.findUnique({
+        where: { id },
+        include: { _count: { select: { venues: true, payments: true } } },
+      });
+      if (!plan) throw new NotFoundException('Plan not found');
+      if (plan.isDefault) {
+        throw new BadRequestException('The default plan cannot be deleted — make another plan the default first');
+      }
+      // The sole plan cannot go either: deleting it leaves zero plans
+      // and no default for venues to bill against — approved venues
+      // would run with billing started but no plan and no gates.
+      const totalPlans = await tx.plan.count();
+      if (totalPlans <= 1) {
+        throw new BadRequestException('The only plan cannot be deleted — create another plan first');
+      }
+      if (plan._count.venues > 0) {
+        throw new BadRequestException(`This plan still has ${plan._count.venues} venue(s) on it — move them first`);
+      }
+      // Ledger rows reference the plan for receipt plan names (the
+      // relation is SetNull, so a delete would silently blank history).
+      // Keep the plan while any payment references it.
+      if (plan._count.payments > 0) {
+        throw new BadRequestException(
+          `This plan still has ${plan._count.payments} payment record(s) on it — it cannot be deleted while its receipts exist`,
+        );
+      }
+      await tx.plan.delete({ where: { id } });
+      return { message: 'Plan deleted' };
     });
-    if (!plan) throw new NotFoundException('Plan not found');
-    if (plan.isDefault) {
-      throw new BadRequestException('The default plan cannot be deleted — make another plan the default first');
+  }
+
+  /**
+   * Void a wrong mark-paid: a compensating reversing ledger row (negative
+   * amount, same period) plus rolling the venue's paid flag back when
+   * this payment is still the latest settlement — no schema change.
+   * The reversal is keyed by note `void:<paymentId>`, so a second void
+   * of the same payment is a clean 409, not a second reversal. Revenue
+   * sums net out (original + reversal = 0). When a LATER period was
+   * already settled, the flag is left alone — unwinding the chain
+   * would unpay a period the venue already settled — but the money is
+   * still returned on the ledger.
+   */
+  async voidPayment(venueId: string, paymentId: string, actorId?: string) {
+    const payment = await this.prisma.venuePayment.findUnique({
+      where: { id: paymentId },
+    });
+    if (!payment || payment.venueId !== venueId) {
+      throw new NotFoundException('Payment not found for this venue');
     }
-    // The sole plan cannot go either: deleting it leaves zero plans
-    // and no default for venues to bill against — approved venues
-    // would run with billing started but no plan and no gates.
-    const totalPlans = await this.prisma.plan.count();
-    if (totalPlans <= 1) {
-      throw new BadRequestException('The only plan cannot be deleted — create another plan first');
+    if (payment.method === 'void') {
+      throw new BadRequestException('This row is itself a reversal — it cannot be voided');
     }
-    if (plan._count.venues > 0) {
-      throw new BadRequestException(`This plan still has ${plan._count.venues} venue(s) on it — move them first`);
+    const already = await this.prisma.venuePayment.findFirst({
+      where: { venueId, note: `void:${paymentId}` },
+    });
+    if (already) {
+      throw new BadRequestException('This payment was already voided');
     }
-    // Ledger rows reference the plan for receipt plan names (the
-    // relation is SetNull, so a delete would silently blank history).
-    // Keep the plan while any payment references it.
-    if (plan._count.payments > 0) {
-      throw new BadRequestException(
-        `This plan still has ${plan._count.payments} payment record(s) on it — it cannot be deleted while its receipts exist`,
-      );
-    }
-    await this.prisma.plan.delete({ where: { id } });
-    return { message: 'Plan deleted' };
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue) throw new NotFoundException('Venue not found');
+    return this.prisma.$transaction(async (tx) => {
+      await tx.venuePayment.create({
+        data: {
+          venueId,
+          planId: payment.planId,
+          amount: -payment.amount,
+          method: 'void',
+          note: `void:${paymentId}`,
+          periodStart: payment.periodStart,
+          periodEnd: payment.periodEnd,
+          recordedById: actorId ?? null,
+        },
+      });
+      // Roll the paid flag back only when this payment is still the
+      // latest settlement (paidUntil within this period); otherwise a
+      // later settlement still governs and the flag stays.
+      if (
+        venue.billingPaidUntil &&
+        payment.periodEnd &&
+        venue.billingPaidUntil <= payment.periodEnd
+      ) {
+        await tx.venue.update({
+          where: { id: venueId },
+          data: { billingPaidUntil: payment.periodStart },
+        });
+      }
+      return { voided: true, paymentId, amount: payment.amount };
+    });
   }
 
   async defaultPlan() {
@@ -343,7 +427,11 @@ export class PlansService {
     }
     let amount: number | undefined;
     if (opts?.amount !== undefined) {
-      amount = Math.round(Number(opts.amount));
+      // Raw comparison, never rounded first: rounding let a typed
+      // Rs 35,999.60 pass as the Rs 36,000 period price, and the
+      // receipt then overstated what was actually paid. A non-exact
+      // amount is rejected by the equality check below.
+      amount = Number(opts.amount);
       if (!Number.isFinite(amount) || amount <= 0) {
         throw new BadRequestException('Payment amount must be a positive number');
       }

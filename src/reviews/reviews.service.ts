@@ -25,30 +25,42 @@ export class ReviewsService {
     });
     if (existing) throw new ConflictException('You already reviewed this booking');
 
-    return this.prisma.$transaction(async (tx) => {
-      const review = await tx.review.create({
-        data: {
-          venueId: booking.venueId,
-          userId,
-          bookingId: booking.id,
-          rating: dto.rating,
-          comment: dto.comment,
-        },
+    // The pre-check races a double-tap: two concurrent creates both
+    // pass it, and the second used to surface a raw P2002 500. The
+    // venue row lock also serializes the aggregate recompute — two
+    // simultaneous reviews used to both write count 11 (lost update).
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${booking.venueId} FOR UPDATE`;
+        const review = await tx.review.create({
+          data: {
+            venueId: booking.venueId,
+            userId,
+            bookingId: booking.id,
+            rating: dto.rating,
+            comment: dto.comment,
+          },
+        });
+        const agg = await tx.review.aggregate({
+          where: { venueId: booking.venueId },
+          _avg: { rating: true },
+          _count: true,
+        });
+        await tx.venue.update({
+          where: { id: booking.venueId },
+          data: {
+            rating: agg._avg.rating ?? 0,
+            ratingCount: agg._count,
+          },
+        });
+        return review;
       });
-      const agg = await tx.review.aggregate({
-        where: { venueId: booking.venueId },
-        _avg: { rating: true },
-        _count: true,
-      });
-      await tx.venue.update({
-        where: { id: booking.venueId },
-        data: {
-          rating: agg._avg.rating ?? 0,
-          ratingCount: agg._count,
-        },
-      });
-      return review;
-    });
+    } catch (e: unknown) {
+      if ((e as { code?: string })?.code === 'P2002') {
+        throw new ConflictException('You already reviewed this booking');
+      }
+      throw e;
+    }
   }
 
   async listByVenue(venueId: string, cursor?: string, rawLimit?: number) {

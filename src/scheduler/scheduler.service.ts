@@ -3,6 +3,7 @@ import { Cron } from '@nestjs/schedule';
 import { BookingStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { minutesSinceMidnight, startOfToday } from '../common/date.util';
+import { parseSettingFloat } from '../common/settings.util';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ReferralsService } from '../promos/referrals.service';
 import { PlansService } from '../plans/plans.service';
@@ -40,18 +41,18 @@ export class SchedulerService implements OnModuleInit {
   }
 
   // In-process record of reminders this instance already sent (booking
-  // id / game id → epoch ms). The catch-up pass ignores reminderSent,
-  // so without this a booking reminded by the normal pass 30 minutes
-  // ago would get a second ping in its last 30 minutes. Entries older
-  // than an hour are pruned on each use; a booking only enters the
-  // 30-minute window once per run cadence, so the window is ample.
+  // id / game id → epoch ms), a second dedupe layer behind the
+  // persisted reminderSent flag. Entries are pruned past 3 hours —
+  // the prune window must exceed the 120-minute reminder gap, or a
+  // booking reminded at T−120 loses its marker before T−30 and gets
+  // pinged twice (the old 60-minute prune did exactly that).
   private bookingRemindedAt = new Map<string, number>();
   private gameRemindedAt = new Map<string, number>();
 
   private recentlyReminded(map: Map<string, number>, id: string): boolean {
     const now = Date.now();
     for (const [k, t] of map) {
-      if (now - t > 60 * 60_000) map.delete(k);
+      if (now - t > 180 * 60_000) map.delete(k);
     }
     return map.has(id);
   }
@@ -64,7 +65,11 @@ export class SchedulerService implements OnModuleInit {
   /** Free slots whose owners never responded: pending → cancelled. */
   @Cron('*/15 * * * *', PKT)
   async expirePendingBookings() {
-    const hours = parseFloat(await this.setting('pendingExpiryHours', '2'));
+    // Validated like graceDays: a garbage value used to parse to NaN,
+    // making expiryAt NaN so pending bookings never expired. Zero is
+    // not a sane window either — it falls back to 2h like garbage.
+    const parsedHours = parseSettingFloat(await this.setting('pendingExpiryHours', '2'), 2);
+    const hours = parsedHours > 0 ? parsedHours : 2;
     // Slot-relative expiry: a pending booking expires at
     // min(slotStart, max(createdAt + pendingExpiryHours, slotStart − 24h)).
     // Creation-based expiry cancelled next-day bookings the owner had
@@ -128,15 +133,13 @@ export class SchedulerService implements OnModuleInit {
    * Remind players ~2h before their slot, plus a last-30-minutes
    * catch-up that runs on startup and every run. The catch-up covers
    * bookings the normal pass missed — accepted after the 2h window
-   * opened, or created while the scheduler was down — regardless of
-   * reminderSent (a flag set by a crashed instance must not swallow
-   * the last reminder). The normal pass claims each row atomically
-   * (updateMany where reminderSent=false): two instances racing the
-   * same row get exactly one claim, so a booking is never reminded
-   * twice from that path. The catch-up path dedupes in-process (see
-   * recentlyReminded); a second instance that never sent the reminder
-   * could still duplicate a catch-up ping — a duplicate reminder, not
-   * a duplicate charge, and the deployment runs a single instance.
+   * opened, or created while the scheduler was down. Every pass claims
+   * its rows atomically (updateMany where reminderSent=false AND the
+   * status still qualifies): two instances racing the same row get
+   * exactly one claim, a just-cancelled booking/game is never
+   * reminded, and the persisted flag — not just the in-process map —
+   * is what prevents a restart from re-pinging the window. A push
+   * failure releases the claim so a later run retries.
    */
   @Cron('*/30 * * * *', PKT)
   async sendReminders() {
@@ -145,19 +148,20 @@ export class SchedulerService implements OnModuleInit {
     const upcoming = await this.prisma.booking.findMany({
       where: {
         status: BookingStatus.confirmed,
-        date: today,
         reminderSent: false,
-        startMinutes: { gt: nowMin, lte: nowMin + 120 },
+        OR: this.reminderWindows(today, nowMin, 120, 'gt'),
       },
       include: { venue: { select: { name: true } } },
     });
     for (const b of upcoming) {
       if (!b.userId) continue;
-      // Atomic claim: the reminderSent condition inside the UPDATE
-      // means a second instance claiming the same row gets count 0
-      // and skips — the booking is reminded exactly once from here.
+      // Atomic claim: the reminderSent + status conditions inside the
+      // UPDATE mean a second instance claiming the same row gets
+      // count 0 and skips — and a booking cancelled between the query
+      // and this write is never reminded. The booking is reminded
+      // exactly once from here.
       const claimed = await this.prisma.booking.updateMany({
-        where: { id: b.id, reminderSent: false },
+        where: { id: b.id, reminderSent: false, status: BookingStatus.confirmed },
         data: { reminderSent: true },
       });
       if (claimed.count === 0) continue;
@@ -175,26 +179,41 @@ export class SchedulerService implements OnModuleInit {
       }
     }
 
-    // Catch-up: bookings starting within 30 minutes, regardless of
-    // reminderSent, unless this instance already reminded them.
+    // Catch-up: bookings starting within 30 minutes that the normal
+    // pass missed (accepted after the 2h window opened, or created
+    // while the scheduler was down). It now respects the persisted
+    // reminderSent flag and claims like the normal pass: the old
+    // version ignored the flag and deduped only in-process, so a
+    // booking reminded at T−120 was re-pinged at T−30 (the 60-minute
+    // in-memory prune vs the 120-minute gap) and every restart
+    // re-pinged everything in the window. The gte (not gt) lower bound
+    // means a booking accepted at 17:59 for 18:00 still gets pinged.
     const imminent = await this.prisma.booking.findMany({
       where: {
         status: BookingStatus.confirmed,
-        date: today,
-        startMinutes: { gt: nowMin, lte: nowMin + 30 },
+        reminderSent: false,
+        OR: this.reminderWindows(today, nowMin, 30, 'gte'),
       },
       include: { venue: { select: { name: true } } },
     });
     for (const b of imminent) {
       if (!b.userId) continue;
       if (this.recentlyReminded(this.bookingRemindedAt, b.id)) continue;
+      const claimed = await this.prisma.booking.updateMany({
+        where: { id: b.id, reminderSent: false, status: BookingStatus.confirmed },
+        data: { reminderSent: true },
+      });
+      if (claimed.count === 0) continue;
       const hh = String(Math.floor(b.startMinutes / 60)).padStart(2, '0');
       const mm = String(b.startMinutes % 60).padStart(2, '0');
-      await this.notifications.notifyBookingReminder(b.userId, b.venue.name, `${hh}:${mm}`).catch(() => {});
-      this.bookingRemindedAt.set(b.id, Date.now());
-      await this.prisma.booking
-        .update({ where: { id: b.id }, data: { reminderSent: true } })
-        .catch(() => {});
+      try {
+        await this.notifications.notifyBookingReminder(b.userId, b.venue.name, `${hh}:${mm}`);
+        this.bookingRemindedAt.set(b.id, Date.now());
+      } catch {
+        await this.prisma.booking
+          .update({ where: { id: b.id }, data: { reminderSent: false } })
+          .catch(() => {});
+      }
     }
 
     // Game posts starting within 2 hours: remind the host and everyone
@@ -202,9 +221,8 @@ export class SchedulerService implements OnModuleInit {
     const games = await this.prisma.gamePost.findMany({
       where: {
         status: { in: ['open', 'full'] },
-        date: today,
         reminderSent: false,
-        startMinutes: { gt: nowMin, lte: nowMin + 120 },
+        OR: this.reminderWindows(today, nowMin, 120, 'gt'),
       },
       include: {
         participants: {
@@ -217,7 +235,7 @@ export class SchedulerService implements OnModuleInit {
     });
     for (const g of games) {
       const claimed = await this.prisma.gamePost.updateMany({
-        where: { id: g.id, reminderSent: false },
+        where: { id: g.id, reminderSent: false, status: { in: ['open', 'full'] } },
         data: { reminderSent: true },
       });
       if (claimed.count === 0) continue;
@@ -231,12 +249,13 @@ export class SchedulerService implements OnModuleInit {
       }
     }
 
-    // Game catch-up: same last-30-minutes rule as bookings.
+    // Game catch-up: same last-30-minutes rule as bookings, same
+    // claim-before-notify discipline.
     const imminentGames = await this.prisma.gamePost.findMany({
       where: {
         status: { in: ['open', 'full'] },
-        date: today,
-        startMinutes: { gt: nowMin, lte: nowMin + 30 },
+        reminderSent: false,
+        OR: this.reminderWindows(today, nowMin, 30, 'gte'),
       },
       include: {
         participants: {
@@ -249,12 +268,48 @@ export class SchedulerService implements OnModuleInit {
     });
     for (const g of imminentGames) {
       if (this.recentlyReminded(this.gameRemindedAt, g.id)) continue;
-      await this.remindGame(g).catch(() => {});
-      this.gameRemindedAt.set(g.id, Date.now());
-      await this.prisma.gamePost
-        .update({ where: { id: g.id }, data: { reminderSent: true } })
-        .catch(() => {});
+      const claimed = await this.prisma.gamePost.updateMany({
+        where: { id: g.id, reminderSent: false, status: { in: ['open', 'full'] } },
+        data: { reminderSent: true },
+      });
+      if (claimed.count === 0) continue;
+      try {
+        await this.remindGame(g);
+        this.gameRemindedAt.set(g.id, Date.now());
+      } catch {
+        await this.prisma.gamePost
+          .update({ where: { id: g.id }, data: { reminderSent: false } })
+          .catch(() => {});
+      }
     }
+  }
+
+  /**
+   * Reminder window clauses for a run at `nowMin` (minutes since
+   * midnight) with a `horizon`-minute lookahead. The second clause is
+   * the early-morning spill: games starting 00:00–02:00 used to never
+   * get a 2h reminder (a 00:00 game got none at all), because the
+   * query filtered `date: today`. When the window crosses midnight,
+   * tomorrow's early bookings are included too — their 2h reminder
+   * fires on the pre-midnight evening run.
+   */
+  private reminderWindows(
+    today: Date,
+    nowMin: number,
+    horizon: number,
+    op: 'gt' | 'gte',
+  ) {
+    const todayClause = {
+      date: today,
+      startMinutes: { [op]: nowMin, lte: nowMin + horizon },
+    };
+    if (nowMin + horizon <= 1440) return [todayClause];
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return [
+      todayClause,
+      { date: tomorrow, startMinutes: { lte: nowMin + horizon - 1440 } },
+    ];
   }
 
   /** One game reminder to host + joined squad, with the per-player share. */

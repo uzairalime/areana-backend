@@ -346,21 +346,30 @@ export class GamePostsService {
       if (existing) {
         throw new ConflictException('This booking already has a game post');
       }
-      return this.prisma.gamePost.create({
-        data: {
-          creatorId: user.id,
-          bookingId: booking.id,
-          venueId: booking.venueId,
-          sport: booking.court.sport,
-          city: booking.venue.city,
-          date: booking.date,
-          startMinutes: booking.startMinutes,
-          playersNeeded: dto.playersNeeded,
-          squadSize: dto.squadSize ?? null,
-          level: dto.level?.trim() || null,
-          note: dto.note,
-        },
-      });
+      // The pre-check races a double-tap: the second create used to
+      // surface a raw P2002 500 instead of the clean 409 above.
+      try {
+        return await this.prisma.gamePost.create({
+          data: {
+            creatorId: user.id,
+            bookingId: booking.id,
+            venueId: booking.venueId,
+            sport: booking.court.sport,
+            city: booking.venue.city,
+            date: booking.date,
+            startMinutes: booking.startMinutes,
+            playersNeeded: dto.playersNeeded,
+            squadSize: dto.squadSize ?? null,
+            level: dto.level?.trim() || null,
+            note: dto.note,
+          },
+        });
+      } catch (e: unknown) {
+        if ((e as { code?: string })?.code === 'P2002') {
+          throw new ConflictException('This booking already has a game post');
+        }
+        throw e;
+      }
     }
 
     if (user.roleName !== 'super_admin') {

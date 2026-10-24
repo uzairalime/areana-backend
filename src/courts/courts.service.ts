@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
+import { addMonths } from '../common/date.util';
 
 export interface DayWindow {
   startMinutes: number;
@@ -12,12 +13,6 @@ export function toYmd(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
     d.getDate(),
   ).padStart(2, "0")}`;
-}
-
-function addMonths(d: Date, months: number): Date {
-  const out = new Date(d);
-  out.setMonth(out.getMonth() + months);
-  return out;
 }
 
 @Injectable()
@@ -66,6 +61,23 @@ export class CourtsService {
   }
 
   /**
+   * Price windows for a date AND the next date, for overnight slots:
+   * post-midnight hours of an overnight window (startMinutes >= 1440)
+   * are priced by the MORNING's weekday windows, never the evening's —
+   * a Sat 00:00–02:00 peak window must price Fri night's 00:00–02:00
+   * slots, not Fri's evening windows.
+   */
+  async priceWindowsForDateRange(courtId: string, date: Date) {
+    const nextDay = new Date(date);
+    nextDay.setDate(nextDay.getDate() + 1);
+    const [day, next] = await Promise.all([
+      this.priceWindowsForDate(courtId, date),
+      this.priceWindowsForDate(courtId, nextDay),
+    ]);
+    return { day, next };
+  }
+
+  /**
    * The Rs/hour rate for a slot starting at `startMinutes`: the price
    * window covering the slot start, else the court's base rate.
    */
@@ -78,6 +90,25 @@ export class CourtsService {
       (x) => startMinutes >= x.startMinutes && startMinutes < x.endMinutes,
     );
     return w ? Number(w.pricePerHour) : baseRate;
+  }
+
+  /**
+   * Overnight-aware slot rate: slots at/after midnight price from the
+   * next day's windows (with minutes shifted back into that day),
+   * daytime slots from the date's own windows.
+   */
+  rateForSlotPair(
+    windows: {
+      day: { startMinutes: number; endMinutes: number; pricePerHour: unknown }[];
+      next: { startMinutes: number; endMinutes: number; pricePerHour: unknown }[];
+    },
+    baseRate: number,
+    startMinutes: number,
+  ): number {
+    if (startMinutes >= 1440) {
+      return this.priceRateForSlot(windows.next, baseRate, startMinutes - 1440);
+    }
+    return this.priceRateForSlot(windows.day, baseRate, startMinutes);
   }
 
   /** Whether the court has any weekly-hours template rows. */
@@ -130,7 +161,26 @@ export class CourtsService {
           (!r.endsOn || toYmd(r.endsOn) >= dayStr),
       )
       .map((r) => ({ startMinutes: r.startMinutes, endMinutes: r.endMinutes }));
-    return [...oneOff, ...rec, ...spill];
+    // Recurring spill, mirroring the one-off spill above: a recurring
+    // early-morning block on the NEXT date (e.g. every Sat 01:00–02:00)
+    // also blocks this date's overnight window. Without it the blocked
+    // time was sold — the one-off spill existed but recurring blocks
+    // never spilled.
+    const nextDayStr = toYmd(nextDay);
+    const nextWeekday = nextDay.getDay();
+    const recSpill = recurring
+      .filter(
+        (r) =>
+          r.weekdays.includes(nextWeekday) &&
+          r.startMinutes < 360 &&
+          (!r.startsOn || toYmd(r.startsOn) <= nextDayStr) &&
+          (!r.endsOn || toYmd(r.endsOn) >= nextDayStr),
+      )
+      .map((r) => ({
+        startMinutes: r.startMinutes + 1440,
+        endMinutes: r.endMinutes + 1440,
+      }));
+    return [...oneOff, ...rec, ...spill, ...recSpill];
   }
 
   /**

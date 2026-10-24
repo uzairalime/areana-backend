@@ -75,15 +75,40 @@ export class BookingsController {
   @ApiQuery({ name: 'code', required: true })
   @ApiQuery({ name: 'courtId', required: true })
   @ApiQuery({ name: 'slotCount', required: false })
+  @ApiQuery({ name: 'date', required: false })
+  @ApiQuery({ name: 'startMinutes', required: false })
   async validatePromo(
     @CurrentUser() user: AuthUser,
     @Query('code') code: string,
     @Query('courtId') courtId: string,
     @Query('slotCount') slotCount?: string,
+    @Query('date') dateStr?: string,
+    @Query('startMinutes') startMinutesRaw?: string,
   ) {
     const court = await this.courts.getActiveCourt(courtId);
     const n = Math.max(1, parseInt(slotCount ?? '1', 10));
-    const amount = Number(court.pricePerHour) * ((court.slotMinutes * n) / 60);
+    let amount: number;
+    if (dateStr && startMinutesRaw !== undefined) {
+      // Window-rate preview: the old base-rate-only amount priced peak
+      // slots wrong (off by Rs 500 in the reported example) — the
+      // preview must match booking creation's per-slot engine,
+      // including the morning's weekday windows for overnight slots.
+      const date = parseDateOnly(dateStr);
+      const start = parseInt(startMinutesRaw, 10);
+      const windows = await this.courts.priceWindowsForDateRange(court.id, date);
+      const baseRate = Number(court.pricePerHour);
+      amount = 0;
+      for (let i = 0; i < n; i++) {
+        amount +=
+          this.courts.rateForSlotPair(windows, baseRate, start + i * court.slotMinutes) *
+          (court.slotMinutes / 60);
+      }
+      amount = Math.round(amount * 100) / 100;
+    } else {
+      // Back-compat: callers without a slot context still get the base
+      // rate preview (the panel passes date + startMinutes).
+      amount = Number(court.pricePerHour) * ((court.slotMinutes * n) / 60);
+    }
     return this.promos.validatePromo(code, user.id, amount, court.venueId);
   }
 

@@ -76,6 +76,15 @@ export class AuthService {
       }
     }
 
+    // Invalidate older unconsumed codes for this email first: verify
+    // always tests the NEWEST code but increments ITS attempt counter
+    // on every wrong guess, so typing an old code five times used to
+    // lock the current code the user never mistyped. With only one
+    // live code at a time, the attempt budget means what the UI implies.
+    await this.prisma.otpCode.updateMany({
+      where: { email, consumedAt: null },
+      data: { consumedAt: new Date() },
+    });
     const code = String(Math.floor(100000 + Math.random() * 900000));
     await this.prisma.otpCode.create({
       data: {

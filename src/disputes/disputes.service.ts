@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { BookingStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
+import { parseSettingInt } from '../common/settings.util';
 import { BookingsService } from '../bookings/bookings.service';
 import { CreateDisputeDto } from './dto';
 
@@ -207,9 +208,12 @@ export class DisputesService {
         where: { id: strikeUserId },
         select: { status: true, noShowCount: true },
       });
-      const limit = parseInt(
-        (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value ?? '3',
-        10,
+      // Validated like graceDays (see bookings.pushNoShowStrike): a
+      // mistyped value must fall back to 3, never parse to NaN.
+      const limit = parseSettingInt(
+        (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value,
+        3,
+        1,
       );
       if (user && user.status === 'active' && user.noShowCount >= limit) {
         await this.bookings.suspendPlayerWithCascade(strikeUserId);

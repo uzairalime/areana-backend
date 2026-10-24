@@ -16,6 +16,7 @@ import {
   parseDateOnly,
   startOfToday,
 } from '../common/date.util';
+import { parseSettingInt } from '../common/settings.util';
 import { CreateBookingDto, CreateRecurringDto, JoinSharedDto, MyBookingsQueryDto } from './dto';
 
 export interface CreateBookingInput extends CreateBookingDto {
@@ -70,11 +71,13 @@ export class BookingsService {
     // Per-slot pricing: each slot takes the rate of the price window
     // covering it (peak/off-peak), else the court's base rate — so a
     // booking spanning the peak boundary prices each hour correctly.
-    const priceWindows = await this.courts.priceWindowsForDate(court.id, date);
+    // Post-midnight slots of an overnight booking price from the
+    // morning's weekday windows, not the evening's.
+    const priceWindows = await this.courts.priceWindowsForDateRange(court.id, date);
     const baseRate = Number(court.pricePerHour);
     let gross = 0;
     for (let i = 0; i < slotCount; i++) {
-      const rate = this.courts.priceRateForSlot(
+      const rate = this.courts.rateForSlotPair(
         priceWindows,
         baseRate,
         startMinutes + i * court.slotMinutes,
@@ -89,8 +92,14 @@ export class BookingsService {
     let promo: { id: string } | null = null;
     if (input.promoCode && input.userId) {
       const res = await this.promos.validatePromo(input.promoCode, input.userId, gross, court.venueId);
-      discount = res.discount;
-      promo = res.promo;
+      // A zero discount must not consume a redemption: a Rs 0/hr court
+      // (or a discount rounding to Rs 0.00) used to burn a single-use
+      // code for nothing. The booking proceeds without the promo, so
+      // the use stays available for a booking it actually discounts.
+      if (res.discount > 0) {
+        discount = res.discount;
+        promo = res.promo;
+      }
     }
 
     const booking = await this.prisma.$transaction(async (tx) => {
@@ -196,10 +205,15 @@ export class BookingsService {
     // A recurring series is a standing commitment the owner approves —
     // its later occurrences are exempt from the max-advance window
     // (min-advance above still applies to every occurrence).
+    // Max-advance is an INSTANT like min-advance, not a calendar date:
+    // the old date comparison let the horizon vary by ~24h with the
+    // time of day. Exactly at the horizon stays allowed, matching the
+    // availability side.
     if (!skipMaxAdvance) {
-      const maxDate = startOfToday();
-      maxDate.setDate(maxDate.getDate() + court.venue.maxAdvanceDays);
-      if (date > maxDate) {
+      const maxBookableAt = new Date(
+        now.getTime() + court.venue.maxAdvanceDays * 24 * 3600_000,
+      );
+      if (bookingAt > maxBookableAt) {
         throw new BadRequestException(`Bookings open only ${court.venue.maxAdvanceDays} days ahead`);
       }
     }
@@ -553,18 +567,23 @@ export class BookingsService {
       s < booking.endMinutes;
       s += court.slotMinutes
     ) {
-      const entries = await this.prisma.slotWaitlist.findMany({
-        where: {
-          courtId: booking.courtId,
-          date: booking.date,
-          startMinutes: s,
-          notifiedAt: null,
-        },
-      });
-      if (entries.length === 0) continue;
+      // Claim BEFORE notifying: the old read-then-ping-then-mark let
+      // two concurrent cancellations both read the same un-notified
+      // entries and ping every waiter twice. The UPDATE ... RETURNING
+      // claims exactly the rows this caller won; a loser claims
+      // nothing and pings nobody.
+      const claimed = await this.prisma.$queryRaw<{ id: string; userId: string }[]>`
+        UPDATE "SlotWaitlist"
+        SET "notifiedAt" = NOW()
+        WHERE "courtId" = ${booking.courtId}
+          AND "date" = ${booking.date.toISOString().slice(0, 10)}::date
+          AND "startMinutes" = ${s}
+          AND "notifiedAt" IS NULL
+        RETURNING "id", "userId"`;
+      if (claimed.length === 0) continue;
       const hh = String(Math.floor(s / 60) % 24).padStart(2, '0');
       const mm = String(s % 60).padStart(2, '0');
-      for (const e of entries) {
+      for (const e of claimed) {
         await this.notifications
           .pushToUser(e.userId, {
             title: 'A slot just opened up',
@@ -573,10 +592,6 @@ export class BookingsService {
           })
           .catch(() => {});
       }
-      await this.prisma.slotWaitlist.updateMany({
-        where: { id: { in: entries.map((e) => e.id) } },
-        data: { notifiedAt: new Date() },
-      });
     }
   }
 
@@ -960,9 +975,13 @@ export class BookingsService {
       select: { noShowCount: true },
     });
     if (!user) return;
-    const limit = parseInt(
-      (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value ?? '3',
-      10,
+    // Validated like graceDays: a mistyped value ("three") used to
+    // parse to NaN, so `count >= NaN` was always false and strike
+    // suspension never fired — and "0" suspended on the first strike.
+    const limit = parseSettingInt(
+      (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value,
+      3,
+      1,
     );
     await this.notifications
       .pushToUser(userId, {
@@ -984,9 +1003,10 @@ export class BookingsService {
       where: { id: userId },
       data: { noShowCount: { increment: 1 } },
     });
-    const limit = parseInt(
-      (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value ?? '3',
-      10,
+    const limit = parseSettingInt(
+      (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value,
+      3,
+      1,
     );
     await this.pushNoShowStrike(userId);
     if (user.noShowCount >= limit && user.status === UserStatus.active) {
