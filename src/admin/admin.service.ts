@@ -1646,7 +1646,12 @@ export class AdminService {
       else if (e.type === 'click') row.clicks++;
       else if (e.type === 'court_view') row.courtViews++;
     }
-    return dayStrs.map((date) => ({ date, ...byDay.get(date)! }));
+    // Whole rupees on display: Decimal sums accumulate float dust
+    // (e.g. 12345.670000000001); storage is untouched.
+    return dayStrs.map((date) => {
+      const row = byDay.get(date)!;
+      return { date, ...row, revenue: Math.round(row.revenue) };
+    });
   }
 
   async venueSeries(
@@ -2488,7 +2493,7 @@ export class AdminService {
    * venues they created — an operator must not rewrite another
    * operator's (or a super admin's) venue photos. '*' passes
    * everywhere; legacy venues (no creator recorded) are fail-closed
-   * for delegates. Reorder stays '*' only (the controller enforces it).
+   * for delegates. Reorder follows the same scope as add/tag/delete.
    */
   private assertImageScope(
     venue: { createdById: string | null },
@@ -2529,10 +2534,11 @@ export class AdminService {
     return final ?? venue;
   }
 
-  /** Reorder a venue's photos (first photo is the cover everywhere). Same-set guard as the owner endpoint. */
-  async reorderVenueImages(venueId: string, urls: string[]) {
+  /** Reorder a venue's photos (first photo is the cover everywhere). Same-set guard as the owner endpoint. Same creator scope as add/tag/delete. */
+  async reorderVenueImages(venueId: string, urls: string[], actor: { id: string; permissions: string[] }) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
+    this.assertImageScope(venue, actor);
     const entries = photoEntriesOf(venue);
     const current = entries.map((e) => e.url);
     const sameSet =
@@ -3177,8 +3183,8 @@ export class AdminService {
   async listDisputes(status?: string, cursor?: string, rawLimit?: number, q?: string) {
     const limit = pageLimit(rawLimit, 50);
     const ks = this.keyset(cursor);
-    // Server-side search across booking id, reason, raiser name/email,
-    // and venue name. The keyset clause is a second OR, so every clause
+    // Server-side search across booking id, reason, resolution, raiser
+    // name/email, and venue name. The keyset clause is a second OR, so every clause
     // goes through an AND array — spreading baseWhere next to a keyset
     // OR would silently drop one of them.
     const filterClauses: Prisma.DisputeWhereInput[] = [];
@@ -3189,6 +3195,7 @@ export class AdminService {
         OR: [
           { bookingId: { contains: term } },
           { reason: { contains: term, mode: 'insensitive' } },
+          { resolution: { contains: term, mode: 'insensitive' } },
           {
             raisedBy: {
               OR: [

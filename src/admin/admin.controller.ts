@@ -347,12 +347,14 @@ export class AdminController {
   }
 
   @ApiTags('admin · venues')
+  @RequirePerm('venues.onboard')
   @Patch('venues/:id/images/order')
   reorderVenueImages(
+    @CurrentUser() u: AuthUser,
     @Param('id') id: string,
     @Body() body: { urls?: string[] },
   ) {
-    return this.admin.reorderVenueImages(id, body?.urls ?? []);
+    return this.admin.reorderVenueImages(id, body?.urls ?? [], u);
   }
 
   @ApiTags('admin · venues')

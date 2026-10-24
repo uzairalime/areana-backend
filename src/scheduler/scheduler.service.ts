@@ -281,7 +281,9 @@ export class SchedulerService implements OnModuleInit {
         g.squadSize != null
           ? g.squadSize + g.playersNeeded
           : g.playersNeeded + 1;
-      if (squad > 0) pricePerPlayer = Math.round(fee / squad);
+      // Floored share, matching priceView: the host absorbs the
+      // remainder so the squad collects exactly the fee.
+      if (squad > 0) pricePerPlayer = Math.floor(fee / squad);
     }
     const targets = new Set<string>([g.creatorId]);
     for (const p of g.participants) if (p.userId) targets.add(p.userId);

@@ -163,10 +163,15 @@ export class AnalyticsService {
     const since =
       bounds.gte ??
       (() => {
-        const d = new Date();
-        d.setDate(d.getDate() - days);
-        d.setHours(0, 0, 0, 0);
-        return d;
+        // PKT calendar days, not server-local midnights: the stored
+        // Booking.date is the UTC midnight of the PKT day, so a
+        // server-local midnight bound silently drops the first day.
+        const pktToday = new Intl.DateTimeFormat('en-CA', {
+          timeZone: 'Asia/Karachi',
+        }).format(new Date());
+        const d = new Date(`${pktToday}T00:00:00.000Z`);
+        d.setUTCDate(d.getUTCDate() - days);
+        return new Date(`${d.toISOString().slice(0, 10)}T00:00:00+05:00`);
       })();
     const rows = await this.prisma.booking.groupBy({
       by: ['date'],
@@ -289,9 +294,15 @@ export class AnalyticsService {
           firstSeen.set(b.userId, b.date.toISOString().slice(0, 10));
         }
       }
-      const cutoff = new Date();
-      cutoff.setDate(cutoff.getDate() - 30);
-      const newPlayers = [...firstSeen.values()].filter((d) => d >= cutoff.toISOString().slice(0, 10)).length;
+      // PKT calendar date, not server-local: firstSeen holds PKT date
+      // strings (Booking.date is the UTC midnight of the PKT day).
+      const pktToday = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Karachi',
+      }).format(new Date());
+      const cutoffDay = new Date(`${pktToday}T00:00:00.000Z`);
+      cutoffDay.setUTCDate(cutoffDay.getUTCDate() - 30);
+      const cutoffStr = cutoffDay.toISOString().slice(0, 10);
+      const newPlayers = [...firstSeen.values()].filter((d) => d >= cutoffStr).length;
       rows.push({
         venueId: v.id,
         name: v.name,

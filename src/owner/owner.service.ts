@@ -1793,8 +1793,13 @@ export class OwnerService {
   }
 
   async deleteMyRole(user: AuthUser, roleId: string) {
+    // Same ownership resolution as updateMyRole: a single-owner staffer
+    // who may edit a role may also delete it. System roles (ownerId
+    // null) can never match a resolved owner id, and the in-use guard
+    // below still applies.
+    const ownerId = await this.resolveRoleOwnerId(user);
     const role = await this.prisma.role.findFirst({
-      where: { id: roleId, ownerId: user.id },
+      where: { id: roleId, ownerId },
       include: { _count: { select: { users: true } } },
     });
     if (!role) throw new NotFoundException('Role not found');
@@ -1823,6 +1828,9 @@ export class OwnerService {
     if (!code) throw new BadRequestException('Promo code is required');
     if (dto.kind === 'percent' && (dto.value < 1 || dto.value > 100)) {
       throw new BadRequestException('Percent promo value must be between 1 and 100');
+    }
+    if (dto.kind === 'flat' && dto.value < 1) {
+      throw new BadRequestException('Flat promo value must be at least Rs 1');
     }
     const exists = await this.prisma.promoCode.findUnique({ where: { code } });
     if (exists) throw new ConflictException('This code is already in use');
@@ -1888,6 +1896,9 @@ export class OwnerService {
     // @Min(0), so a 150% promo stored a negative booking price).
     if (dto.value !== undefined && existing.kind === 'percent' && (dto.value < 1 || dto.value > 100)) {
       throw new BadRequestException('Percent promo value must be between 1 and 100');
+    }
+    if (dto.value !== undefined && existing.kind === 'flat' && dto.value < 1) {
+      throw new BadRequestException('Flat promo value must be at least Rs 1');
     }
     const validFrom = dto.validFrom ? new Date(dto.validFrom) : undefined;
     const validTo = dto.validTo ? new Date(dto.validTo) : undefined;

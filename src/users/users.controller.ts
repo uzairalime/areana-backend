@@ -121,6 +121,15 @@ export class UsersController {
             archivedAt: v.archivedAt ?? new Date(),
             billingPaused: true,
             billingStartAt: null,
+            // Clear the frozen billing state too: a future startBilling()
+            // checks only billingStartAt and would otherwise silently
+            // re-anchor on this stale frozen period.
+            billingPaidUntil: null,
+            freeUntilOverride: null,
+            billingPeriodStart: null,
+            billingPeriodEnd: null,
+            billingPeriodPrice: null,
+            frozenPlanId: null,
           },
         }),
       ),

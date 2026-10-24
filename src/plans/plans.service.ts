@@ -50,8 +50,14 @@ export interface BillingSummary {
 }
 
 function addMonths(d: Date, months: number): Date {
+  // Clamp to the target month's last day: raw setMonth() overflows
+  // (31 Jan + 3 months landed on 1 May, not 30 Apr).
+  const day = d.getDate();
   const out = new Date(d);
+  out.setDate(1);
   out.setMonth(out.getMonth() + months);
+  const last = new Date(out.getFullYear(), out.getMonth() + 1, 0).getDate();
+  out.setDate(Math.min(day, last));
   return out;
 }
 
@@ -526,7 +532,7 @@ export class PlansService {
     };
   }
 
-  /** Nightly sweep: flip billingPaused + notify owners on due / overdue. */
+  /** Nightly sweep: pause overdue venues + notify owners. Pause-only — see below. */
   async sweepBilling() {
     // Billing freeze, first half (S6): a suspended owner's venues are
     // skipped entirely — no pause/resume transition, no due reminder
@@ -542,14 +548,21 @@ export class PlansService {
       include: { plan: true, owner: { select: { id: true, name: true } } },
     });
     let paused = 0;
-    let resumed = 0;
+    // Sweep never resumes (see below); kept for return-shape compat.
+    const resumed = 0;
     for (const venue of venues) {
       const summary = await this.billingSummary(venue);
       const shouldPause = summary.status === 'overdue';
-      if (shouldPause !== venue.billingPaused) {
+      // Pause-only sweep: a billing-paused venue resumes solely via an
+      // explicit action (markPaid, extendFree, plan restart) — never via
+      // a settings change. Raising billingGraceDays used to flip overdue
+      // venues back to due and auto-resume them with zero payment, so
+      // grace changes now only affect computed status display for
+      // venues that are not paused.
+      if (shouldPause && !venue.billingPaused) {
         await this.prisma.venue.update({
           where: { id: venue.id },
-          data: { billingPaused: shouldPause },
+          data: { billingPaused: true },
         });
         // The pause that hides a venue (and cancels its bookings) had
         // no audit trail at all. System rows carry a null actor — the
@@ -558,51 +571,26 @@ export class PlansService {
           .create({
             data: {
               actorId: null,
-              action: shouldPause ? 'venue.billing.paused' : 'venue.billing.resumed',
+              action: 'venue.billing.paused',
               entity: 'venue',
               entityId: venue.id,
-              details: shouldPause
-                ? `overdue: Rs ${summary.amountDue.toLocaleString('en-PK')} due for period ${summary.nextDueAt ?? 'unknown'}`
-                : `status: ${summary.status}`,
+              details: `overdue: Rs ${summary.amountDue.toLocaleString('en-PK')} due for period ${summary.nextDueAt ?? 'unknown'}`,
             },
           })
           .catch(() => {});
-        if (shouldPause) {
-          paused++;
-          // Overdue-pause follows the sanction policy: upcoming
-          // bookings do not stand at a venue players can no longer see.
-          await this.bookings
-            .cancelVenueUpcomingBookings(venue.id, 'the arena\'s plan payment is overdue')
-            .catch(() => {});
-          await this.notifications
-            .pushToUser(venue.ownerId, {
-              title: 'Venue paused — plan payment overdue',
-              body: `${venue.name} is hidden from players until the yearly plan fee is settled. Contact Areana to reactivate instantly.`,
-              data: { type: 'billing_overdue' },
-            })
-            .catch(() => {});
-        } else {
-          // A venue that was paused and is no longer overdue (paid,
-          // free-extended, or plan-changed) may be live again — but
-          // only if nothing else still hides it. The notice says so
-          // only when the full live predicate holds (approved +
-          // unarchived + unmoderated); otherwise it says the pause
-          // lifted without promising visibility.
-          resumed++;
-          const liveAgain =
-            venue.status === 'approved' &&
-            !venue.archivedAt &&
-            venue.moderationStatus === 'none';
-          await this.notifications
-            .pushToUser(venue.ownerId, {
-              title: liveAgain ? 'Venue live again' : 'Billing pause lifted',
-              body: liveAgain
-                ? `${venue.name} is no longer billing-paused and is visible to players again.`
-                : `${venue.name} is no longer billing-paused, but it stays hidden for now — it becomes visible once its approval, moderation, and billing state are all clear.`,
-              data: { type: 'billing_resumed' },
-            })
-            .catch(() => {});
-        }
+        paused++;
+        // Overdue-pause follows the sanction policy: upcoming
+        // bookings do not stand at a venue players can no longer see.
+        await this.bookings
+          .cancelVenueUpcomingBookings(venue.id, 'the arena\'s plan payment is overdue')
+          .catch(() => {});
+        await this.notifications
+          .pushToUser(venue.ownerId, {
+            title: 'Venue paused — plan payment overdue',
+            body: `${venue.name} is hidden from players until the yearly plan fee is settled. Contact Areana to reactivate instantly.`,
+            data: { type: 'billing_overdue' },
+          })
+          .catch(() => {});
       }
       // One due-reminder per period. The key is the period's start
       // (nextDueAt): frozen billing periods make it stable across

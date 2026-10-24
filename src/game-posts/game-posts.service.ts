@@ -35,21 +35,27 @@ export class GamePostsService {
     squadSize: number | null;
     playersNeeded: number;
     booking?: { totalPrice: unknown } | null;
-  }): { courtFee: number | null; pricePerPlayer: number | null } {
-    if (!post.booking) return { courtFee: null, pricePerPlayer: null };
+  }): { courtFee: number | null; pricePerPlayer: number | null; hostShare: number | null } {
+    if (!post.booking) return { courtFee: null, pricePerPlayer: null, hostShare: null };
     // totalPrice is already net of any discount — subtracting
     // discountAmount again understated every share.
     const courtFee = Math.max(0, Number(post.booking.totalPrice));
     // The fee splits across the FULL squad: the host's group (squadSize)
     // plus everyone who joins (playersNeeded). squadSize is always sent
     // by the booking flows; the +1 fallback counts a lone host.
+    // Joiners pay the floored share; the host absorbs the remainder so
+    // the squad collects exactly the fee (rounding every share used to
+    // collect Rs 999 or Rs 1,001 on a Rs 1,000 fee of 3).
     const squad =
       post.squadSize != null
         ? post.squadSize + post.playersNeeded
         : post.playersNeeded + 1;
+    if (squad <= 0) return { courtFee, pricePerPlayer: null, hostShare: null };
+    const share = Math.floor(courtFee / squad);
     return {
       courtFee,
-      pricePerPlayer: squad > 0 ? Math.round(courtFee / squad) : null,
+      pricePerPlayer: share,
+      hostShare: courtFee - (squad - 1) * share,
     };
   }
 
