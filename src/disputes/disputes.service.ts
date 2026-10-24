@@ -4,15 +4,23 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
-import { BookingStatus } from '@prisma/client';
+import { BookingStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
+import { BookingsService } from '../bookings/bookings.service';
 import { CreateDisputeDto } from './dto';
 
-export type DisputeAction = 'confirm_no_show' | 'dismiss' | 'credit';
+// NOTE: there is deliberately no `credit` action. A credit mechanism
+// (wallet / voucher ledger) does not exist, and resolving as "credit"
+// while delivering nothing is worse than refusing the action — it is
+// future scope, not a quiet no-op.
+export type DisputeAction = 'confirm_no_show' | 'dismiss';
 
 @Injectable()
 export class DisputesService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private bookings: BookingsService,
+  ) {}
 
   async create(userId: string, dto: CreateDisputeDto) {
     const booking = await this.prisma.booking.findFirst({
@@ -24,15 +32,40 @@ export class DisputesService {
         'You can only raise a dispute after the game has been played',
       );
     }
+    // One dispute per booking, ever: a terminal resolution closes the
+    // matter for good (re-raising would refill the admin queue forever).
+    const alreadyResolved = await this.prisma.dispute.findFirst({
+      where: { bookingId: dto.bookingId, status: { in: ['resolved', 'dismissed'] } },
+      select: { id: true },
+    });
+    if (alreadyResolved) {
+      throw new BadRequestException(
+        'This booking already has a resolved dispute — it cannot be disputed again',
+      );
+    }
     const open = await this.prisma.dispute.findFirst({
       where: { bookingId: dto.bookingId, status: 'open' },
     });
     if (open) {
       throw new ConflictException('There is already an open dispute for this booking');
     }
-    return this.prisma.dispute.create({
-      data: { bookingId: booking.id, raisedById: userId, reason: dto.reason },
-    });
+    // openKey is the race guard: two concurrent creates both pass the
+    // check above, but only one insert with this key can land.
+    try {
+      return await this.prisma.dispute.create({
+        data: {
+          bookingId: booking.id,
+          raisedById: userId,
+          reason: dto.reason,
+          openKey: dto.bookingId,
+        },
+      });
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        throw new ConflictException('There is already an open dispute for this booking');
+      }
+      throw e;
+    }
   }
 
   listMine(userId: string) {
@@ -55,7 +88,10 @@ export class DisputesService {
 
   /**
    * Resolves a dispute. Called by the admin module (permissions verified there).
-   * `confirm_no_show` also marks the booking and adds a strike to the player.
+   * `confirm_no_show` also marks the booking and adds a strike to the player —
+   * but only on the completed → no_show transition, claimed atomically, with
+   * the same strike-limit suspension check as the owner no-show path.
+   * The audit row is written inside the same transaction as the resolution.
    */
   async resolveDispute(
     id: string,
@@ -63,6 +99,14 @@ export class DisputesService {
     resolution: string,
     resolvedById: string,
   ) {
+    if (action !== 'confirm_no_show' && action !== 'dismiss') {
+      throw new BadRequestException(
+        'Unknown dispute action — credit is not supported (no credit mechanism exists)',
+      );
+    }
+    if (!resolution?.trim()) {
+      throw new BadRequestException('A resolution note is required');
+    }
     const dispute = await this.prisma.dispute.findUnique({
       where: { id },
       include: { booking: true },
@@ -72,12 +116,21 @@ export class DisputesService {
       throw new BadRequestException('Dispute is already resolved');
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    let strikeUserId: string | null = null;
+    const resolved = await this.prisma.$transaction(async (tx) => {
       if (action === 'confirm_no_show') {
-        await tx.booking.update({
-          where: { id: dispute.bookingId },
+        // Atomic claim: only a completed booking can become a no-show,
+        // and only once — a booking the owner already marked no-show
+        // must not earn a second strike from the same game.
+        const claimed = await tx.booking.updateMany({
+          where: { id: dispute.bookingId, status: BookingStatus.completed },
           data: { status: BookingStatus.no_show },
         });
+        if (claimed.count === 0) {
+          throw new BadRequestException(
+            'Only a completed booking can be confirmed as a no-show',
+          );
+        }
         // A no-showed booking must never be resurrected by a stale
         // pending reschedule request.
         await tx.rescheduleRequest.updateMany({
@@ -89,21 +142,50 @@ export class DisputesService {
           },
         });
         if (dispute.booking.userId) {
-          await tx.user.update({
+          const struck = await tx.user.update({
             where: { id: dispute.booking.userId },
             data: { noShowCount: { increment: 1 } },
           });
+          strikeUserId = struck.id;
         }
       }
-      return tx.dispute.update({
+      const updated = await tx.dispute.update({
         where: { id },
         data: {
           status: action === 'dismiss' ? 'dismissed' : 'resolved',
-          resolution,
+          resolution: resolution.trim(),
           resolvedById,
           resolvedAt: new Date(),
+          openKey: null,
         },
       });
+      await tx.auditLog.create({
+        data: {
+          actorId: resolvedById,
+          action: 'dispute.resolve',
+          entity: 'dispute',
+          entityId: id,
+          details: action,
+        },
+      });
+      return updated;
     });
+
+    // Strike-limit suspension runs after the transaction (it has its own
+    // cascade); the strike count itself is already durable above.
+    if (strikeUserId) {
+      const user = await this.prisma.user.findUnique({
+        where: { id: strikeUserId },
+        select: { status: true, noShowCount: true },
+      });
+      const limit = parseInt(
+        (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value ?? '3',
+        10,
+      );
+      if (user && user.status === 'active' && user.noShowCount >= limit) {
+        await this.bookings.suspendPlayerWithCascade(strikeUserId);
+      }
+    }
+    return resolved;
   }
 }

@@ -194,9 +194,12 @@ export class OwnerService {
         status: VenueStatus.draft,
       },
     });
-    // Default staff roles: attach the venue's allowed roles (set by super admin;
-    // fall back to all arena-scope roles so the owner isn't blocked).
-    const allowed = await this.prisma.role.findMany({ where: { scope: 'arena' } });
+    // Default staff roles: platform arena roles only. Owner-created
+    // roles belong to their own owner — attaching them here would let
+    // one owner's role silently govern another owner's venue.
+    const allowed = await this.prisma.role.findMany({
+      where: { scope: 'arena', ownerId: null },
+    });
     if (allowed.length > 0) {
       await this.prisma.venueAllowedRole.createMany({
         data: allowed.map((r) => ({ venueId: venue.id, roleId: r.id })),
@@ -278,7 +281,22 @@ export class OwnerService {
     if (!user.permissions.includes('venues.manage')) {
       throw new ForbiddenException('Only the owner can submit a venue');
     }
-    const courts = await this.prisma.court.count({ where: { venueId, isActive: true } });
+    // Only a draft or a rejected venue can (re-)enter the queue: a live
+    // venue must not delist itself by accident, and a suspended or
+    // archived venue must not self-reinstate through this path.
+    if (venue.archivedAt) {
+      throw new BadRequestException('This arena is archived — restore it before submitting');
+    }
+    if (venue.status !== VenueStatus.draft && venue.status !== VenueStatus.rejected) {
+      throw new BadRequestException(
+        `This arena is ${venue.status} — only a draft or rejected arena can be submitted`,
+      );
+    }
+    // Readiness counts bookable courts only: a pending court is not
+    // bookable, so it must not satisfy the "at least one court" bar.
+    const courts = await this.prisma.court.count({
+      where: { venueId, isActive: true, status: 'approved' },
+    });
     const readiness = venueReadiness(venue, courts);
     if (!readiness.ready) {
       throw new BadRequestException(
@@ -391,10 +409,26 @@ export class OwnerService {
 
   async unarchiveVenue(user: AuthUser, venueId: string) {
     const venue = await this.assertVenue(user, venueId);
-    return this.prisma.venue.update({
+    const restored = await this.prisma.venue.update({
       where: { id: venue.id },
       data: { archivedAt: null },
     });
+    // A live venue that decayed while archived (photos/amenities
+    // stripped, courts removed) must not silently return to discovery:
+    // it drops back to pending for a fresh approval decision.
+    if (venue.status === VenueStatus.approved) {
+      const courts = await this.prisma.court.count({
+        where: { venueId, isActive: true, status: 'approved' },
+      });
+      const readiness = venueReadiness(restored, courts);
+      if (!readiness.ready) {
+        return this.prisma.venue.update({
+          where: { id: venue.id },
+          data: { status: VenueStatus.pending },
+        });
+      }
+    }
+    return restored;
   }
 
   async removeVenueImage(user: AuthUser, venueId: string, url: string) {
@@ -470,7 +504,14 @@ export class OwnerService {
   }
 
   async createCourt(user: AuthUser, venueId: string, dto: CreateCourtDto) {
-    await this.assertVenue(user, venueId);
+    const venue = await this.assertVenue(user, venueId);
+    // Courts for a dead venue would pile into the approvals queue and
+    // could be approved into nothing bookable.
+    if (venue.archivedAt || venue.status === VenueStatus.suspended || venue.status === VenueStatus.rejected) {
+      throw new BadRequestException(
+        'Courts cannot be added while the arena is archived, suspended, or rejected',
+      );
+    }
     await this.assertCourtNameFree(venueId, dto.name);
     const data = { ...dto, sport: await this.sports.normalizeSport(dto.sport) };
     if (data.openMinutes != null && data.closeMinutes != null) {
@@ -1323,8 +1364,17 @@ export class OwnerService {
   /** Roles the super admin enabled for this venue — the only ones the owner may hand out. */
   async allowedRoles(user: AuthUser, venueId: string) {
     const venue = await this.assertVenue(user, venueId);
+    // Only live, in-scope links: a disabled role must not be handed
+    // out again (it would silently gain its permissions on re-enable),
+    // and a link to another owner's role (legacy data) is never valid.
     const links = await this.prisma.venueAllowedRole.findMany({
-      where: { venueId },
+      where: {
+        venueId,
+        role: {
+          isActive: true,
+          OR: [{ ownerId: null }, { ownerId: venue.ownerId }],
+        },
+      },
       include: { role: true },
     });
     const roles = links.map((l) => l.role);
@@ -1391,40 +1441,104 @@ export class OwnerService {
     }
   }
 
+  /**
+   * The owner a role minted through this account belongs to. Owners own
+   * their own roles; a staff caller mints roles for the single venue
+   * owner they serve (serving several owners is ambiguous → rejected).
+   * The old code always used the caller's id, which let a staff member
+   * mint a fully-permissioned role owned by themselves and invisible
+   * to the real owner.
+   */
+  private async resolveRoleOwnerId(user: AuthUser): Promise<string> {
+    if (user.roleName === 'owner' || user.permissions.includes('*')) return user.id;
+    const links = await this.prisma.venueStaff.findMany({
+      where: { userId: user.id },
+      select: { venueId: true },
+    });
+    if (links.length === 0) {
+      throw new ForbiddenException('Only venue owners can manage roles');
+    }
+    const venues = await this.prisma.venue.findMany({
+      where: { id: { in: links.map((l) => l.venueId) } },
+      select: { ownerId: true },
+    });
+    const owners = [...new Set(venues.map((v) => v.ownerId))];
+    if (owners.length !== 1) {
+      throw new BadRequestException(
+        'You serve venues of more than one owner — ask an owner to create this role',
+      );
+    }
+    return owners[0];
+  }
+
+  /**
+   * A non-owner may only grant permissions they hold themselves —
+   * otherwise a manager holding only staff.manage could mint a role
+   * with full arena control and log into it.
+   */
+  private assertCallerMayGrant(user: AuthUser, permissions: string[]) {
+    if (user.permissions.includes('*') || user.roleName === 'owner') return;
+    const missing = permissions.filter((p) => !user.permissions.includes(p));
+    if (missing.length > 0) {
+      throw new ForbiddenException(
+        `You cannot grant permission(s) you do not hold: ${missing.join(', ')}`,
+      );
+    }
+  }
+
   async createMyRole(user: AuthUser, dto: CreateMyRoleDto) {
     this.assertGrantable(dto.permissions);
+    const ownerId = await this.resolveRoleOwnerId(user);
+    this.assertCallerMayGrant(user, dto.permissions);
     const name = dto.name.trim();
     if (!name) throw new BadRequestException('Role name is required');
     const clash = await this.prisma.role.findFirst({
-      where: { ownerId: user.id, name: { equals: name, mode: 'insensitive' } },
+      where: { ownerId, name: { equals: name, mode: 'insensitive' } },
     });
     if (clash) throw new ConflictException('You already have a role with this name');
+    // Platform role names are reserved: @@unique([ownerId, name]) does
+    // not protect them (NULL ownerIds are distinct in Postgres), and
+    // name-based lookups (owner role, last-admin guards) would start
+    // matching this owner's role instead of the platform's.
+    const systemClash = await this.prisma.role.findFirst({
+      where: { ownerId: null, name: { equals: name, mode: 'insensitive' } },
+    });
+    if (systemClash) throw new ConflictException('That name belongs to a platform role');
     return this.prisma.role.create({
       data: {
         name,
         description: dto.description,
         permissions: [...new Set(dto.permissions)],
         scope: 'arena',
-        ownerId: user.id,
+        ownerId,
       },
     });
   }
 
   async updateMyRole(user: AuthUser, roleId: string, dto: UpdateMyRoleDto) {
-    const role = await this.prisma.role.findFirst({
-      where: { id: roleId, ownerId: user.id },
-    });
+    const role = await this.prisma.role.findUnique({ where: { id: roleId } });
     if (!role) throw new NotFoundException('Role not found');
-    if (dto.permissions) this.assertGrantable(dto.permissions);
+    const ownerId = await this.resolveRoleOwnerId(user);
+    if (role.ownerId !== ownerId) throw new NotFoundException('Role not found');
+    // Only a permission change is a grant: a name/description edit by
+    // staff must not fail on keys the role already holds.
+    if (dto.permissions) {
+      this.assertGrantable(dto.permissions);
+      this.assertCallerMayGrant(user, dto.permissions);
+    }
     if (dto.name && dto.name.trim().toLowerCase() !== role.name.toLowerCase()) {
       const clash = await this.prisma.role.findFirst({
         where: {
-          ownerId: user.id,
+          ownerId,
           name: { equals: dto.name.trim(), mode: 'insensitive' },
           id: { not: roleId },
         },
       });
       if (clash) throw new ConflictException('You already have a role with this name');
+      const systemClash = await this.prisma.role.findFirst({
+        where: { ownerId: null, name: { equals: dto.name.trim(), mode: 'insensitive' } },
+      });
+      if (systemClash) throw new ConflictException('That name belongs to a platform role');
     }
     return this.prisma.role.update({
       where: { id: roleId },
@@ -1508,6 +1622,31 @@ export class OwnerService {
 
   async updateMyPromo(user: AuthUser, promoId: string, dto: UpdateMyPromoDto) {
     const existing = await this.assertMyPromo(user, promoId);
+    // A redeemed promo's terms are frozen: rewriting value, limits, or
+    // dates after redemptions would silently re-price every future
+    // booking and leave no audit trail. Only activation may change.
+    const termsChange =
+      dto.value !== undefined ||
+      dto.maxDiscount !== undefined ||
+      dto.maxUses !== undefined ||
+      dto.perUserLimit !== undefined ||
+      dto.validFrom !== undefined ||
+      dto.validTo !== undefined;
+    if (termsChange && existing.usedCount > 0) {
+      throw new BadRequestException(
+        'This promo has already been redeemed — only activation can be changed now',
+      );
+    }
+    if (dto.maxUses !== undefined && dto.maxUses < existing.usedCount) {
+      throw new BadRequestException(
+        `maxUses cannot go below the ${existing.usedCount} redemption(s) already recorded`,
+      );
+    }
+    // Mirror the create-path validation (the old update had only
+    // @Min(0), so a 150% promo stored a negative booking price).
+    if (dto.value !== undefined && existing.kind === 'percent' && (dto.value < 1 || dto.value > 100)) {
+      throw new BadRequestException('Percent promo value must be between 1 and 100');
+    }
     const validFrom = dto.validFrom ? new Date(dto.validFrom) : undefined;
     const validTo = dto.validTo ? new Date(dto.validTo) : undefined;
     if (validFrom && isNaN(validFrom.getTime())) {
@@ -1515,6 +1654,9 @@ export class OwnerService {
     }
     if (validTo && isNaN(validTo.getTime())) {
       throw new BadRequestException('validTo must be a valid date');
+    }
+    if (validTo && validTo <= new Date()) {
+      throw new BadRequestException('validTo must be a future date');
     }
     if ((validFrom ?? existing.validFrom) >= (validTo ?? existing.validTo)) {
       throw new BadRequestException('validFrom must be before validTo');
@@ -1563,7 +1705,7 @@ export class OwnerService {
   }
 
   async createStaff(user: AuthUser, venueId: string, dto: CreateStaffDto) {
-    await this.assertVenue(user, venueId);
+    const venue = await this.assertVenue(user, venueId);
     const staffCap = await this.plans.effectiveStaffLimit(venueId);
     // An explicit admin override IS the grant — it can seat a team even
     // on a plan without the staff_accounts feature. Plan-based seating
@@ -1574,12 +1716,23 @@ export class OwnerService {
     // The seat check itself runs inside the write transaction below,
     // under the venue row lock — see assertSeatAvailable.
     // The role must be one the super admin allowed for this arena — or a
-    // role this owner created for their own team.
+    // role this owner created for their own team. A disabled role is
+    // never assignable (it would silently gain its permissions the
+    // moment an admin re-enables it), and neither is another owner's
+    // role (legacy links must not leak across owners).
     const allowed = await this.prisma.venueAllowedRole.findUnique({
       where: { venueId_roleId: { venueId, roleId: dto.roleId } },
       include: { role: true },
     });
     let staffRole = allowed?.role ?? null;
+    if (staffRole) {
+      if (!staffRole.isActive) {
+        throw new ForbiddenException('This role is disabled and cannot be assigned');
+      }
+      if (staffRole.ownerId !== null && staffRole.ownerId !== venue.ownerId) {
+        throw new ForbiddenException('This role belongs to another owner');
+      }
+    }
     if (!staffRole) {
       staffRole = await this.prisma.role.findFirst({
         where: { id: dto.roleId, ownerId: user.id, scope: 'arena', isActive: true },

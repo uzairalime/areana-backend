@@ -181,6 +181,15 @@ model Venue {
   /// paused on public surfaces exactly like a suspended owner's venue.
   billingPaused     Boolean   @default(false)
   billingDueNotifiedFor DateTime?
+  /// Frozen current paid period (plan changes must not re-anchor it):
+  /// set when a plan changes without restart, from the period in effect
+  /// at that moment. Period boundaries then walk forward from this
+  /// anchor instead of being recomputed from the new plan's freeMonths.
+  billingPeriodStart DateTime?
+  billingPeriodEnd   DateTime?
+  /// Yearly price locked for the frozen period above; the new plan's
+  /// price applies from the next period, not retroactively.
+  billingPeriodPrice Int?
   /// Per-arena court cap set by the super admin. Null = the plan's
   /// maxCourts applies. Overrides the plan when set.
   courtLimitOverride Int?
@@ -581,6 +590,10 @@ model Dispute {
   resolvedBy   User?     @relation("ResolvedDisputes", fields: [resolvedById], references: [id])
   createdAt    DateTime  @default(now())
   resolvedAt   DateTime?
+  /// Race-safe open guard: set to the booking id while the dispute is
+  /// open, cleared on resolution. NULLs are distinct in Postgres, so
+  /// legacy rows (NULL) never collide with a new open dispute.
+  openKey      String?   @unique
 
   @@index([status])
 }
@@ -599,6 +612,10 @@ model VenueReport {
   resolvedBy   User?     @relation("ResolvedVenueReports", fields: [resolvedById], references: [id])
   createdAt    DateTime  @default(now())
   resolvedAt   DateTime?
+  /// Race-safe outstanding guard: set to "<venueId>:<userId>" while the
+  /// report is open or reviewed, cleared once actioned/dismissed.
+  /// NULLs are distinct in Postgres, so legacy rows never collide.
+  openKey      String?   @unique
 
   @@index([venueId, status])
   @@index([status])

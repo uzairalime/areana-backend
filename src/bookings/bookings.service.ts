@@ -99,7 +99,9 @@ export class BookingsService {
           date,
           startMinutes,
           endMinutes,
-          totalPrice: gross - discount,
+          // Never store a negative price: a discount larger than the
+          // gross (e.g. a misconfigured promo) floors at zero.
+          totalPrice: Math.max(0, gross - discount),
           discountAmount: discount,
           promoCodeId: promo?.id,
           status: court.venue.autoAccept ? BookingStatus.confirmed : BookingStatus.pending,
@@ -302,6 +304,7 @@ export class BookingsService {
     });
     for (const b of affected) {
       await this.rejectPendingReschedules(b.id);
+      await this.releasePromo(b.id);
       await this.cleanupGamePost(b.id, 'The host cancelled their booking, so this game is off.');
       const full = await this.prisma.booking.findUnique({
         where: { id: b.id },
@@ -382,6 +385,7 @@ export class BookingsService {
     await this.rejectPendingReschedules(bookingId);
     await this.cleanupGamePost(bookingId, 'The host cancelled their booking, so this game is off.');
     await this.notifyWaitlist(booking);
+    await this.releasePromo(bookingId);
     return updated;
   }
 
@@ -594,6 +598,7 @@ export class BookingsService {
       throw new BadRequestException('This booking has already been decided');
     }
     const updated = await this.prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
+    await this.releasePromo(bookingId);
     if (booking.userId) {
       await this.notifications.notifyPlayerDecision(booking.userId, false, booking.venue.name, this.fmtWhen(booking), reason).catch(() => {});
     }
@@ -617,10 +622,40 @@ export class BookingsService {
         }
       } catch {
         await this.prisma.booking.update({ where: { id: b.id }, data: { status: BookingStatus.cancelled } });
+        await this.releasePromo(b.id);
         skipped.push({ id: b.id, reason: 'Slot no longer available' });
       }
     }
     return { accepted, skipped };
+  }
+
+  /**
+   * Defense in depth for check-in: bookings are created through the
+   * getActiveCourt choke point, but a venue sanctioned, paused, or
+   * suspended afterwards must not keep accepting check-ins for
+   * bookings that slipped through (e.g. made before the sanction).
+   */
+  private async assertVenueAcceptsCheckIns(venueId: string) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: {
+        status: true,
+        archivedAt: true,
+        billingPaused: true,
+        moderationStatus: true,
+        owner: { select: { status: true } },
+      },
+    });
+    if (
+      !venue ||
+      venue.status !== 'approved' ||
+      venue.archivedAt ||
+      venue.billingPaused ||
+      venue.moderationStatus !== 'none' ||
+      venue.owner.status !== 'active'
+    ) {
+      throw new BadRequestException('This arena is not currently accepting check-ins');
+    }
   }
 
   async checkInByCode(checkInCode: string, venueId: string) {
@@ -632,12 +667,14 @@ export class BookingsService {
       },
     });
     if (!booking) throw new NotFoundException('Invalid check-in code');
+    await this.assertVenueAcceptsCheckIns(venueId);
     return booking;
   }
 
   async checkIn(bookingId: string) {
     const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
     if (!booking) throw new NotFoundException('Booking not found');
+    await this.assertVenueAcceptsCheckIns(booking.venueId);
     if (booking.checkedInAt) {
       throw new BadRequestException('This booking is already checked in');
     }
@@ -699,16 +736,82 @@ export class BookingsService {
     // reschedule request.
     await this.rejectPendingReschedules(bookingId);
     if (booking.userId) {
-      const user = await this.prisma.user.update({
-        where: { id: booking.userId },
-        data: { noShowCount: { increment: 1 } },
-      });
-      const limit = parseInt((await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value ?? '3', 10);
-      if (user.noShowCount >= limit && user.status === UserStatus.active) {
-        await this.suspendPlayerWithCascade(booking.userId);
-      }
+      await this.recordNoShowStrike(booking.userId);
     }
     return updated;
+  }
+
+  /**
+   * One no-show strike, shared by the owner path (markNoShow) and the
+   * dispute path (admin confirm_no_show): increment, then suspend at
+   * the configured strike limit with the full cascade.
+   */
+  async recordNoShowStrike(userId: string) {
+    const user = await this.prisma.user.update({
+      where: { id: userId },
+      data: { noShowCount: { increment: 1 } },
+    });
+    const limit = parseInt(
+      (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value ?? '3',
+      10,
+    );
+    if (user.noShowCount >= limit && user.status === UserStatus.active) {
+      await this.suspendPlayerWithCascade(userId);
+    }
+    return user.noShowCount;
+  }
+
+  /** Refund a booking's promo (uses are given back on cancel/expiry). */
+  async releasePromo(bookingId: string) {
+    await this.promos.refundBookingPromo(bookingId);
+  }
+
+  /**
+   * Sanction / suspension / overdue-pause policy: when a venue stops
+   * being bookable, its upcoming bookings do not stand — they are
+   * cancelled, their game posts and waitlists are cleaned up, promos
+   * are refunded, and every affected player is told why.
+   */
+  async cancelVenueUpcomingBookings(venueId: string, reason: string) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { name: true },
+    });
+    const upcoming = await this.prisma.booking.findMany({
+      where: {
+        venueId,
+        date: { gte: startOfToday() },
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+      },
+      select: {
+        id: true,
+        userId: true,
+        date: true,
+        courtId: true,
+        startMinutes: true,
+        endMinutes: true,
+      },
+    });
+    for (const b of upcoming) {
+      await this.prisma.booking.update({
+        where: { id: b.id },
+        data: { status: BookingStatus.cancelled },
+      });
+      await this.rejectPendingReschedules(b.id);
+      await this.cleanupGamePost(b.id, 'The arena cancelled the booking, so this game is off.');
+      await this.notifyWaitlist(b);
+      await this.releasePromo(b.id);
+      if (b.userId) {
+        await this.notifications
+          .pushToUser(b.userId, {
+            title: 'Booking cancelled',
+            body: `Your booking at ${venue?.name ?? 'the arena'} on ${b.date.toISOString().slice(0, 10)} was cancelled: ${reason}.`,
+            data: { type: 'booking_cancelled', venueId },
+          })
+          .catch(() => {});
+      }
+    }
+    return upcoming.length;
   }
 
   /**
@@ -740,6 +843,7 @@ export class BookingsService {
         data: { status: BookingStatus.cancelled },
       });
       await this.rejectPendingReschedules(b.id);
+      await this.releasePromo(b.id);
       await this.cleanupGamePost(b.id, 'This game is off — the host is no longer on Areana.');
       await this.notifyWaitlist(b);
       if (b.venue.owner?.email) {
@@ -875,6 +979,7 @@ export class BookingsService {
     await this.rejectPendingReschedules(bookingId);
     await this.cleanupGamePost(bookingId, 'The venue cancelled the booking, so this game is off.');
     await this.notifyWaitlist(booking);
+    await this.releasePromo(bookingId);
     return updated;
   }
 

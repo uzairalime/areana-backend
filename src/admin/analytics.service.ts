@@ -134,7 +134,9 @@ export class AnalyticsService {
         }),
         this.prisma.venueEvent.count({ where: { type: 'view', day: dateWhere(range) } }),
         this.prisma.venueEvent.count({ where: { type: 'click', day: dateWhere(range) } }),
-        this.prisma.venueReport.count({ where: { status: 'open' } }),
+        // Outstanding = open + reviewed: a report under investigation
+        // is still an open item.
+        this.prisma.venueReport.count({ where: { status: { in: ['open', 'reviewed'] } } }),
       ]);
     return {
       openReports,
@@ -289,7 +291,10 @@ export class AnalyticsService {
   }
 
   // ------------------------------------------------------- 5a. venue drill-down
-  async venueDetail(venueId: string) {
+  // A range, when given, applies to the drill-down too (bookings by
+  // play date, reviews/customers by created date) — otherwise a
+  // period-filtered leaderboard would open an all-time modal.
+  async venueDetail(venueId: string, range: AnalyticsRange = {}) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
       include: {
@@ -302,20 +307,20 @@ export class AnalyticsService {
     if (!venue) throw new NotFoundException('Venue not found');
     const [bookings, reviews, customers] = await Promise.all([
       this.prisma.booking.findMany({
-        where: { venueId },
+        where: { venueId, date: dateWhere(range) },
         include: { court: { select: { name: true } }, user: { select: { name: true } } },
         orderBy: [{ date: 'desc' }, { startMinutes: 'desc' }],
         take: 200,
       }),
       this.prisma.review.findMany({
-        where: { venueId },
+        where: { venueId, createdAt: dateWhere(range) },
         include: { user: { select: { name: true } } },
         orderBy: { createdAt: 'desc' },
         take: 50,
       }),
       this.prisma.booking.groupBy({
         by: ['userId'],
-        where: { venueId, userId: { not: null } },
+        where: { venueId, userId: { not: null }, date: dateWhere(range) },
         _count: true,
       }),
     ]);
@@ -335,7 +340,7 @@ export class AnalyticsService {
   }
 
   // ------------------------------------------------------- 5b. owner drill-down
-  async ownerDetail(ownerId: string) {
+  async ownerDetail(ownerId: string, range: AnalyticsRange = {}) {
     const owner = await this.prisma.user.findUnique({
       where: { id: ownerId },
       include: { role: { select: { name: true } } },
@@ -348,7 +353,7 @@ export class AnalyticsService {
     const perVenue = await Promise.all(
       venues.map(async (v) => {
         const agg = await this.prisma.booking.aggregate({
-          where: { venueId: v.id, status: { in: ACTIVE_BOOKING } },
+          where: { venueId: v.id, status: { in: ACTIVE_BOOKING }, date: dateWhere(range) },
           _count: true,
           _sum: { totalPrice: true },
         });
@@ -368,7 +373,7 @@ export class AnalyticsService {
   }
 
   // -------------------------------------------------------- 5c. user drill-down
-  async userDetail(userId: string) {
+  async userDetail(userId: string, range: AnalyticsRange = {}) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: { role: { select: { name: true } } },
@@ -376,14 +381,14 @@ export class AnalyticsService {
     if (!user) throw new NotFoundException('User not found');
     const [bookings, referralsMade, redemptions, disputes] = await Promise.all([
       this.prisma.booking.findMany({
-        where: { userId },
+        where: { userId, date: dateWhere(range) },
         include: { venue: { select: { name: true } }, court: { select: { name: true } } },
         orderBy: [{ date: 'desc' }],
         take: 100,
       }),
-      this.prisma.referral.count({ where: { referrerId: userId } }),
-      this.prisma.promoRedemption.count({ where: { userId } }),
-      this.prisma.dispute.count({ where: { raisedById: userId } }),
+      this.prisma.referral.count({ where: { referrerId: userId, createdAt: dateWhere(range) } }),
+      this.prisma.promoRedemption.count({ where: { userId, createdAt: dateWhere(range) } }),
+      this.prisma.dispute.count({ where: { raisedById: userId, createdAt: dateWhere(range) } }),
     ]);
     const { passwordHash: _p, ...safe } = user;
     return {

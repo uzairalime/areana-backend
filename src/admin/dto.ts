@@ -69,9 +69,11 @@ export class UpdatePromoDto {
 
 // --------------------------------------------------------------- disputes
 export class ResolveDisputeDto {
-  @ApiProperty({ enum: ['confirm_no_show', 'dismiss', 'credit'] })
-  @IsIn(['confirm_no_show', 'dismiss', 'credit'])
-  action: 'confirm_no_show' | 'dismiss' | 'credit';
+  // No `credit` action: no credit mechanism exists, and resolving as
+  // "credit" while delivering nothing is worse than refusing it.
+  @ApiProperty({ enum: ['confirm_no_show', 'dismiss'] })
+  @IsIn(['confirm_no_show', 'dismiss'])
+  action: 'confirm_no_show' | 'dismiss';
   @ApiPropertyOptional() @IsOptional() @IsString() resolution?: string;
 }
 

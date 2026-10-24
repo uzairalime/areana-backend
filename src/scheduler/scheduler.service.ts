@@ -32,19 +32,35 @@ export class SchedulerService {
     const cutoff = new Date(Date.now() - hours * 3600_000);
     const stale = await this.prisma.booking.findMany({
       where: { status: BookingStatus.pending, createdAt: { lt: cutoff } },
-      select: { id: true, userId: true, venue: { select: { name: true } } },
+      select: {
+        id: true,
+        userId: true,
+        courtId: true,
+        date: true,
+        startMinutes: true,
+        endMinutes: true,
+        venue: { select: { name: true } },
+      },
     });
+    let expired = 0;
     for (const b of stale) {
-      await this.prisma.booking.update({
-        where: { id: b.id },
+      // Atomic claim: the status condition inside the UPDATE means an
+      // owner accepting between the find and this write wins — the
+      // just-confirmed booking is never overwritten to cancelled.
+      const claimed = await this.prisma.booking.updateMany({
+        where: { id: b.id, status: BookingStatus.pending },
         data: { status: BookingStatus.cancelled },
       });
+      if (claimed.count === 0) continue;
+      expired++;
       await this.bookings.rejectPendingReschedules(b.id, 'Booking expired');
+      await this.bookings.releasePromo(b.id);
+      await this.bookings.notifyWaitlist(b);
       if (b.userId) {
         await this.notifications.notifyPlayerDecision(b.userId, false, b.venue.name, '', 'The arena did not respond in time');
       }
     }
-    if (stale.length > 0) this.logger.log(`Expired ${stale.length} pending bookings`);
+    if (expired > 0) this.logger.log(`Expired ${expired} pending bookings`);
   }
 
   /** Remind players ~2h before their slot. */

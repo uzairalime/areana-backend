@@ -77,20 +77,20 @@ export class AdminController {
 
   @ApiTags('admin · analytics')
   @Get('analytics/venues/:id')
-  venueDetail(@Param('id') id: string) {
-    return this.analytics.venueDetail(id);
+  venueDetail(@Param('id') id: string, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.analytics.venueDetail(id, { from, to });
   }
 
   @ApiTags('admin · analytics')
   @Get('analytics/owners/:id')
-  ownerDetail(@Param('id') id: string) {
-    return this.analytics.ownerDetail(id);
+  ownerDetail(@Param('id') id: string, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.analytics.ownerDetail(id, { from, to });
   }
 
   @ApiTags('admin · analytics')
   @Get('analytics/users/:id')
-  userDetail(@Param('id') id: string) {
-    return this.analytics.userDetail(id);
+  userDetail(@Param('id') id: string, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.analytics.userDetail(id, { from, to });
   }
 
   // ------------------------------------------------------------------- users
@@ -524,7 +524,7 @@ export class AdminController {
   markVenuePaid(
     @CurrentUser() u: AuthUser,
     @Param('id') id: string,
-    @Body() body?: { method?: string; note?: string },
+    @Body() body?: { method?: string; note?: string; amount?: number },
   ) {
     return this.admin.markVenuePaid(u.id, id, body);
   }
@@ -566,7 +566,40 @@ export class AdminController {
     return this.admin.revokeVenueBadge(u.id, id, badgeId);
   }
 
+  @ApiTags('admin · venues')
+  @Post('venues/:id/unsuspend')
+  unsuspendVenue(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.admin.unsuspendVenue(u.id, id);
+  }
+
+  @ApiTags('admin · venues')
+  @Post('venues/:id/requeue')
+  requeueVenue(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.admin.requeueVenue(u.id, id);
+  }
+
+  @ApiTags('admin · venues')
+  @Post('courts/:id/requeue')
+  requeueCourt(@CurrentUser() u: AuthUser, @Param('id') id: string) {
+    return this.admin.requeueCourt(u.id, id);
+  }
+
   // ---------------------------------------------------------------- disputes
+  @ApiTags('admin · venues')
+  @Get('venue-reports')
+  listVenueReports(
+    @Query('status') status?: string,
+    @Query('venueId') venueId?: string,
+    @Query() query?: OffsetQueryDto,
+  ) {
+    return this.admin.listVenueReports({
+      status,
+      venueId,
+      page: query?.page ?? 1,
+      limit: query?.limit,
+    });
+  }
+
   @ApiTags('admin · venues')
   @Post('venue-reports/:id/resolve')
   resolveVenueReport(

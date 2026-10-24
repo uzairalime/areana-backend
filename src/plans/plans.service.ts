@@ -7,6 +7,9 @@ import {
 import { Prisma, Venue } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { NotificationsService } from '../notifications/notifications.service';
+import { BookingsService } from '../bookings/bookings.service';
+
+const PAYMENT_METHODS = ['bank', 'raast', 'cash', 'other'];
 
 /**
  * Subscription plans + venue billing.
@@ -57,6 +60,7 @@ export class PlansService {
   constructor(
     private prisma: PrismaService,
     private notifications: NotificationsService,
+    private bookings: BookingsService,
   ) {}
 
   // ------------------------------------------------------------------ plans
@@ -117,6 +121,18 @@ export class PlansService {
     const existing = await this.prisma.plan.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Plan not found');
     if (dto.features) this.assertFeatures(dto.features);
+    // The platform must never be left with zero default plans: venues
+    // without their own plan would silently stop being billed or paused.
+    if (dto.isDefault === false && existing.isDefault) {
+      const others = await this.prisma.plan.count({
+        where: { isDefault: true, id: { not: id } },
+      });
+      if (others === 0) {
+        throw new BadRequestException(
+          'At least one plan must stay the default — make another plan the default first',
+        );
+      }
+    }
     const plan = await this.prisma.$transaction(async (tx) => {
       if (dto.isDefault) {
         await tx.plan.updateMany({ data: { isDefault: false } });
@@ -175,30 +191,67 @@ export class PlansService {
     });
   }
 
+  /**
+   * Billing actions only make sense for a live arena. An archived venue
+   * must not gain ledger rows or an un-pause, and a venue that never
+   * went live must not have its billing clock started sideways.
+   */
+  private assertBillableVenue(venue: Venue) {
+    if (venue.archivedAt) {
+      throw new BadRequestException('This arena is archived — billing actions are not available');
+    }
+    if (venue.status !== 'approved') {
+      throw new BadRequestException('Billing actions apply to live (approved) arenas');
+    }
+  }
+
   async assignPlan(venueId: string, planId: string, restartBilling = false) {
     const plan = await this.prisma.plan.findUnique({ where: { id: planId } });
     if (!plan) throw new NotFoundException('Plan not found');
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
-    const updated = await this.prisma.venue.update({
+    this.assertBillableVenue(venue);
+    if (restartBilling) {
+      return this.prisma.venue.update({
+        where: { id: venueId },
+        data: {
+          planId,
+          billingStartAt: new Date(),
+          billingPaidUntil: null,
+          freeUntilOverride: null,
+          billingPeriodStart: null,
+          billingPeriodEnd: null,
+          billingPeriodPrice: null,
+          billingPaused: false,
+          billingDueNotifiedFor: null,
+        },
+        include: { plan: true },
+      });
+    }
+    // Unchecked input: planId is a scalar FK, which the checked
+    // VenueUpdateInput (relation-only) does not accept.
+    const data: Prisma.VenueUncheckedUpdateInput = { planId };
+    if (planId !== venue.planId && !venue.billingPeriodStart) {
+      // Freeze the period in effect BEFORE the switch: without this,
+      // the new plan's freeMonths would retroactively re-anchor every
+      // period boundary (a trial venue switched to a 0-free-months plan
+      // would instantly go due; a longer-free plan would resurrect an
+      // overdue venue into "trial" with no payment).
+      const ctx = await this.context(venue);
+      if (ctx) {
+        data.billingPeriodStart = ctx.periodStart;
+        data.billingPeriodEnd = ctx.periodEnd;
+        data.billingPeriodPrice = ctx.plan.priceYearly;
+      }
+    }
+    // Deliberately no billingStartAt here: assigning a plan never starts
+    // the billing clock. Only approval (startBilling) or an explicit
+    // restart does — otherwise "set the plan for later" bills immediately.
+    return this.prisma.venue.update({
       where: { id: venueId },
-      data: {
-        planId,
-        ...(restartBilling
-          ? {
-              billingStartAt: new Date(),
-              billingPaidUntil: null,
-              freeUntilOverride: null,
-              billingPaused: false,
-              billingDueNotifiedFor: null,
-            }
-          : venue.billingStartAt
-            ? {}
-            : { billingStartAt: new Date() }),
-      },
+      data,
       include: { plan: true },
     });
-    return updated;
   }
 
   async extendFree(venueId: string, months: number) {
@@ -207,12 +260,32 @@ export class PlansService {
       include: { plan: true },
     });
     if (!venue) throw new NotFoundException('Venue not found');
+    this.assertBillableVenue(venue);
     const summary = await this.billingSummary(venue);
-    const base = summary.freeUntil ? new Date(summary.freeUntil) : new Date();
-    const freeUntil = addMonths(base, months);
+    const now = new Date();
+    const freeUntil = summary.freeUntil ? new Date(summary.freeUntil) : null;
+    // Stack onto paid coverage when paid, else onto the later of the
+    // current free date and now — never onto a long-past free date,
+    // which made the extension a no-op for due/overdue venues.
+    const base =
+      venue.billingPaidUntil && venue.billingPaidUntil > now
+        ? venue.billingPaidUntil
+        : freeUntil && freeUntil > now
+          ? freeUntil
+          : now;
+    const newFreeUntil = addMonths(base, months);
     const updated = await this.prisma.venue.update({
       where: { id: venueId },
-      data: { freeUntilOverride: freeUntil, billingPaused: false },
+      data: {
+        freeUntilOverride: newFreeUntil,
+        // Only un-pause when the venue is actually free again; an
+        // extension that still ends in the past must not revive it.
+        ...(newFreeUntil > now ? { billingPaused: false } : {}),
+        // A new free anchor re-derives periods — drop any frozen period.
+        billingPeriodStart: null,
+        billingPeriodEnd: null,
+        billingPeriodPrice: null,
+      },
       include: { plan: true },
     });
     return updated;
@@ -222,39 +295,64 @@ export class PlansService {
   async markPaid(
     venueId: string,
     actorId?: string,
-    opts?: { method?: string; note?: string },
+    opts?: { method?: string; note?: string; amount?: number },
   ) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
       include: { plan: true },
     });
     if (!venue) throw new NotFoundException('Venue not found');
+    this.assertBillableVenue(venue);
+    if (opts?.method && !PAYMENT_METHODS.includes(opts.method)) {
+      throw new BadRequestException(
+        `Unknown payment method — expected one of: ${PAYMENT_METHODS.join(', ')}`,
+      );
+    }
+    let amount: number | undefined;
+    if (opts?.amount !== undefined) {
+      amount = Math.round(Number(opts.amount));
+      if (!Number.isFinite(amount) || amount <= 0) {
+        throw new BadRequestException('Payment amount must be a positive number');
+      }
+    }
     const ctx = await this.context(venue);
     if (!ctx) throw new BadRequestException('Billing has not started for this venue');
+    // Idempotency: this period is already settled — a retry or
+    // double-click must not create a second ledger row and double the
+    // subscription revenue.
+    if (ctx.paidUntil && ctx.paidUntil >= ctx.periodEnd) {
+      throw new BadRequestException('This billing period is already paid');
+    }
     const paidUntil =
       ctx.paidUntil && ctx.paidUntil > ctx.periodEnd
         ? ctx.paidUntil
         : ctx.periodEnd;
-    const updated = await this.prisma.venue.update({
-      where: { id: venueId },
-      data: { billingPaidUntil: paidUntil, billingPaused: false },
-      include: { plan: true },
+    // Flag update + ledger insert in ONE transaction: a failed insert
+    // must not leave the venue marked paid with no ledger row.
+    return this.prisma.$transaction(async (tx) => {
+      const updated = await tx.venue.update({
+        where: { id: venueId },
+        data: { billingPaidUntil: paidUntil, billingPaused: false },
+        include: { plan: true },
+      });
+      // Every settlement lands in the payments ledger, so platform revenue
+      // is a sum of records — never a guess from flags. An explicit
+      // amount records what was actually received (discounted / partial
+      // cash); otherwise the period price in effect applies.
+      await tx.venuePayment.create({
+        data: {
+          venueId,
+          planId: ctx.plan.id,
+          amount: amount ?? ctx.price,
+          method: opts?.method ?? null,
+          note: opts?.note ?? null,
+          periodStart: ctx.periodStart,
+          periodEnd: ctx.periodEnd,
+          recordedById: actorId ?? null,
+        },
+      });
+      return updated;
     });
-    // Every settlement lands in the payments ledger, so platform revenue
-    // is a sum of records — never a guess from flags.
-    await this.prisma.venuePayment.create({
-      data: {
-        venueId,
-        planId: ctx.plan.id,
-        amount: ctx.plan.priceYearly,
-        method: opts?.method ?? null,
-        note: opts?.note ?? null,
-        periodStart: ctx.periodStart,
-        periodEnd: ctx.periodEnd,
-        recordedById: actorId ?? null,
-      },
-    });
-    return updated;
   }
 
   // ---------------------------------------------------------------- billing
@@ -297,22 +395,43 @@ export class PlansService {
       venue.freeUntilOverride ??
       addMonths(venue.billingStartAt, plan.freeMonths);
     const now = new Date();
-    // Yearly periods anchored at freeUntil.
-    let periodStart = freeUntil;
-    let periodEnd = addMonths(freeUntil, 12);
-    while (now >= periodEnd) {
-      periodStart = periodEnd;
-      periodEnd = addMonths(periodStart, 12);
-    }
-    while (now < periodStart && periodStart > freeUntil) {
-      periodEnd = periodStart;
-      periodStart = addMonths(periodStart, -12);
+    // Yearly periods. When a plan changed without restart, the frozen
+    // period (set by assignPlan) is the anchor: boundaries walk forward
+    // from it, and its locked price applies until that period ends —
+    // the new plan's price applies from the next period, not this one.
+    let periodStart: Date;
+    let periodEnd: Date;
+    let price: number;
+    if (venue.billingPeriodStart && venue.billingPeriodEnd) {
+      periodStart = venue.billingPeriodStart;
+      periodEnd = venue.billingPeriodEnd;
+      while (now >= periodEnd) {
+        periodStart = periodEnd;
+        periodEnd = addMonths(periodStart, 12);
+      }
+      price =
+        now < venue.billingPeriodEnd && venue.billingPeriodPrice != null
+          ? venue.billingPeriodPrice
+          : plan.priceYearly;
+    } else {
+      periodStart = freeUntil;
+      periodEnd = addMonths(freeUntil, 12);
+      while (now >= periodEnd) {
+        periodStart = periodEnd;
+        periodEnd = addMonths(periodStart, 12);
+      }
+      while (now < periodStart && periodStart > freeUntil) {
+        periodEnd = periodStart;
+        periodStart = addMonths(periodStart, -12);
+      }
+      price = plan.priceYearly;
     }
     return {
       plan,
       freeUntil,
       periodStart,
       periodEnd,
+      price,
       paidUntil: venue.billingPaidUntil,
       now,
     };
@@ -347,7 +466,7 @@ export class PlansService {
         nextDueAt: prepaid
           ? paidUntil.toISOString()
           : freeUntil.toISOString(),
-        amountDue: prepaid ? 0 : ctx.plan.priceYearly,
+        amountDue: prepaid ? 0 : ctx.price,
       };
     }
     if (paidUntil && paidUntil > now) {
@@ -365,7 +484,7 @@ export class PlansService {
       ...base,
       status: overdue ? 'overdue' : 'due',
       nextDueAt: periodStart.toISOString(),
-      amountDue: ctx.plan.priceYearly,
+      amountDue: ctx.price,
       graceEndsAt: graceEnd.toISOString(),
     };
   }
@@ -386,9 +505,13 @@ export class PlansService {
           where: { id: venue.id },
           data: { billingPaused: shouldPause },
         });
-        if (shouldPause) paused++;
-        else resumed++;
         if (shouldPause) {
+          paused++;
+          // Overdue-pause follows the sanction policy: upcoming
+          // bookings do not stand at a venue players can no longer see.
+          await this.bookings
+            .cancelVenueUpcomingBookings(venue.id, 'the arena\'s plan payment is overdue')
+            .catch(() => {});
           await this.notifications
             .pushToUser(venue.ownerId, {
               title: 'Venue paused — plan payment overdue',
@@ -396,7 +519,7 @@ export class PlansService {
               data: { type: 'billing_overdue' },
             })
             .catch(() => {});
-        }
+        } else resumed++;
       }
       // One due-reminder per period.
       if (summary.status === 'due' && summary.nextDueAt) {

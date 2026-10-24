@@ -51,13 +51,21 @@ export class PromosService {
       }
     } else {
       discount = Math.min(Number(promo.value), amount);
+      if (promo.maxDiscount != null) {
+        discount = Math.min(discount, Number(promo.maxDiscount));
+      }
     }
     return { promo, discount: Math.round(discount * 100) / 100 };
   }
 
   /**
    * Records promo usage. Pass the caller's transaction client to keep the
-   * booking + redemption atomic.
+   * booking + redemption atomic. Validation ran before the booking
+   * transaction, so it is re-checked here: a promo deactivated (or
+   * expired, or exhausted for this user) between validation and apply
+   * must not be consumed. With a transaction client the promo row is
+   * locked first, which serializes concurrent applies and makes the
+   * per-user count check accurate.
    */
   async applyPromo(
     promoId: string,
@@ -66,6 +74,23 @@ export class PromosService {
     tx?: Prisma.TransactionClient,
   ) {
     const db = tx ?? this.prisma;
+    if (tx) {
+      await tx.$queryRaw`SELECT id FROM "PromoCode" WHERE id = ${promoId} FOR UPDATE`;
+    }
+    const promo = await db.promoCode.findUnique({ where: { id: promoId } });
+    if (!promo || !promo.isActive) {
+      throw new BadRequestException('Promo code is no longer active');
+    }
+    const now = new Date();
+    if (promo.validFrom > now || promo.validTo < now) {
+      throw new BadRequestException('Promo code is expired');
+    }
+    const userUses = await db.promoRedemption.count({
+      where: { promoCodeId: promoId, userId },
+    });
+    if (userUses >= promo.perUserLimit) {
+      throw new BadRequestException('Promo code already used');
+    }
     // Atomic conditional increment: the WHERE re-checks the cap inside
     // the same UPDATE, so two simultaneous redemptions of the last use
     // can't both succeed (the old read-then-increment had a race window).
@@ -81,6 +106,26 @@ export class PromosService {
     return db.promoRedemption.create({
       data: { promoCodeId: promoId, userId, bookingId },
     });
+  }
+
+  /**
+   * Refund a booking's promo: delete its redemptions and give the uses
+   * back. Called on every cancel/expiry path, so a cancelled booking
+   * never permanently burns a single-use code.
+   */
+  async refundBookingPromo(bookingId: string) {
+    const redemptions = await this.prisma.promoRedemption.findMany({
+      where: { bookingId },
+      select: { promoCodeId: true },
+    });
+    if (redemptions.length === 0) return;
+    await this.prisma.promoRedemption.deleteMany({ where: { bookingId } });
+    for (const r of redemptions) {
+      await this.prisma.promoCode.updateMany({
+        where: { id: r.promoCodeId, usedCount: { gt: 0 } },
+        data: { usedCount: { decrement: 1 } },
+      });
+    }
   }
 
   /**

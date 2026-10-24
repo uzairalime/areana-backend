@@ -27,8 +27,10 @@ export class VenuesService {
     if (venue.ownerId === userId) {
       throw new BadRequestException('You cannot report your own arena.');
     }
+    // Outstanding means open OR reviewed: a report under investigation
+    // still blocks a duplicate, and counts in the outstanding queue.
     const existing = await this.prisma.venueReport.findFirst({
-      where: { venueId, userId, status: 'open' },
+      where: { venueId, userId, status: { in: ['open', 'reviewed'] } },
       select: { id: true },
     });
     if (existing) {
@@ -44,7 +46,7 @@ export class VenuesService {
       where: {
         venueId,
         userId,
-        status: { not: 'open' },
+        status: { in: ['actioned', 'dismissed'] },
         resolvedAt: { gte: thirtyDaysAgo },
       },
       select: { id: true },
@@ -70,14 +72,26 @@ export class VenuesService {
         'You have too many open reports right now — please wait for our team to review them.',
       );
     }
-    return this.prisma.venueReport.create({
-      data: {
-        venueId,
-        userId,
-        category: body.category,
-        details: body.details?.trim() || null,
-      },
-    });
+    // openKey is the race guard: two concurrent reports both pass the
+    // check above, but only one insert with this key can land.
+    try {
+      return await this.prisma.venueReport.create({
+        data: {
+          venueId,
+          userId,
+          category: body.category,
+          details: body.details?.trim() || null,
+          openKey: `${venueId}:${userId}`,
+        },
+      });
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        throw new ConflictException(
+          'You already have an open report for this arena — our team is reviewing it.',
+        );
+      }
+      throw e;
+    }
   }
 
   /** The player's own latest report for this arena (any status), if any. */
