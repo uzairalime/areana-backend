@@ -17,8 +17,13 @@ function dayBounds(range: AnalyticsRange): { gte?: Date; lt?: Date } {
   let { from, to } = range;
   if (from && to && from > to) [from, to] = [to, from];
   const out: { gte?: Date; lt?: Date } = {};
-  if (from) out.gte = new Date(`${from}T00:00:00.000Z`);
-  if (to) out.lt = new Date(new Date(`${to}T00:00:00.000Z`).getTime() + 86400000);
+  // PKT days, not UTC days: a PKT date starts at 19:00Z the previous
+  // day (UTC+05:00 year-round, no DST). The old UTC-midnight bounds
+  // silently cut off the first five hours of every PKT day on
+  // timestamp columns — and shifted the range by a day wherever an
+  // instant bound was compared against a @db.Date column.
+  if (from) out.gte = new Date(`${from}T00:00:00+05:00`);
+  if (to) out.lt = new Date(new Date(`${to}T00:00:00+05:00`).getTime() + 86400000);
   return out;
 }
 
@@ -257,7 +262,24 @@ export class AnalyticsService {
         where: { venueId: v.id, isActive: true },
         select: { openMinutes: true, closeMinutes: true },
       });
-      const days = new Set(bookings.map((b) => b.date.toISOString().slice(0, 10))).size || 1;
+      // Occupancy over the REQUESTED range's days, not the days that
+      // happen to have bookings: a venue booked on 2 of 30 days is 7%
+      // occupied, not 100%. Only when no bounded range is given
+      // (open-ended view) fall back to booked days.
+      let rangeFrom = range.from;
+      let rangeTo = range.to;
+      if (rangeFrom && rangeTo && rangeFrom > rangeTo) {
+        [rangeFrom, rangeTo] = [rangeTo, rangeFrom];
+      }
+      const days =
+        rangeFrom && rangeTo
+          ? Math.max(
+              1,
+              Math.round(
+                (new Date(rangeTo).getTime() - new Date(rangeFrom).getTime()) / 86400000,
+              ) + 1,
+            )
+          : new Set(bookings.map((b) => b.date.toISOString().slice(0, 10))).size || 1;
       const availMin = courts.reduce((s, c) => s + Math.max(0, c.closeMinutes - c.openMinutes), 0) * days;
       // New vs returning: first booking date per player at this venue.
       const firstSeen = new Map<string, string>();

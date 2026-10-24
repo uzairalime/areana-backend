@@ -289,15 +289,27 @@ export class BookingsService {
   }
 
   async cancelRecurringSeries(userId: string, recurrenceId: string) {
-    const affected = await this.prisma.booking.findMany({
+    const candidates = await this.prisma.booking.findMany({
       where: {
         recurrenceId,
         userId,
         status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
         date: { gte: startOfToday() },
       },
-      select: { id: true },
+      select: { id: true, date: true, startMinutes: true },
     });
+    // The started-check applies to today's occurrence too: a series
+    // cancel must not kill a slot that is already in play — it stays
+    // confirmed while the rest of the series is cancelled.
+    const now = new Date();
+    const nowMin = minutesSinceMidnight(now);
+    const affected = candidates.filter(
+      (b) =>
+        !(
+          b.date < startOfToday() ||
+          (isSameDay(b.date, now) && b.startMinutes <= nowMin)
+        ),
+    );
     const res = await this.prisma.booking.updateMany({
       where: { id: { in: affected.map((b) => b.id) } },
       data: { status: BookingStatus.cancelled },
@@ -668,7 +680,21 @@ export class BookingsService {
     });
     if (!booking) throw new NotFoundException('Invalid check-in code');
     await this.assertVenueAcceptsCheckIns(venueId);
-    return booking;
+    // Scan responses used to return bare booking details, leaving the
+    // panel to guess whether check-in would succeed. The flag mirrors
+    // checkIn's own rules exactly: confirmed, not already checked in,
+    // game day, and inside [start − 30min, end]. Non-confirmed codes
+    // are always false — a pending/cancelled booking is never
+    // check-in-able, whatever the clock says.
+    const now = new Date();
+    const nowMin = minutesSinceMidnight(now);
+    const canCheckIn =
+      booking.status === BookingStatus.confirmed &&
+      !booking.checkedInAt &&
+      isSameDay(booking.date, now) &&
+      nowMin >= booking.startMinutes - 30 &&
+      nowMin <= booking.endMinutes;
+    return { ...booking, canCheckIn };
   }
 
   async checkIn(bookingId: string) {
@@ -971,6 +997,17 @@ export class BookingsService {
     if (!booking) throw new NotFoundException('Booking not found');
     if (!UPCOMING.includes(booking.status)) {
       throw new BadRequestException('Only upcoming bookings can be cancelled');
+    }
+    // Same guards as the player cancel path: a slot that already
+    // started is history, not a cancellation — and a checked-in
+    // player is already on the court.
+    const now = new Date();
+    const started =
+      booking.date < startOfToday() ||
+      (isSameDay(booking.date, now) && booking.startMinutes <= minutesSinceMidnight(now));
+    if (started) throw new BadRequestException('Cannot cancel a slot that already started');
+    if (booking.checkedInAt) {
+      throw new BadRequestException('This booking is already checked in — it cannot be cancelled');
     }
     const updated = await this.prisma.booking.update({
       where: { id: bookingId },

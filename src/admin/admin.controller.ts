@@ -28,6 +28,7 @@ import {
   AdminUpdateCourtDto,
   SetCourtLimitDto,
   SetStaffLimitDto,
+  ResetPasswordDto,
 } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 import { PLAN_FEATURES } from '../plans/plans.service';
@@ -137,8 +138,14 @@ export class AdminController {
 
   @ApiTags('admin · users')
   @Post('users/:id/reject')
-  rejectUser(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.admin.rejectUser(u.id, id);
+  rejectUser(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() body?: { reason?: string }) {
+    return this.admin.rejectUser(u.id, id, body?.reason);
+  }
+
+  @ApiTags('admin · users')
+  @Post('users/:id/reset-password')
+  resetUserPassword(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: ResetPasswordDto) {
+    return this.admin.resetUserPassword(u.id, id, dto.newPassword);
   }
 
   @ApiTags('admin · users')
@@ -215,8 +222,8 @@ export class AdminController {
 
   @ApiTags('admin · approvals')
   @Post('venues/:id/reject')
-  rejectVenue(@CurrentUser() u: AuthUser, @Param('id') id: string) {
-    return this.admin.rejectVenue(u.id, id);
+  rejectVenue(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() body?: { reason?: string }) {
+    return this.admin.rejectVenue(u.id, id, body?.reason);
   }
 
   @ApiTags('admin · approvals')
@@ -241,11 +248,13 @@ export class AdminController {
   listVenuesAdmin(
     @Query('sort') sort?: string,
     @Query('range') range?: string,
+    @Query('status') status?: string,
     @Query() query?: OffsetQueryDto,
   ) {
     return this.admin.listVenuesAdmin({
       sort,
       range,
+      status,
       page: query?.page,
       limit: query?.limit,
     });
@@ -274,6 +283,8 @@ export class AdminController {
     });
   }
 
+  @ApiTags('admin · venues')
+  @RequirePerm('venues.onboard')
   @Get('venues/:id')
   venueDetailAdmin(@Param('id') id: string) {
     return this.admin.venueDetailAdmin(id);
@@ -286,7 +297,7 @@ export class AdminController {
     @Param('id') id: string,
     @Body() dto: SetCourtLimitDto,
   ) {
-    return this.admin.setCourtLimit(user.id, id, dto.limit ?? null);
+    return this.admin.setCourtLimit(user.id, id, dto.limit ?? null, dto.confirmBelowUsage ?? false);
   }
 
   @ApiTags('admin · venues')
@@ -296,7 +307,7 @@ export class AdminController {
     @Param('id') id: string,
     @Body() dto: SetStaffLimitDto,
   ) {
-    return this.admin.setStaffLimit(user.id, id, dto.limit ?? null);
+    return this.admin.setStaffLimit(user.id, id, dto.limit ?? null, dto.confirmBelowUsage ?? false);
   }
 
   @ApiTags('admin · venues')
@@ -332,6 +343,7 @@ export class AdminController {
   }
 
   @ApiTags('admin · venues')
+  @RequirePerm('venues.onboard')
   @Get('venues/onboard/check')
   onboardCheck(
     @Query('phone') phone?: string,
@@ -379,9 +391,9 @@ export class AdminController {
   rejectCourt(
     @CurrentUser() u: AuthUser,
     @Param('id') id: string,
-    @Body() body?: { note?: string },
+    @Body() body?: { note?: string; reason?: string },
   ) {
-    return this.admin.rejectCourt(u.id, id, body?.note);
+    return this.admin.rejectCourt(u.id, id, body?.reason ?? body?.note);
   }
 
   @ApiTags('admin · venues')
@@ -472,6 +484,7 @@ export class AdminController {
   }
 
   @ApiTags('admin · plans')
+  @RequirePerm('venues.onboard')
   @Get('plans')
   async listPlans() {
     return wrapList(await this.admin.listPlans());
@@ -497,8 +510,8 @@ export class AdminController {
 
   @ApiTags('admin · plans')
   @Get('plans/venues')
-  listVenueBilling(@Query() query: OffsetQueryDto) {
-    return this.admin.listVenueBilling(query.page ?? 1, query.limit);
+  listVenueBilling(@Query('status') status?: string, @Query() query?: OffsetQueryDto) {
+    return this.admin.listVenueBilling(query?.page ?? 1, query?.limit, status);
   }
 
   @ApiTags('admin · plans')
@@ -510,7 +523,7 @@ export class AdminController {
   @ApiTags('admin · plans')
   @Post('venues/:id/plan')
   assignVenuePlan(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: AssignPlanDto) {
-    return this.admin.assignVenuePlan(u.id, id, dto.planId, dto.restartBilling ?? false);
+    return this.admin.assignVenuePlan(u.id, id, dto.planId, dto.restartBilling ?? false, dto.confirmBelowUsage ?? false);
   }
 
   @ApiTags('admin · plans')
@@ -612,8 +625,8 @@ export class AdminController {
 
   @ApiTags('admin · disputes')
   @Get('disputes')
-  listDisputes(@Query('status') status?: string, @Query() query?: CursorQueryDto) {
-    return this.admin.listDisputes(status, query?.cursor, query?.limit);
+  listDisputes(@Query('status') status?: string, @Query('q') q?: string, @Query() query?: CursorQueryDto) {
+    return this.admin.listDisputes(status, query?.cursor, query?.limit, q);
   }
 
   @ApiTags('admin · disputes')

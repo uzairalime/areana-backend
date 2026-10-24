@@ -14,6 +14,12 @@ export function toYmd(d: Date): string {
   ).padStart(2, "0")}`;
 }
 
+function addMonths(d: Date, months: number): Date {
+  const out = new Date(d);
+  out.setMonth(out.getMonth() + months);
+  return out;
+}
+
 @Injectable()
 export class CourtsService {
   constructor(private prisma: PrismaService) {}
@@ -119,13 +125,88 @@ export class CourtsService {
     return [...oneOff, ...rec, ...spill];
   }
 
+  /**
+   * Live overdue-ness, mirroring PlansService billingSummary: the
+   * materialized billingPaused flag only flips on the nightly sweep,
+   * so between the grace end and 00:30 a venue whose fee is overdue
+   * would otherwise keep taking bookings. Computed here because
+   * injecting PlansService would cycle modules (Plans → Bookings →
+   * Courts). Keep this in step with plans.context/billingSummary.
+   */
+  private async isBillingOverdue(venue: {
+    billingStartAt: Date | null;
+    billingPaidUntil: Date | null;
+    freeUntilOverride: Date | null;
+    billingPeriodStart: Date | null;
+    billingPeriodEnd: Date | null;
+    planId: string | null;
+  }): Promise<boolean> {
+    if (!venue.billingStartAt) return false;
+    const plan = venue.planId
+      ? await this.prisma.plan.findUnique({ where: { id: venue.planId } })
+      : await this.prisma.plan.findFirst({ where: { isDefault: true } });
+    if (!plan) return false;
+    const freeUntil =
+      venue.freeUntilOverride ?? addMonths(venue.billingStartAt, plan.freeMonths);
+    const now = new Date();
+    if (now < freeUntil) return false;
+    if (venue.billingPaidUntil && venue.billingPaidUntil > now) return false;
+    let periodStart: Date;
+    let periodEnd: Date;
+    if (venue.billingPeriodStart && venue.billingPeriodEnd) {
+      periodStart = venue.billingPeriodStart;
+      periodEnd = venue.billingPeriodEnd;
+      while (now >= periodEnd) {
+        periodStart = periodEnd;
+        periodEnd = addMonths(periodStart, 12);
+      }
+    } else {
+      periodStart = freeUntil;
+      periodEnd = addMonths(freeUntil, 12);
+      while (now >= periodEnd) {
+        periodStart = periodEnd;
+        periodEnd = addMonths(periodStart, 12);
+      }
+      while (now < periodStart && periodStart > freeUntil) {
+        periodEnd = periodStart;
+        periodStart = addMonths(periodStart, -12);
+      }
+    }
+    const setting = await this.prisma.setting.findUnique({
+      where: { key: 'billingGraceDays' },
+    });
+    const grace = setting ? parseInt(setting.value, 10) || 14 : 14;
+    return now > new Date(periodStart.getTime() + grace * 24 * 3600_000);
+  }
+
+  /** The full live-venue predicate shared by listByVenue and getActiveCourt. */
+  private venuePredicate() {
+    return {
+      status: VenueStatus.approved,
+      archivedAt: null,
+      billingPaused: false,
+      moderationStatus: 'none',
+      owner: { status: UserStatus.active },
+    } as const;
+  }
+
   // Public: courts of one approved venue.
   async listByVenue(venueId: string) {
     const venue = await this.prisma.venue.findFirst({
-      where: { id: venueId, status: VenueStatus.approved },
-      select: { id: true },
+      where: { id: venueId, ...this.venuePredicate() },
+      select: {
+        id: true,
+        billingStartAt: true,
+        billingPaidUntil: true,
+        freeUntilOverride: true,
+        billingPeriodStart: true,
+        billingPeriodEnd: true,
+        planId: true,
+      },
     });
-    if (!venue) throw new NotFoundException('Venue not found');
+    if (!venue || (await this.isBillingOverdue(venue))) {
+      throw new NotFoundException('Venue not found');
+    }
     return this.prisma.court.findMany({
       where: { venueId, isActive: true, status: 'approved' },
       orderBy: { pricePerHour: 'asc' },
@@ -138,11 +219,13 @@ export class CourtsService {
         id: courtId,
         isActive: true,
         status: 'approved',
-        venue: { status: VenueStatus.approved, archivedAt: null, billingPaused: false, moderationStatus: 'none', owner: { status: UserStatus.active } },
+        venue: this.venuePredicate(),
       },
       include: { venue: true },
     });
-    if (!court) throw new NotFoundException('Court not found');
+    if (!court || (await this.isBillingOverdue(court.venue))) {
+      throw new NotFoundException('Court not found');
+    }
     return court;
   }
 }

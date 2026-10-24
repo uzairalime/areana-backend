@@ -65,6 +65,25 @@ export class CreatePromoDto {
 
 export class UpdatePromoDto {
   @ApiPropertyOptional() @IsOptional() @IsBoolean() isActive?: boolean;
+  // Value/dates/limits become editable once a promo exists (panel edit
+  // modal). Code and kind stay immutable. The service applies the same
+  // redeemed-promo freeze as the owner update path: terms may not
+  // change after any redemption, and maxUses may not drop below
+  // usedCount.
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) value?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) maxDiscount?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) maxUses?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(1) perUserLimit?: number;
+  @ApiPropertyOptional() @IsOptional() @IsString() validFrom?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() validTo?: string;
+}
+
+export class ResetPasswordDto {
+  @ApiProperty({ minLength: 8, maxLength: 72 })
+  @IsString()
+  @Min(8)
+  @Max(72)
+  newPassword: string;
 }
 
 // --------------------------------------------------------------- disputes
@@ -219,6 +238,10 @@ export class SetCourtLimitDto {
   @IsInt()
   @Min(1)
   limit?: number | null;
+  @ApiPropertyOptional({ description: 'Allow the new limit even when current usage is above it (audited)' })
+  @IsOptional()
+  @IsBoolean()
+  confirmBelowUsage?: boolean;
 }
 
 
@@ -228,4 +251,8 @@ export class SetStaffLimitDto {
   @IsInt()
   @Min(0)
   limit?: number | null;
+  @ApiPropertyOptional({ description: 'Allow the new limit even when current usage is above it (audited)' })
+  @IsOptional()
+  @IsBoolean()
+  confirmBelowUsage?: boolean;
 }

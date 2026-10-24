@@ -132,6 +132,14 @@ export class PromosService {
    * Creates a single-use personal promo (e.g. referral welcome/reward).
    * The unique code itself is the targeting mechanism.
    */
+  /**
+   * Bearer-token semantics, by design: the code is NOT bound to a
+   * recipient. `userId` names the intended holder but is not stored
+   * on the row and is never checked at redemption — anyone holding
+   * the code can redeem it, subject to maxUses/perUserLimit. Do not
+   * "fix" this by scoping redemption to userId without a product
+   * decision: the WELCOME/REWARD codes are meant to be shareable.
+   */
   async createPersonalPromo(
     userId: string,
     kind: 'percent' | 'flat',

@@ -36,6 +36,7 @@ import {
   UpdateMyRoleDto,
   CreateMyPromoDto,
   UpdateMyPromoDto,
+  ResetPasswordDto,
 } from './dto';
 
 @ApiBearerAuth()
@@ -467,6 +468,17 @@ export class OwnerController {
   @Delete('staff/:id')
   removeStaff(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.removeStaff(user, id);
+  }
+
+  @RequirePerm('staff.manage')
+  @ApiTags('owner · staff')
+  @Post('staff/:id/reset-password')
+  resetStaffPassword(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: ResetPasswordDto,
+  ) {
+    return this.owner.resetStaffPassword(user, id, dto.newPassword);
   }
 
   // --------------------------------------------------------------- customers

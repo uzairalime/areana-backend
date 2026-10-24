@@ -81,6 +81,14 @@ export class RejectDto {
   @ApiPropertyOptional() @IsOptional() @IsString() reason?: string;
 }
 
+export class ResetPasswordDto {
+  @ApiProperty({ minLength: 8, maxLength: 72 })
+  @IsString()
+  @Min(8)
+  @Max(72)
+  newPassword: string;
+}
+
 export class CheckInScanDto {
   @ApiProperty() @IsString() code: string;
   @ApiProperty() @IsString() venueId: string;

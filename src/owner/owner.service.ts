@@ -14,7 +14,7 @@ import { BookingsService } from '../bookings/bookings.service';
 import { StorageService } from '../storage/storage.service';
 import { ReviewsService } from '../reviews/reviews.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { parseDateOnly, startOfToday } from '../common/date.util';
+import { isSameDay, minutesSinceMidnight, parseDateOnly, startOfToday } from '../common/date.util';
 import { CourtsService, toYmd } from '../courts/courts.service';
 import { PlansService } from '../plans/plans.service';
 import { ARENA_ROLE_PERMISSIONS } from '../common/permissions';
@@ -239,7 +239,10 @@ export class OwnerService {
     // Identity edits on a LIVE venue go back through approval: approvals
     // guard what a venue claims to be, so a name/address/city/pin change
     // can't silently rewrite a reviewed listing. Operational fields
-    // (phone, description, amenities, photos) stay instant.
+    // (phone, description) stay instant — but an amenities/sports edit
+    // that breaks the go-live checklist also drops the venue to
+    // pending (see the readiness drop below), because the listing
+    // would no longer meet the bar players were shown.
     const current = await this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
     if (dto.minAdvanceMinutes !== undefined || dto.maxAdvanceDays !== undefined) {
       assertBookingWindow(
@@ -273,7 +276,41 @@ export class OwnerService {
       backToPending = true;
     }
     const venue = await this.prisma.venue.update({ where: { id: venueId }, data });
+    // Amenity/sport edits can break the go-live checklist (empty
+    // amenities, or a sport with no tagged photo left): an approved
+    // venue that no longer qualifies goes back to pending, surfaced
+    // through the same flag as the identity drop.
+    if (
+      venue.status === VenueStatus.approved &&
+      (dto.amenities !== undefined || dto.sports !== undefined)
+    ) {
+      const dropped = await this.dropVenueIfUnready(venueId);
+      if (dropped) {
+        backToPending = true;
+        return { ...(await this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } })), backToPending };
+      }
+    }
     return { ...venue, backToPending };
+  }
+
+  /**
+   * Re-run the go-live checklist after a photo/amenity/sport edit.
+   * Returns true when an approved venue was dropped to pending.
+   * Adding a photo or reordering never breaks readiness, so those
+   * paths skip this.
+   */
+  private async dropVenueIfUnready(venueId: string): Promise<boolean> {
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue || venue.status !== VenueStatus.approved) return false;
+    const courts = await this.prisma.court.count({
+      where: { venueId, isActive: true, status: 'approved' },
+    });
+    if (venueReadiness(venue, courts).ready) return false;
+    await this.prisma.venue.update({
+      where: { id: venueId },
+      data: { status: VenueStatus.pending },
+    });
+    return true;
   }
 
   async submitVenue(user: AuthUser, venueId: string) {
@@ -305,7 +342,7 @@ export class OwnerService {
     }
     return this.prisma.venue.update({
       where: { id: venueId },
-      data: { status: VenueStatus.pending },
+      data: { status: VenueStatus.pending, rejectionReason: null },
     });
   }
 
@@ -337,10 +374,13 @@ export class OwnerService {
   async tagVenueImage(user: AuthUser, venueId: string, url: string, sport: string | null) {
     const venue = await this.assertVenue(user, venueId);
     const entries = withSportTag(this.photoEntries(venue), url, sport);
-    return this.prisma.venue.update({
+    await this.prisma.venue.update({
       where: { id: venueId },
       data: { photos: entries },
     });
+    // Untagging can break the per-sport photo rule for an approved venue.
+    await this.dropVenueIfUnready(venueId);
+    return this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
   }
 
   /** Retire a venue: hidden from players everywhere, history kept. */
@@ -435,10 +475,14 @@ export class OwnerService {
     const venue = await this.assertVenue(user, venueId);
     await this.storage.deleteImage(url);
     const entries = this.photoEntries(venue).filter((e) => e.url !== url);
-    return this.prisma.venue.update({
+    await this.prisma.venue.update({
       where: { id: venueId },
       data: { images: entries.map((e) => e.url), photos: entries },
     });
+    // Removing a photo can drop an approved venue below 4 photos or
+    // remove the only tagged photo for a sport.
+    await this.dropVenueIfUnready(venueId);
+    return this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
   }
 
   /** Reorder a venue's photos (the first photo is the cover everywhere). */
@@ -519,13 +563,14 @@ export class OwnerService {
     }
     const { limit } = await this.plans.effectiveCourtLimit(venueId);
     // The venue row lock serializes creates per arena, so two
-    // simultaneous creates can't both pass the limit check. Rejected
-    // courts don't consume quota.
+    // simultaneous creates can't both pass the limit check. Only
+    // ACTIVE, non-rejected courts consume quota — a deactivated court
+    // frees its slot, and a rejected one never took one.
     const court = await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
       if (limit !== null) {
         const count = await tx.court.count({
-          where: { venueId, status: { not: 'rejected' } },
+          where: { venueId, isActive: true, status: { not: 'rejected' } },
         });
         if (count >= limit) {
           throw new ForbiddenException(
@@ -573,10 +618,22 @@ export class OwnerService {
         );
       }
     }
-    // Editing a rejected court re-submits it for approval.
+    // Editing a rejected court re-submits it for approval. An approved
+    // court whose price, hours, or slot length actually changes
+    // likewise goes back into the review queue — players were shown
+    // the old terms. (Sport is not owner-editable — the admin path
+    // covers its re-queue.) isActive toggles, name, size, surface,
+    // and indoor do not re-queue.
+    const requeueFields = ['pricePerHour', 'openMinutes', 'closeMinutes', 'slotMinutes'] as const;
+    const requeue =
+      court.status === 'rejected' ||
+      (court.status === 'approved' &&
+        requeueFields.some(
+          (f) => (data as Record<string, unknown>)[f] !== undefined && (data as Record<string, unknown>)[f] !== court[f],
+        ));
     const updated = await this.prisma.court.update({
       where: { id: courtId },
-      data: court.status === 'rejected' ? { ...data, status: 'pending' } : data,
+      data: requeue ? { ...data, status: 'pending', rejectionReason: null } : data,
     });
     await this.syncVenueSports(court.venueId);
     return updated;
@@ -1029,6 +1086,16 @@ export class OwnerService {
   async acceptBooking(user: AuthUser, bookingId: string) {
     const booking = await this.ownedBooking(user, bookingId);
     await this.assertVenueActionable(booking.venueId);
+    // Single-booking accept re-validates what the list view showed
+    // when the owner opened it: the court must still be bookable
+    // (live venue, approved court), and the slot must not have
+    // started while the request sat pending.
+    await this.courtsSvc.getActiveCourt(booking.courtId);
+    const now = new Date();
+    const started =
+      booking.date < startOfToday() ||
+      (isSameDay(booking.date, now) && booking.startMinutes <= minutesSinceMidnight(now));
+    if (started) throw new BadRequestException('Cannot accept a slot that already started');
     return this.bookingOps.acceptBooking(bookingId);
   }
 
@@ -1057,6 +1124,17 @@ export class OwnerService {
     await this.assertVenue(user, court.venueId);
     if (court.venue.status !== VenueStatus.approved) {
       throw new BadRequestException('Venue is not approved');
+    }
+    // Walk-ins are for guests physically present — never backdated.
+    // skipWindowCheck below only waives the min-advance window, not
+    // the past.
+    const slotDate = parseDateOnly(dto.date);
+    const now = new Date();
+    const past =
+      slotDate < startOfToday() ||
+      (isSameDay(slotDate, now) && dto.startMinutes <= minutesSinceMidnight(now));
+    if (past) {
+      throw new BadRequestException('Walk-ins cannot be backdated — the slot has already started');
     }
     const booking = await this.bookingOps.create({
       courtId: dto.courtId,
@@ -1504,7 +1582,7 @@ export class OwnerService {
       where: { ownerId: null, name: { equals: name, mode: 'insensitive' } },
     });
     if (systemClash) throw new ConflictException('That name belongs to a platform role');
-    return this.prisma.role.create({
+    const created = await this.prisma.role.create({
       data: {
         name,
         description: dto.description,
@@ -1513,6 +1591,30 @@ export class OwnerService {
         ownerId,
       },
     });
+    // Audit only, never a block: recreating a DISABLED role's exact
+    // permission set is usually "un-delete by re-creation" — but it
+    // can also silently resurrect a set the owner deliberately turned
+    // off, so it leaves a trail.
+    const newPerms = [...new Set(dto.permissions)].sort().join(',');
+    const disabled = await this.prisma.role.findMany({
+      where: { ownerId, isActive: false, id: { not: created.id } },
+      select: { id: true, name: true, permissions: true },
+    });
+    const duplicate = disabled.find(
+      (r) => [...new Set(r.permissions)].sort().join(',') === newPerms,
+    );
+    if (duplicate) {
+      await this.prisma.auditLog.create({
+        data: {
+          actorId: user.id,
+          action: 'role.create.duplicates_disabled',
+          entity: 'role',
+          entityId: created.id,
+          details: `duplicates disabled role "${duplicate.name}" (${duplicate.id})`,
+        },
+      });
+    }
+    return created;
   }
 
   async updateMyRole(user: AuthUser, roleId: string, dto: UpdateMyRoleDto) {
@@ -1802,6 +1904,51 @@ export class OwnerService {
     return safe;
   }
 
+  /**
+   * Owner-initiated password reset for a staff member at the owner's
+   * own venues. The caller must be the venue owner (not a staff
+   * member with staff.manage), the target must be arena-scoped staff
+   * linked to one of the caller's venues, and the target's sessions
+   * are revoked — exactly like changePassword. Audited.
+   */
+  async resetStaffPassword(user: AuthUser, staffId: string, newPassword: string) {
+    if (user.roleName !== 'owner') {
+      throw new ForbiddenException('Only the venue owner can reset a team member password');
+    }
+    const target = await this.prisma.user.findUnique({
+      where: { id: staffId },
+      include: { role: { select: { scope: true, name: true } } },
+    });
+    if (!target) throw new NotFoundException('Team member not found');
+    if (target.role.scope !== 'arena') {
+      throw new ForbiddenException('Only arena team members can be reset from here');
+    }
+    const link = await this.prisma.venueStaff.findFirst({
+      where: { userId: staffId, venue: { ownerId: user.id } },
+      select: { id: true },
+    });
+    if (!link) {
+      throw new ForbiddenException('This team member does not work at any of your venues');
+    }
+    await this.prisma.user.update({
+      where: { id: staffId },
+      data: { passwordHash: await bcrypt.hash(newPassword, 10) },
+    });
+    await this.prisma.refreshSession.updateMany({
+      where: { userId: staffId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    await this.prisma.auditLog.create({
+      data: {
+        actorId: user.id,
+        action: 'staff.password_reset',
+        entity: 'user',
+        entityId: staffId,
+      },
+    });
+    return { id: staffId, ok: true };
+  }
+
   async removeStaff(user: AuthUser, staffLinkId: string) {
     const link = await this.prisma.venueStaff.findUnique({ where: { id: staffLinkId } });
     if (!link) throw new NotFoundException('Team member not found');
@@ -1833,13 +1980,20 @@ export class OwnerService {
 
   // --------------------------------------------------------------- customers
   async customers(user: AuthUser, venueId?: string, page = 1, rawLimit?: number) {
-    const ids = venueId ? [(await this.assertVenue(user, venueId)).id] : await this.venueIds(user);
-    const featureSets = await Promise.all(ids.map((id) => this.plans.featuresForVenue(id)));
+    const allIds = venueId ? [(await this.assertVenue(user, venueId)).id] : await this.venueIds(user);
+    const featureSets = await Promise.all(allIds.map((id) => this.plans.featuresForVenue(id)));
     if (!featureSets.some((f) => f.includes('customers_insight'))) {
       throw new ForbiddenException(
         "Your current plan doesn't include Customers & player history. Ask Areana about upgrading your plan.",
       );
     }
+    // Without a venue filter the gate used to pass on ANY venue having
+    // the feature, then return customers from ALL venues — including
+    // ones whose plan never bought the insight. Restrict to the venues
+    // that actually have the feature.
+    const ids = venueId
+      ? allIds
+      : allIds.filter((_, i) => featureSets[i].includes('customers_insight'));
     const bookings = await this.prisma.booking.findMany({
       where: { venueId: { in: ids }, userId: { not: null } },
       select: {

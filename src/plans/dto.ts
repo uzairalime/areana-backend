@@ -111,6 +111,11 @@ export class UpdatePlanDto {
   @IsOptional()
   @IsBoolean()
   isDefault?: boolean;
+
+  @ApiPropertyOptional({ description: 'Allow the change even when a venue on this plan already uses more courts/staff than the new limits allow (audited)' })
+  @IsOptional()
+  @IsBoolean()
+  confirmBelowUsage?: boolean;
 }
 
 export class AssignPlanDto {
@@ -122,6 +127,11 @@ export class AssignPlanDto {
   @IsOptional()
   @IsBoolean()
   restartBilling?: boolean;
+
+  @ApiPropertyOptional({ description: 'Allow the switch even when the venue already uses more courts/staff than the new plan allows (audited)' })
+  @IsOptional()
+  @IsBoolean()
+  confirmBelowUsage?: boolean;
 }
 
 export class ExtendFreeDto {

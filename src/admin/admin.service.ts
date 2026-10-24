@@ -28,6 +28,7 @@ import {
 } from '../venues/venue-readiness';
 import { AmenitiesService } from '../amenities/amenities.service';
 import { CreateRoleDto, CreateUserDto, UpdateRoleDto } from './dto';
+import type { UpdatePromoDto } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
 import { SportsService } from '../sports/sports.service';
 
@@ -258,8 +259,9 @@ export class AdminService {
    * Reject a pending signup: suspends the account but audits it as a
    * rejection, so the account stays marked Rejected in Users (with a
    * one-tap re-approval) instead of blending into suspended-for-cause.
+   * An optional reason is stored on the account and pushed to the user.
    */
-  async rejectUser(actorId: string, id: string) {
+  async rejectUser(actorId: string, id: string, reason?: string) {
     const target = await this.prisma.user.findUnique({ where: { id } });
     if (!target) throw new NotFoundException('User not found');
     if (target.status !== UserStatus.pending) {
@@ -267,9 +269,18 @@ export class AdminService {
     }
     const user = await this.prisma.user.update({
       where: { id },
-      data: { status: UserStatus.suspended },
+      data: { status: UserStatus.suspended, rejectionReason: reason?.trim() || null },
     });
-    await this.audit(actorId, 'user.reject', 'user', id);
+    await this.audit(actorId, 'user.reject', 'user', id, reason);
+    await this.notifications
+      .pushToUser(id, {
+        title: 'Your Areana signup was not approved',
+        body: reason?.trim()
+          ? `Your signup was not approved: ${reason.trim()}`
+          : 'Your signup was not approved. Contact support if you think this is a mistake.',
+        data: { type: 'account_rejected' },
+      })
+      .catch(() => {});
     const { passwordHash: _p, ...safe } = user;
     return safe;
   }
@@ -422,6 +433,13 @@ export class AdminService {
     }
     const user = await this.prisma.user.update({ where: { id }, data: { roleId } });
     await this.audit(actorId, 'user.set_role', 'user', id);
+    await this.notifications
+      .pushToUser(id, {
+        title: 'Your Areana role changed',
+        body: `Your account role is now ${role.name}.`,
+        data: { type: 'role_changed' },
+      })
+      .catch(() => {});
     const { passwordHash: _p, ...safe } = user;
     return safe;
   }
@@ -460,8 +478,31 @@ export class AdminService {
         }
       }
     }
-    const user = await this.prisma.user.update({ where: { id }, data: { status } });
+    // Approval/reactivation clears any stored rejection reason, so a
+    // stale reason never shows on a live account.
+    const user = await this.prisma.user.update({
+      where: { id },
+      data: status === UserStatus.active ? { status, rejectionReason: null } : { status },
+    });
     await this.audit(actorId, `user.${status}`, 'user', id);
+    if (status === UserStatus.suspended && target.role.name === 'owner') {
+      await this.notifications
+        .pushToUser(id, {
+          title: 'Your Areana account is suspended',
+          body: 'Your arenas are hidden from players while your account is suspended.',
+          data: { type: 'account_suspended' },
+        })
+        .catch(() => {});
+    }
+    if (status === UserStatus.active && target.status === UserStatus.suspended && target.role.name === 'owner') {
+      await this.notifications
+        .pushToUser(id, {
+          title: 'Your Areana account is active again',
+          body: 'You can sign in again. Arenas under moderation or a billing pause stay hidden until those are resolved.',
+          data: { type: 'account_unsuspended' },
+        })
+        .catch(() => {});
+    }
     if (
       status === UserStatus.active &&
       target.status === UserStatus.pending &&
@@ -618,6 +659,39 @@ export class AdminService {
     return { id: user.id, noShowCount: 0 };
   }
 
+  /**
+   * Admin-initiated password reset. Super admins are out of scope here
+   * (their credentials are never reset from the panel) and the target's
+   * sessions are revoked, exactly like changePassword does.
+   */
+  async resetUserPassword(actorId: string, id: string, newPassword: string) {
+    const target = await this.prisma.user.findUnique({
+      where: { id },
+      include: { role: { select: { name: true } } },
+    });
+    if (!target) throw new NotFoundException('User not found');
+    if (target.role.name === 'super_admin') {
+      throw new ForbiddenException("Super admin passwords can't be reset from the panel");
+    }
+    await this.prisma.user.update({
+      where: { id },
+      data: { passwordHash: await bcrypt.hash(newPassword, 10) },
+    });
+    await this.prisma.refreshSession.updateMany({
+      where: { userId: id, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    await this.audit(actorId, 'user.password_reset', 'user', id);
+    await this.notifications
+      .pushToUser(id, {
+        title: 'Your Areana password was reset',
+        body: 'An admin reset your password. Sign in with the new password you were given.',
+        data: { type: 'password_reset' },
+      })
+      .catch(() => {});
+    return { id, ok: true };
+  }
+
   // ---------------------------------------------------------------- roles
   listRoles(systemOnly = false) {
     return this.prisma.role.findMany({
@@ -643,6 +717,25 @@ export class AdminService {
       data: { isActive },
     });
     await this.audit(actorId, isActive ? 'role.enable' : 'role.disable', 'role', roleId);
+    // Everyone holding the role loses (or regains) its permissions at
+    // once — tell them, and the role's owner if they aren't a holder.
+    const holders = await this.prisma.user.findMany({
+      where: { roleId },
+      select: { id: true },
+    });
+    const recipients = new Set(holders.map((h) => h.id));
+    if (role.ownerId) recipients.add(role.ownerId);
+    for (const userId of recipients) {
+      await this.notifications
+        .pushToUser(userId, {
+          title: isActive ? 'Your team role is active again' : 'Your team role is disabled',
+          body: isActive
+            ? `The ${role.name} role is active again — its permissions apply to your account.`
+            : `The ${role.name} role was disabled by an admin — its permissions no longer apply to your account.`,
+          data: { type: 'role_active_changed' },
+        })
+        .catch(() => {});
+    }
     return updated;
   }
 
@@ -997,6 +1090,16 @@ export class AdminService {
     if (new Set(courtNames).size !== courtNames.length) {
       throw new BadRequestException('Two courts in this onboard have the same name');
     }
+    // Onboard courts count against the plan's court cap (the plan that
+    // will bill the venue, or the default plan when none is chosen).
+    const onboardPlan = dto.planId
+      ? await this.prisma.plan.findUnique({ where: { id: dto.planId } })
+      : await this.plans.defaultPlan();
+    if (onboardPlan?.maxCourts !== null && onboardPlan?.maxCourts !== undefined && (dto.courts ?? []).length > onboardPlan.maxCourts) {
+      throw new BadRequestException(
+        `This onboard has ${(dto.courts ?? []).length} courts, above the ${onboardPlan.name} plan's limit of ${onboardPlan.maxCourts}`,
+      );
+    }
     assertPakistanCoords(dto.lat, dto.lng);
     const amenities = await this.amenities.normalizeAmenities(dto.amenities ?? []);
     const courtSports = [...new Set((dto.courts ?? []).map((c) => c.sport))];
@@ -1089,8 +1192,15 @@ export class AdminService {
    * views / clicks; subscription revenue is the all-time ledger total.
    * `sort`: bookings | views | clicks | revenue | name.
    */
-  async listVenuesAdmin(opts?: { sort?: string; range?: string; page?: number; limit?: number }) {
+  async listVenuesAdmin(opts?: { sort?: string; range?: string; status?: string; page?: number; limit?: number }) {
+    // Server-side status filter: omitted keeps the old load-everything
+    // behaviour; an unknown value is a client error, not an empty page.
+    const statusFilter = opts?.status;
+    if (statusFilter && !Object.values(VenueStatus).includes(statusFilter as VenueStatus)) {
+      throw new BadRequestException(`Unknown venue status: ${statusFilter}`);
+    }
     const venues = await this.prisma.venue.findMany({
+      ...(statusFilter ? { where: { status: statusFilter as VenueStatus } } : {}),
       include: {
         owner: { select: { id: true, name: true, email: true, phone: true, status: true } },
         plan: true,
@@ -1531,11 +1641,24 @@ export class AdminService {
    * reason is mandatory and is shown to the owner, who is notified.
    */
   /** Set (or clear, with null) a per-arena court cap that overrides the plan. */
-  async setCourtLimit(actorId: string, venueId: string, limit: number | null) {
+  async setCourtLimit(actorId: string, venueId: string, limit: number | null, confirmBelowUsage = false) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
     if (limit !== null && (!Number.isInteger(limit) || limit < 1 || limit > 500)) {
       throw new BadRequestException('Court limit must be between 1 and 500, or empty for the plan default');
+    }
+    // A cap below current usage would silently strand live courts: the
+    // owner could no longer create, and approval would start failing.
+    // Refuse unless the admin explicitly confirms (audited below).
+    const usage = await this.prisma.court.count({
+      where: { venueId, isActive: true, status: { not: 'rejected' } },
+    });
+    const effective = limit ?? (await this.plans.effectivePlan({ planId: venue.planId }))?.maxCourts ?? null;
+    const belowUsage = effective !== null && usage > effective;
+    if (belowUsage && !confirmBelowUsage) {
+      throw new BadRequestException(
+        `This arena already uses ${usage} courts, above the new limit of ${effective}. Pass confirmBelowUsage to proceed anyway.`,
+      );
     }
     await this.prisma.venue.update({
       where: { id: venueId },
@@ -1546,7 +1669,7 @@ export class AdminService {
       'venue.court_limit',
       'venue',
       venueId,
-      limit === null ? 'limit: plan default' : `limit: ${limit}`,
+      limit === null ? 'limit: plan default' : `limit: ${limit}` + (belowUsage ? ` (confirmed below usage: ${usage})` : ''),
     );
     void this.notifications
       .pushToUser(venue.ownerId, {
@@ -1562,11 +1685,19 @@ export class AdminService {
   }
 
   /** Set (or clear, with null) a per-arena team-seat cap that overrides the plan. */
-  async setStaffLimit(actorId: string, venueId: string, limit: number | null) {
+  async setStaffLimit(actorId: string, venueId: string, limit: number | null, confirmBelowUsage = false) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
     if (limit !== null && (!Number.isInteger(limit) || limit < 0 || limit > 500)) {
       throw new BadRequestException('Team seat limit must be between 0 and 500, or empty for the plan default');
+    }
+    const usage = await this.prisma.venueStaff.count({ where: { venueId } });
+    const effective = limit ?? (await this.plans.effectivePlan({ planId: venue.planId }))?.maxStaff ?? null;
+    const belowUsage = effective !== null && usage > effective;
+    if (belowUsage && !confirmBelowUsage) {
+      throw new BadRequestException(
+        `This arena already has ${usage} team members, above the new limit of ${effective}. Pass confirmBelowUsage to proceed anyway.`,
+      );
     }
     await this.prisma.venue.update({
       where: { id: venueId },
@@ -1577,7 +1708,7 @@ export class AdminService {
       'venue.staff_limit',
       'venue',
       venueId,
-      limit === null ? 'limit: plan default' : `limit: ${limit}`,
+      limit === null ? 'limit: plan default' : `limit: ${limit}` + (belowUsage ? ` (confirmed below usage: ${usage})` : ''),
     );
     void this.notifications
       .pushToUser(venue.ownerId, {
@@ -1593,9 +1724,37 @@ export class AdminService {
   }
 
   /**
-   * Super-admin edit of ANY arena's data. Unlike owner edits, an admin
-   * edit never sends a live venue back to pending — the admin IS the
-   * approver. Sports are validated against the catalog.
+   * Re-run the go-live checklist after a photo/amenity/sport edit: an
+   * approved venue that no longer meets it goes back to pending (the
+   * owner must fix the gap and resubmit), the same readiness rule as
+   * owner edits. Adding a photo or reordering never breaks readiness,
+   * so those paths skip this. Returns the final venue row and whether
+   * it was dropped.
+   */
+  private async dropVenueIfUnready(venueId: string) {
+    const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    if (!venue || venue.status !== VenueStatus.approved) {
+      return { venue, dropped: false };
+    }
+    const courts = await this.prisma.court.count({
+      where: { venueId, isActive: true, status: 'approved' },
+    });
+    if (venueReadiness(venue, courts).ready) {
+      return { venue, dropped: false };
+    }
+    const dropped = await this.prisma.venue.update({
+      where: { id: venueId },
+      data: { status: VenueStatus.pending },
+    });
+    return { venue: dropped, dropped: true };
+  }
+
+  /**
+   * Super-admin edit of ANY arena's data. Sports are validated against
+   * the catalog. Most admin edits leave a live venue live, but a
+   * sports/amenities change that breaks the go-live checklist sends an
+   * approved venue back to pending — the listing would no longer meet
+   * the bar players were shown.
    */
   async updateVenue(
     actorId: string,
@@ -1654,17 +1813,33 @@ export class AdminService {
       venueId,
       changed.length ? `changed: ${changed.join(', ')}` : 'no field changes',
     );
+    let final = updated;
+    let dropped = false;
+    if (dto.sports !== undefined || dto.amenities !== undefined) {
+      const res = await this.dropVenueIfUnready(venueId);
+      final = res.venue ?? updated;
+      dropped = res.dropped;
+      if (dropped) {
+        await this.audit(actorId, 'venue.readiness_drop', 'venue', venueId, 'approved → pending: go-live checklist no longer met after edit');
+      }
+    }
     if (changed.length > 0) {
       await this.notifications
         .pushToUser(venue.ownerId, {
           title: 'Arena details updated',
-          body: `Areana admin updated "${venue.name}" (${changed.join(', ')}).`,
+          body:
+            `Areana admin updated "${venue.name}" (${changed.join(', ')}).` +
+            (dropped ? ' It no longer meets the go-live checklist, so it is back in review until the gaps are fixed.' : ''),
           data: { type: 'venue_edited', venueId },
         })
         .catch(() => {});
     }
-    const activeCourts = await this.prisma.court.count({ where: { venueId, isActive: true } });
-    return { ...updated, readiness: venueReadiness(updated, activeCourts) };
+    // Readiness is counted over approved + active courts (an
+    // active-but-pending court does not make the venue go-live ready).
+    const activeCourts = await this.prisma.court.count({
+      where: { venueId, isActive: true, status: 'approved' },
+    });
+    return { ...final, readiness: venueReadiness(final, activeCourts), backToPending: dropped };
   }
 
   async setVenueModeration(
@@ -1705,12 +1880,21 @@ export class AdminService {
       disabled: 'Your arena has been disabled',
       none: 'Your arena is visible again',
     };
+    // The clear message mirrors the arenaLive computation used on
+    // court approval: approved + unarchived + billing unpaused is what
+    // actually makes the arena visible. Telling the owner it is "back"
+    // while a billing pause or a non-approved status still hides it
+    // would be a lie the panel can't see.
+    const arenaLive =
+      updated.status === VenueStatus.approved && !updated.archivedAt && !updated.billingPaused;
     await this.notifications
       .pushToUser(venue.ownerId, {
         title: titles[status],
         body:
           status === 'none'
-            ? `${venue.name} is back on Areana and visible to players.`
+            ? arenaLive
+              ? `${venue.name} is back on Areana and visible to players.`
+              : `${venue.name} is no longer moderated, but it stays hidden for now — it becomes visible once its approval, archive, and billing state are all clear.`
             : `${venue.name} is hidden from players. Reason: ${reason}`,
         data: { type: 'venue_moderation', venueId },
       })
@@ -1746,6 +1930,9 @@ export class AdminService {
               id: true,
               name: true,
               city: true,
+              status: true,
+              moderationStatus: true,
+              archivedAt: true,
               owner: { select: { name: true, email: true } },
             },
           },
@@ -1779,6 +1966,9 @@ export class AdminService {
       },
     });
     if (!court) throw new NotFoundException('Court not found');
+    if (court.status !== 'pending') {
+      throw new BadRequestException('Only a pending court can be approved');
+    }
     if (
       court.venue.archivedAt ||
       court.venue.status === 'suspended' ||
@@ -1788,9 +1978,22 @@ export class AdminService {
         'This arena is archived, suspended, or rejected — its courts cannot be approved',
       );
     }
+    // Approving adds a live court, so the venue must still be under its
+    // cap (a pending court already counts toward usage while active).
+    const { limit: courtLimit } = await this.plans.effectiveCourtLimit(court.venueId);
+    if (courtLimit !== null) {
+      const usage = await this.prisma.court.count({
+        where: { venueId: court.venueId, isActive: true, status: { not: 'rejected' } },
+      });
+      if (usage > courtLimit) {
+        throw new BadRequestException(
+          `This arena already uses ${usage} courts, above its limit of ${courtLimit} — raise the limit before approving`,
+        );
+      }
+    }
     const updated = await this.prisma.court.update({
       where: { id: courtId },
-      data: { status: 'approved' },
+      data: { status: 'approved', rejectionReason: null },
     });
     await this.audit(actorId, 'court.approve', 'court', courtId);
     const arenaLive =
@@ -1815,11 +2018,26 @@ export class AdminService {
       include: { venue: { select: { name: true, ownerId: true } } },
     });
     if (!court) throw new NotFoundException('Court not found');
+    // Rejecting a court with upcoming bookings strands players who
+    // already paid (or planned) around it — refuse and name the count.
+    const upcoming = await this.prisma.booking.count({
+      where: {
+        courtId,
+        date: { gte: startOfToday() },
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+      },
+    });
+    if (upcoming > 0) {
+      throw new BadRequestException(
+        `This court has ${upcoming} upcoming booking${upcoming === 1 ? '' : 's'} — cancel or move them before rejecting it`,
+      );
+    }
+    const reason = note?.trim() || null;
     const updated = await this.prisma.court.update({
       where: { id: courtId },
-      data: { status: 'rejected' },
+      data: { status: 'rejected', rejectionReason: reason },
     });
-    await this.audit(actorId, 'court.reject', 'court', courtId);
+    await this.audit(actorId, 'court.reject', 'court', courtId, reason ?? undefined);
     await this.notifications
       .pushToUser(court.venue.ownerId, {
         title: 'Court not approved',
@@ -1899,6 +2117,19 @@ export class AdminService {
     if (close0 - open0 < 60 || close0 - open0 > 1200) {
       throw new BadRequestException('Court hours must span between 1 and 20 hours');
     }
+    // Admin-created courts are approved instantly, so they count
+    // against the venue's cap the same way owner-created ones do.
+    const { limit: courtLimit } = await this.plans.effectiveCourtLimit(venueId);
+    if (courtLimit !== null) {
+      const usage = await this.prisma.court.count({
+        where: { venueId, isActive: true, status: { not: 'rejected' } },
+      });
+      if (usage >= courtLimit) {
+        throw new BadRequestException(
+          `This arena already uses ${usage} courts, at its limit of ${courtLimit}`,
+        );
+      }
+    }
     const sport = await this.sports.normalizeSport(dto.sport);
     const court = await this.prisma.court.create({
       data: {
@@ -1975,6 +2206,21 @@ export class AdminService {
         );
       }
     }
+    // An approved court whose price, sport, hours, or slot length
+    // actually changes goes back into the review queue — players were
+    // shown the old terms, and the change needs a second look. A
+    // rejected court edited by an admin likewise re-queues (it can no
+    // longer be re-approved from the rejected state otherwise).
+    // isActive toggles, name, size, surface, and indoor do not re-queue.
+    const requeueFields = ['pricePerHour', 'sport', 'openMinutes', 'closeMinutes', 'slotMinutes'] as const;
+    const requeue =
+      court.status === 'rejected' ||
+      (court.status === 'approved' &&
+        requeueFields.some((f) => dto[f] !== undefined && (data as Record<string, unknown>)[f] !== court[f]));
+    if (requeue) {
+      data.status = 'pending';
+      data.rejectionReason = null;
+    }
     const updated = await this.prisma.court.update({ where: { id: courtId }, data });
     await this.syncVenueSports(court.venueId);
     await this.audit(
@@ -1982,18 +2228,34 @@ export class AdminService {
       'court.update',
       'court',
       courtId,
-      `${court.name}: ${Object.keys(dto).join(', ')}`,
+      `${court.name}: ${Object.keys(dto).join(', ')}` + (requeue ? ' (back to pending review)' : ''),
     );
     await this.notifications
       .pushToUser(court.venue.ownerId, {
         title: 'Court updated',
-        body: `Areana admin updated "${court.name}" at "${court.venue.name}".`,
+        body:
+          `Areana admin updated "${court.name}" at "${court.venue.name}".` +
+          (requeue ? ' It is back in the review queue.' : ''),
         data: { type: 'court_updated', venueId: court.venueId },
       })
       .catch(() => {});
     return updated;
   }
 
+  /**
+   * Court delete rule: refuse only for (a) any pending/confirmed
+   * booking (any date — non-terminal bookings can still be acted on),
+   * (b) any dispute on a cancelled booking, or (c) any OPEN dispute
+   * on any booking of the court. Otherwise the court goes with its
+   * history: completed/no-show/cancelled-undisputed booking rows are
+   * deleted in the same transaction (their participants, reschedules,
+   * reviews, and game posts cascade; resolved/dismissed disputes are
+   * deleted explicitly because Dispute.bookingId has no onDelete, and
+   * promo redemptions are nulled via PromoRedemption's SetNull).
+   * Consequence to be aware of: deleting a court with history also
+   * deletes those bookings' reviews — deactivate instead if the
+   * history must survive.
+   */
   async deleteCourt(actorId: string, courtId: string) {
     const court = await this.prisma.court.findUnique({
       where: { id: courtId },
@@ -2001,11 +2263,11 @@ export class AdminService {
     });
     if (!court) throw new NotFoundException('Court not found');
     const live = await this.prisma.booking.count({
-      where: { courtId, status: { not: BookingStatus.cancelled } },
+      where: { courtId, status: { in: [BookingStatus.pending, BookingStatus.confirmed] } },
     });
     if (live > 0) {
       throw new ConflictException(
-        `This court has ${live} booking(s) on record — deactivate it instead of deleting it`,
+        `This court has ${live} live booking(s) — cancel or complete them first, or deactivate it instead of deleting it`,
       );
     }
     const disputed = await this.prisma.dispute.count({
@@ -2016,10 +2278,21 @@ export class AdminService {
         'This court has cancelled bookings with disputes on record — it cannot be deleted',
       );
     }
+    const openDisputed = await this.prisma.dispute.count({
+      where: { booking: { courtId }, status: 'open' },
+    });
+    if (openDisputed > 0) {
+      throw new ConflictException(
+        'This court has bookings with open disputes — resolve them before deleting it',
+      );
+    }
     await this.prisma.$transaction(async (tx) => {
-      // Only cancelled bookings can remain at this point; they carry no
-      // disputes (checked above) and are removed with the court.
-      await tx.booking.deleteMany({ where: { courtId, status: BookingStatus.cancelled } });
+      // Only historical bookings can remain at this point; resolved or
+      // dismissed disputes on them are removed explicitly (no onDelete),
+      // then the bookings themselves (cascades take participants,
+      // reschedules, reviews, and game posts).
+      await tx.dispute.deleteMany({ where: { booking: { courtId } } });
+      await tx.booking.deleteMany({ where: { courtId } });
       await tx.slotWaitlist.deleteMany({ where: { courtId } });
       await tx.court.delete({ where: { id: courtId } });
     });
@@ -2075,10 +2348,13 @@ export class AdminService {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
     const entries = withSportTag(photoEntriesOf(venue), url, sport);
-    return this.prisma.venue.update({
+    await this.prisma.venue.update({
       where: { id: venueId },
       data: { photos: entries },
     });
+    // Untagging can break the per-sport photo rule for an approved venue.
+    const { venue: final } = await this.dropVenueIfUnready(venueId);
+    return final ?? venue;
   }
 
   /** Reorder a venue's photos (first photo is the cover everywhere). Same-set guard as the owner endpoint. */
@@ -2127,10 +2403,14 @@ export class AdminService {
     if (!venue) throw new NotFoundException('Venue not found');
     await this.storage.deleteImage(url);
     const entries = photoEntriesOf(venue).filter((e) => e.url !== url);
-    return this.prisma.venue.update({
+    await this.prisma.venue.update({
       where: { id: venueId },
       data: { images: entries.map((e) => e.url), photos: entries },
     });
+    // Removing a photo can drop an approved venue below 4 photos or
+    // remove the only tagged photo for a sport.
+    const { venue: final } = await this.dropVenueIfUnready(venueId);
+    return final ?? venue;
   }
 
   // ------------------------------------------------------------------ plans
@@ -2145,8 +2425,51 @@ export class AdminService {
   }
 
   async updatePlan(actorId: string, id: string, dto: UpdatePlanDto) {
+    // Lowering a plan's caps must not silently strand venues already
+    // above them: refuse unless the admin explicitly confirms. Only
+    // venues whose effective limit comes from the plan are checked —
+    // an override on the venue already supersedes the plan.
+    const confirmBelowUsage = dto.confirmBelowUsage ?? false;
+    const newCourts = dto.maxCourts;
+    const newStaff = dto.maxStaff;
+    let over: string[] = [];
+    if (newCourts !== undefined || newStaff !== undefined) {
+      const venues = await this.prisma.venue.findMany({
+        where: { planId: id },
+        select: { id: true, name: true, courtLimitOverride: true, staffLimitOverride: true },
+      });
+      for (const v of venues) {
+        // Each limit is checked only when the venue has no override
+        // for it — an override already supersedes the plan there.
+        const [courtUsage, staffUsage] = await Promise.all([
+          v.courtLimitOverride === null
+            ? this.prisma.court.count({ where: { venueId: v.id, isActive: true, status: { not: 'rejected' } } })
+            : Promise.resolve(0),
+          v.staffLimitOverride === null
+            ? this.prisma.venueStaff.count({ where: { venueId: v.id } })
+            : Promise.resolve(0),
+        ]);
+        if (v.courtLimitOverride === null && newCourts !== undefined && newCourts !== null && courtUsage > newCourts) {
+          over.push(`${v.name}: courts ${courtUsage} > ${newCourts}`);
+        }
+        if (v.staffLimitOverride === null && newStaff !== undefined && newStaff !== null && staffUsage > newStaff) {
+          over.push(`${v.name}: team seats ${staffUsage} > ${newStaff}`);
+        }
+      }
+      if (over.length > 0 && !confirmBelowUsage) {
+        throw new BadRequestException(
+          `Venues already above the new limits: ${over.join('; ')}. Pass confirmBelowUsage to proceed anyway.`,
+        );
+      }
+    }
     const plan = await this.plans.updatePlan(id, dto);
-    await this.audit(actorId, 'plan.update', 'plan', id);
+    await this.audit(
+      actorId,
+      'plan.update',
+      'plan',
+      id,
+      over.length > 0 ? `confirmed below usage: ${over.join('; ')}` : undefined,
+    );
     return plan;
   }
 
@@ -2157,9 +2480,14 @@ export class AdminService {
   }
 
   /** All approved venues with their plan + billing state (Plans page). */
-  async listVenueBilling(page = 1, rawLimit?: number) {
+  async listVenueBilling(page = 1, rawLimit?: number, status?: string) {
+    // Server-side status filter: omitted keeps the approved-only
+    // default; an unknown value is a client error, not an empty page.
+    if (status && !Object.values(VenueStatus).includes(status as VenueStatus)) {
+      throw new BadRequestException(`Unknown venue status: ${status}`);
+    }
     const venues = await this.prisma.venue.findMany({
-      where: { status: VenueStatus.approved },
+      where: { status: status ? (status as VenueStatus) : VenueStatus.approved },
       include: {
         plan: true,
         owner: { select: { id: true, name: true, email: true } },
@@ -2186,15 +2514,51 @@ export class AdminService {
     return { venue, billing };
   }
 
-  async assignVenuePlan(actorId: string, venueId: string, planId: string, restartBilling = false) {
+  async assignVenuePlan(actorId: string, venueId: string, planId: string, restartBilling = false, confirmBelowUsage = false) {
+    const plan = await this.prisma.plan.findUnique({ where: { id: planId } });
+    if (!plan) throw new NotFoundException('Plan not found');
+    // Switching to a smaller plan must not silently strand live courts
+    // or team seats: refuse unless the admin explicitly confirms.
+    const [courtUsage, staffUsage] = await Promise.all([
+      this.prisma.court.count({ where: { venueId, isActive: true, status: { not: 'rejected' } } }),
+      this.prisma.venueStaff.count({ where: { venueId } }),
+    ]);
+    const over: string[] = [];
+    if (plan.maxCourts !== null && courtUsage > plan.maxCourts) over.push(`courts ${courtUsage} > ${plan.maxCourts}`);
+    if (plan.maxStaff !== null && staffUsage > plan.maxStaff) over.push(`team seats ${staffUsage} > ${plan.maxStaff}`);
+    if (over.length > 0 && !confirmBelowUsage) {
+      throw new BadRequestException(
+        `This arena already uses ${over.join(', ')} — above the ${plan.name} plan's limits. Pass confirmBelowUsage to proceed anyway.`,
+      );
+    }
     const venue = await this.plans.assignPlan(venueId, planId, restartBilling);
-    await this.audit(actorId, 'venue.plan.assign', 'venue', venueId);
+    await this.audit(
+      actorId,
+      'venue.plan.assign',
+      'venue',
+      venueId,
+      over.length > 0 ? `plan: ${plan.name} (confirmed below usage: ${over.join(', ')})` : `plan: ${plan.name}`,
+    );
+    await this.notifications
+      .pushToUser(venue.ownerId, {
+        title: 'Your arena plan changed',
+        body: `${venue.name} is now on the ${plan.name} plan${restartBilling ? ' and its billing clock restarted from today' : ''}.`,
+        data: { type: 'plan_assigned', venueId },
+      })
+      .catch(() => {});
     return { venue, billing: await this.plans.billingSummary(venue) };
   }
 
   async extendVenueFree(actorId: string, venueId: string, months: number) {
     const venue = await this.plans.extendFree(venueId, months);
     await this.audit(actorId, 'venue.billing.extend_free', 'venue', venueId);
+    await this.notifications
+      .pushToUser(venue.ownerId, {
+        title: 'Free period extended',
+        body: `${venue.name}'s free period was extended by ${months} month${months === 1 ? '' : 's'}.`,
+        data: { type: 'billing_free_extended', venueId },
+      })
+      .catch(() => {});
     return { venue, billing: await this.plans.billingSummary(venue) };
   }
 
@@ -2203,12 +2567,25 @@ export class AdminService {
     venueId: string,
     opts?: { method?: string; note?: string; amount?: number },
   ) {
+    const before = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: { billingPaused: true },
+    });
     const venue = await this.plans.markPaid(venueId, actorId, opts);
     await this.audit(actorId, 'venue.billing.mark_paid', 'venue', venueId);
+    await this.notifications
+      .pushToUser(venue.ownerId, {
+        title: 'Payment received',
+        body: before?.billingPaused
+          ? `${venue.name}'s payment was recorded and the arena is live again.`
+          : `${venue.name}'s payment was recorded.`,
+        data: { type: 'billing_paid', venueId },
+      })
+      .catch(() => {});
     return { venue, billing: await this.plans.billingSummary(venue) };
   }
 
-  async rejectVenue(actorId: string, venueId: string) {
+  async rejectVenue(actorId: string, venueId: string, reason?: string) {
     const existing = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!existing) throw new NotFoundException('Venue not found');
     if (existing.status !== VenueStatus.pending && existing.status !== VenueStatus.draft) {
@@ -2218,13 +2595,15 @@ export class AdminService {
     }
     const venue = await this.prisma.venue.update({
       where: { id: venueId },
-      data: { status: VenueStatus.rejected },
+      data: { status: VenueStatus.rejected, rejectionReason: reason?.trim() || null },
     });
-    await this.audit(actorId, 'venue.reject', 'venue', venueId);
+    await this.audit(actorId, 'venue.reject', 'venue', venueId, reason);
     await this.notifications
       .pushToUser(venue.ownerId, {
         title: 'Your arena was not approved',
-        body: `${venue.name} won't go live. Check its photos, location and details, then submit it again.`,
+        body: reason?.trim()
+          ? `${venue.name} won't go live. Reason: ${reason.trim()} Fix it, then submit it again.`
+          : `${venue.name} won't go live. Check its photos, location and details, then submit it again.`,
         data: { type: 'venue_rejected', venueId },
       })
       .catch(() => {});
@@ -2319,7 +2698,7 @@ export class AdminService {
     }
     const venue = await this.prisma.venue.update({
       where: { id: venueId },
-      data: { status: VenueStatus.pending },
+      data: { status: VenueStatus.pending, rejectionReason: null },
     });
     await this.audit(actorId, 'venue.requeue', 'venue', venueId);
     await this.notifications
@@ -2430,28 +2809,105 @@ export class AdminService {
     if (validFrom && validFrom >= validTo) {
       throw new BadRequestException('validFrom must be before validTo');
     }
+    if (validTo <= new Date()) {
+      throw new BadRequestException('validTo must be in the future — a promo that already expired can never be redeemed');
+    }
     const code = (dto.code ?? `PROMO-${Math.random().toString(36).slice(2, 8).toUpperCase()}`).toUpperCase();
-    const promo = await this.prisma.promoCode.create({
-      data: {
-        code,
-        kind: dto.kind,
-        value: dto.value,
-        maxDiscount: dto.maxDiscount,
-        maxUses: dto.maxUses,
-        perUserLimit: dto.perUserLimit ?? 1,
-        validFrom,
-        validTo,
-        isActive: dto.isActive ?? true,
-      },
-    });
+    // Pre-check the code so a clash is a clean 409, not a raw Prisma
+    // error — and still map P2002, because two admins can race the
+    // pre-check.
+    const clash = await this.prisma.promoCode.findUnique({ where: { code } });
+    if (clash) throw new ConflictException('This promo code is already in use');
+    let promo;
+    try {
+      promo = await this.prisma.promoCode.create({
+        data: {
+          code,
+          kind: dto.kind,
+          value: dto.value,
+          maxDiscount: dto.maxDiscount,
+          maxUses: dto.maxUses,
+          perUserLimit: dto.perUserLimit ?? 1,
+          validFrom,
+          validTo,
+          isActive: dto.isActive ?? true,
+        },
+      });
+    } catch (e: unknown) {
+      if ((e as { code?: string })?.code === 'P2002') {
+        throw new ConflictException('This promo code is already in use');
+      }
+      throw e;
+    }
     await this.audit(actorId, 'promo.create', 'promo', promo.id);
     return promo;
   }
 
-  async updatePromo(actorId: string, id: string, dto: { isActive?: boolean }) {
-    const promo = await this.prisma.promoCode.update({ where: { id }, data: dto });
+  /**
+   * Admin promo edit (panel edit modal). Mirrors the owner update guard
+   * exactly: once a promo has any redemption, its terms are frozen and
+   * only activation may change; maxUses may never drop below usedCount.
+   * Code and kind are immutable — they identify the offer.
+   */
+  async updatePromo(actorId: string, id: string, dto: UpdatePromoDto) {
+    const promo = await this.prisma.promoCode.findUnique({ where: { id } });
+    if (!promo) throw new NotFoundException('Promo not found');
+    const data: Prisma.PromoCodeUpdateInput = {};
+    if (dto.isActive !== undefined) data.isActive = dto.isActive;
+    const termsChanged =
+      dto.value !== undefined ||
+      dto.maxDiscount !== undefined ||
+      dto.maxUses !== undefined ||
+      dto.perUserLimit !== undefined ||
+      dto.validFrom !== undefined ||
+      dto.validTo !== undefined;
+    if (termsChanged && promo.usedCount > 0) {
+      throw new BadRequestException(
+        'This promo has already been redeemed — only activation can be changed now',
+      );
+    }
+    if (dto.value !== undefined) {
+      if (promo.kind === 'percent' && (dto.value < 1 || dto.value > 100)) {
+        throw new BadRequestException('Percent promo value must be between 1 and 100');
+      }
+      if (promo.kind === 'flat' && dto.value < 1) {
+        throw new BadRequestException('Flat promo value must be at least Rs 1');
+      }
+      data.value = dto.value;
+    }
+    if (dto.maxDiscount !== undefined) data.maxDiscount = dto.maxDiscount;
+    if (dto.maxUses !== undefined) {
+      if (dto.maxUses < promo.usedCount) {
+        throw new BadRequestException(
+          `maxUses (${dto.maxUses}) is below the ${promo.usedCount} redemption(s) already made`,
+        );
+      }
+      data.maxUses = dto.maxUses;
+    }
+    if (dto.perUserLimit !== undefined) data.perUserLimit = dto.perUserLimit;
+    const validFrom = dto.validFrom !== undefined ? new Date(dto.validFrom) : undefined;
+    const validTo = dto.validTo !== undefined ? new Date(dto.validTo) : undefined;
+    if (validFrom && isNaN(validFrom.getTime())) {
+      throw new BadRequestException('validFrom must be a valid date');
+    }
+    if (validTo && isNaN(validTo.getTime())) {
+      throw new BadRequestException('validTo must be a valid date');
+    }
+    const effFrom = validFrom ?? promo.validFrom;
+    const effTo = validTo ?? promo.validTo;
+    if (validFrom) data.validFrom = validFrom;
+    if (validTo) {
+      if (validTo <= new Date()) {
+        throw new BadRequestException('validTo must be in the future');
+      }
+      data.validTo = validTo;
+    }
+    if (effFrom && effFrom >= effTo) {
+      throw new BadRequestException('validFrom must be before validTo');
+    }
+    const updated = await this.prisma.promoCode.update({ where: { id }, data });
     await this.audit(actorId, 'promo.update', 'promo', id);
-    return promo;
+    return updated;
   }
 
   // ---------------------------------------------------------------- badges
@@ -2477,8 +2933,21 @@ export class AdminService {
     });
   }
   grantVenueBadge(actorId: string, venueId: string, badgeId: string) {
-    return this.badges.grantBadge(venueId, badgeId, actorId).then(async () => {
+    return this.badges.grantBadge(venueId, badgeId, actorId).then(async (granted) => {
       await this.audit(actorId, 'venue.grant_badge', 'venue', venueId);
+      const venue = await this.prisma.venue.findUnique({
+        where: { id: venueId },
+        select: { ownerId: true, name: true },
+      });
+      if (venue) {
+        await this.notifications
+          .pushToUser(venue.ownerId, {
+            title: 'Your arena earned a badge',
+            body: `${venue.name} earned the ${granted.badge.name} badge.`,
+            data: { type: 'badge_granted', venueId },
+          })
+          .catch(() => {});
+      }
       return { venueId, badgeId };
     });
   }
@@ -2490,22 +2959,52 @@ export class AdminService {
   }
 
   // --------------------------------------------------------------- disputes
-  async listDisputes(status?: string, cursor?: string, rawLimit?: number) {
+  async listDisputes(status?: string, cursor?: string, rawLimit?: number, q?: string) {
     const limit = pageLimit(rawLimit, 50);
     const ks = this.keyset(cursor);
-    const baseWhere: Prisma.DisputeWhereInput = status ? { status } : {};
-    const [total, rows] = await Promise.all([
-      this.prisma.dispute.count({ where: baseWhere }),
-      this.prisma.dispute.findMany({
-        where: ks
-          ? {
-              ...baseWhere,
+    // Server-side search across booking id, reason, raiser name/email,
+    // and venue name. The keyset clause is a second OR, so every clause
+    // goes through an AND array — spreading baseWhere next to a keyset
+    // OR would silently drop one of them.
+    const filterClauses: Prisma.DisputeWhereInput[] = [];
+    if (status) filterClauses.push({ status });
+    if (q?.trim()) {
+      const term = q.trim();
+      filterClauses.push({
+        OR: [
+          { bookingId: { contains: term } },
+          { reason: { contains: term, mode: 'insensitive' } },
+          {
+            raisedBy: {
               OR: [
-                { createdAt: { lt: ks.createdAt } },
-                { createdAt: ks.createdAt, id: { lt: ks.id } },
+                { name: { contains: term, mode: 'insensitive' } },
+                { email: { contains: term, mode: 'insensitive' } },
               ],
-            }
-          : baseWhere,
+            },
+          },
+          { booking: { venue: { name: { contains: term, mode: 'insensitive' } } } },
+        ],
+      });
+    }
+    const filterWhere: Prisma.DisputeWhereInput =
+      filterClauses.length > 0 ? { AND: filterClauses } : {};
+    const pageClauses = ks
+      ? [
+          ...filterClauses,
+          {
+            OR: [
+              { createdAt: { lt: ks.createdAt } },
+              { createdAt: ks.createdAt, id: { lt: ks.id } },
+            ],
+          },
+        ]
+      : filterClauses;
+    const pageWhere: Prisma.DisputeWhereInput =
+      pageClauses.length > 0 ? { AND: pageClauses } : {};
+    const [total, rows] = await Promise.all([
+      this.prisma.dispute.count({ where: filterWhere }),
+      this.prisma.dispute.findMany({
+        where: pageWhere,
         include: {
           booking: { include: { venue: { select: { id: true, name: true } } } },
           raisedBy: {
@@ -2824,8 +3323,31 @@ export class AdminService {
   }
 
   async deleteGamePost(actorId: string, id: string) {
+    // Fetch the squad BEFORE the delete — participants cascade with
+    // the post, so after it there is nobody left to notify.
+    const post = await this.prisma.gamePost.findUnique({
+      where: { id },
+      include: {
+        venue: { select: { name: true } },
+        participants: { where: { userId: { not: null } }, select: { userId: true, status: true } },
+      },
+    });
+    if (!post) throw new NotFoundException('Game post not found');
     await this.prisma.gamePost.delete({ where: { id } });
     await this.audit(actorId, 'game_post.delete', 'game_post', id);
+    const recipients = new Set<string>([post.creatorId]);
+    for (const p of post.participants) {
+      if (p.status === 'joined' && p.userId) recipients.add(p.userId);
+    }
+    for (const userId of recipients) {
+      await this.notifications
+        .pushToUser(userId, {
+          title: 'Game removed',
+          body: `The ${post.sport} game at ${post.venue?.name ?? 'the arena'} was removed by an admin.`,
+          data: { type: 'game_removed' },
+        })
+        .catch(() => {});
+    }
     return { deleted: true };
   }
 
@@ -2865,12 +3387,20 @@ export class AdminService {
   async cancelBooking(actorId: string, id: string) {
     const booking = await this.prisma.booking.findUnique({ where: { id } });
     if (!booking) throw new NotFoundException('Booking not found');
+    // Only live bookings can be cancelled: a completed/no-show booking
+    // is history, and cancelling it would rewrite revenue and reviews.
+    if (booking.status !== BookingStatus.pending && booking.status !== BookingStatus.confirmed) {
+      throw new BadRequestException(
+        `This booking is ${booking.status} — only pending or confirmed bookings can be cancelled`,
+      );
+    }
     const updated = await this.prisma.booking.update({
       where: { id },
       data: { status: BookingStatus.cancelled },
     });
-    // A cancelled booking must never be resurrected by a stale pending
-    // reschedule request.
+    // Same cleanup as the owner cancel path: stale pending reschedules
+    // must never resurrect it, its game post dies, the waitlist gets
+    // the freed slot, and its promo use is refunded.
     await this.prisma.rescheduleRequest.updateMany({
       where: { bookingId: id, status: 'pending' },
       data: {
@@ -2879,6 +3409,8 @@ export class AdminService {
         decidedAt: new Date(),
       },
     });
+    await this.bookings.cleanupGamePost(id, 'Booking cancelled by admin');
+    await this.bookings.notifyWaitlist(booking);
     await this.bookings.releasePromo(id);
     await this.audit(actorId, 'booking.cancel', 'booking', id);
     return updated;
@@ -2887,6 +3419,14 @@ export class AdminService {
   async forceConfirmBooking(actorId: string, id: string) {
     const booking = await this.prisma.booking.findUnique({ where: { id } });
     if (!booking) throw new NotFoundException('Booking not found');
+    // Force-confirm is a rescue for stuck pendings, not a rewrite of
+    // history: a completed, cancelled, or no-show booking must never
+    // come back as confirmed.
+    if (booking.status !== BookingStatus.pending) {
+      throw new BadRequestException(
+        `This booking is ${booking.status} — only a pending booking can be force-confirmed`,
+      );
+    }
     const updated = await this.prisma.booking.update({
       where: { id },
       data: { status: BookingStatus.confirmed },

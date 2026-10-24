@@ -82,7 +82,41 @@ export class UsersController {
     );
     await this.bookings.exitGames(id);
     await this.bookings.deleteHostedPosts(id);
+    // An owner deleting their account must not leave live arenas
+    // behind: upcoming bookings AT their venues are cancelled first
+    // (players notified by the shared helper), then each venue is
+    // archived and its billing clock stopped. Stopping the clock
+    // means billingStartAt = null — the nightly sweep only touches
+    // venues with a start date — and billingPaused = true, so the
+    // venue stays hidden even if the sweep runs before the archive
+    // propagates. Ledger rows stay for history; the venue rows
+    // themselves stay (archived) so past bookings and reviews still
+    // resolve instead of dangling.
+    const owned = await this.prisma.venue.findMany({
+      where: { ownerId: id },
+      select: { id: true, archivedAt: true },
+    });
+    for (const v of owned) {
+      await this.bookings.cancelVenueUpcomingBookings(
+        v.id,
+        'the arena owner deleted their account',
+      );
+    }
+    const me = await this.prisma.user.findUnique({
+      where: { id },
+      select: { avatarUrl: true },
+    });
     await this.prisma.$transaction([
+      ...owned.map((v) =>
+        this.prisma.venue.update({
+          where: { id: v.id },
+          data: {
+            archivedAt: v.archivedAt ?? new Date(),
+            billingPaused: true,
+            billingStartAt: null,
+          },
+        }),
+      ),
       this.prisma.refreshSession.updateMany({
         where: { userId: id, revokedAt: null },
         data: { revokedAt: new Date() },
@@ -104,7 +138,19 @@ export class UsersController {
           deletedAt: new Date(),
         },
       }),
+      this.prisma.auditLog.create({
+        data: {
+          actorId: id,
+          action: 'user.delete_me',
+          entity: 'user',
+          entityId: id,
+          details: `archived ${owned.length} owned venue(s), billing stopped`,
+        },
+      }),
     ]);
+    // The avatar file goes with the account (best-effort — deleteImage
+    // logs failures internally and never throws).
+    if (me?.avatarUrl) await this.storage.deleteImage(me.avatarUrl);
     return { ok: true };
   }
 

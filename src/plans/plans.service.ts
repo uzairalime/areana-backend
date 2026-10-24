@@ -159,7 +159,7 @@ export class PlansService {
   async deletePlan(id: string) {
     const plan = await this.prisma.plan.findUnique({
       where: { id },
-      include: { _count: { select: { venues: true } } },
+      include: { _count: { select: { venues: true, payments: true } } },
     });
     if (!plan) throw new NotFoundException('Plan not found');
     if (plan.isDefault) {
@@ -167,6 +167,14 @@ export class PlansService {
     }
     if (plan._count.venues > 0) {
       throw new BadRequestException(`This plan still has ${plan._count.venues} venue(s) on it — move them first`);
+    }
+    // Ledger rows reference the plan for receipt plan names (the
+    // relation is SetNull, so a delete would silently blank history).
+    // Keep the plan while any payment references it.
+    if (plan._count.payments > 0) {
+      throw new BadRequestException(
+        `This plan still has ${plan._count.payments} payment record(s) on it — it cannot be deleted while its receipts exist`,
+      );
     }
     await this.prisma.plan.delete({ where: { id } });
     return { message: 'Plan deleted' };
@@ -519,19 +527,34 @@ export class PlansService {
               data: { type: 'billing_overdue' },
             })
             .catch(() => {});
-        } else resumed++;
+        } else {
+          // A venue that was paused and is no longer overdue (paid,
+          // free-extended, or plan-changed) is live again — tell the
+          // owner, since the pause notice is what they last heard.
+          resumed++;
+          await this.notifications
+            .pushToUser(venue.ownerId, {
+              title: 'Venue live again',
+              body: `${venue.name} is no longer billing-paused and is visible to players again.`,
+              data: { type: 'billing_resumed' },
+            })
+            .catch(() => {});
+        }
       }
-      // One due-reminder per period.
+      // One due-reminder per period. The key is the period's start
+      // (nextDueAt): frozen billing periods make it stable across
+      // plan changes within the same period. The push goes FIRST and
+      // the record is written only after it resolves, so a failed
+      // send does not burn the period's one reminder — with the caveat
+      // that pushToUser swallows inbox/FCM failures internally and
+      // resolves anyway, so "after a successful push" here means
+      // after the push attempt completed, not after delivery.
       if (summary.status === 'due' && summary.nextDueAt) {
         const periodKey = new Date(summary.nextDueAt);
         const already =
           venue.billingDueNotifiedFor &&
           venue.billingDueNotifiedFor.getTime() === periodKey.getTime();
         if (!already) {
-          await this.prisma.venue.update({
-            where: { id: venue.id },
-            data: { billingDueNotifiedFor: periodKey },
-          });
           await this.notifications
             .pushToUser(venue.ownerId, {
               title: 'Plan payment due',
@@ -539,6 +562,10 @@ export class PlansService {
               data: { type: 'billing_due' },
             })
             .catch(() => {});
+          await this.prisma.venue.update({
+            where: { id: venue.id },
+            data: { billingDueNotifiedFor: periodKey },
+          });
         }
       }
     }

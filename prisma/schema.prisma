@@ -74,6 +74,9 @@ model User {
   role         Role       @relation(fields: [roleId], references: [id])
   referralCode String?    @unique
   noShowCount  Int        @default(0)
+  /// Reason given when a pending signup is rejected (admin reject flow).
+  /// Cleared when the account is approved/reactivated.
+  rejectionReason String?
   status       UserStatus @default(active)
   deletedAt    DateTime?
   createdAt    DateTime   @default(now())
@@ -202,6 +205,9 @@ model Venue {
   /// plumbing as billingPaused); the reason is shown to the owner.
   moderationStatus  String    @default("none")
   moderationReason  String?
+  /// Reason given when a pending submission is rejected (admin reject
+  /// flow). Cleared when the venue is requeued or resubmitted.
+  rejectionReason   String?
   moderatedAt       DateTime?
   moderatedById     String?
   status            VenueStatus @default(draft)
@@ -263,6 +269,9 @@ model Court {
   /// rejected. Existing and admin-created courts are approved; a pending
   /// court is invisible to players and cannot be booked.
   status       String   @default("approved")
+  /// Reason given when the court is rejected (admin reject flow).
+  /// Cleared when the court goes back into the review queue.
+  rejectionReason String?
   /// Per-court photo entries [{ url, blurhash, width, height }] —
   /// managed by owners/admins, shown on the venue page under the
   /// court's tab. (Venues keep their own gallery + sport tags.)
@@ -535,7 +544,9 @@ model PromoRedemption {
   userId      String
   user        User      @relation(fields: [userId], references: [id])
   bookingId   String?
-  booking     Booking?  @relation(fields: [bookingId], references: [id])
+  // SetNull (not the Prisma default): deleting a booking — e.g. with
+  // its court — must not fail on, or orphan, its promo redemptions.
+  booking     Booking?  @relation(fields: [bookingId], references: [id], onDelete: SetNull)
   createdAt   DateTime  @default(now())
 
   @@index([promoCodeId, userId])

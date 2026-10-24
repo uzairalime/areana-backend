@@ -3,10 +3,14 @@ import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { offsetPageFromDb } from '../common/pagination';
 import { QueryVenuesDto } from './dto';
+import { PlansService } from '../plans/plans.service';
 
 @Injectable()
 export class VenuesService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private plans: PlansService,
+  ) {}
 
   // ------------------------------------------------------------ reports
   /**
@@ -274,12 +278,26 @@ export class VenuesService {
 
   /** Distinct cities with at least one approved venue, A-Z. */
   async cities(): Promise<string[]> {
+    // Same live-venue predicate as getById/getActiveCourt — a city
+    // whose only arenas are archived, moderated, billing-paused, or
+    // past their grace period (but not yet swept) must not be offered
+    // as a bookable destination.
     const rows = await this.prisma.venue.findMany({
-      where: { status: VenueStatus.approved },
-      select: { city: true },
-      distinct: ['city'],
+      where: {
+        status: VenueStatus.approved,
+        archivedAt: null,
+        billingPaused: false,
+        moderationStatus: 'none',
+        owner: { status: UserStatus.active },
+      },
     });
-    return rows.map((r) => r.city).sort((a, b) => a.localeCompare(b));
+    const cities = new Set<string>();
+    for (const v of rows) {
+      const summary = await this.plans.billingSummary(v);
+      if (summary.status === 'overdue') continue;
+      cities.add(v.city);
+    }
+    return [...cities].sort((a, b) => a.localeCompare(b));
   }
 
   async getById(id: string) {
