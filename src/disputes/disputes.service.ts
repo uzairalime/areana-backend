@@ -78,6 +78,16 @@ export class DisputesService {
           where: { id: dispute.bookingId },
           data: { status: BookingStatus.no_show },
         });
+        // A no-showed booking must never be resurrected by a stale
+        // pending reschedule request.
+        await tx.rescheduleRequest.updateMany({
+          where: { bookingId: dispute.bookingId, status: 'pending' },
+          data: {
+            status: 'rejected',
+            reason: 'Booking is no longer active',
+            decidedAt: new Date(),
+          },
+        });
         if (dispute.booking.userId) {
           await tx.user.update({
             where: { id: dispute.booking.userId },

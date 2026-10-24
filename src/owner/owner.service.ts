@@ -1078,20 +1078,33 @@ export class OwnerService {
     };
   }
 
-  async acceptReschedule(user: AuthUser, requestId: string) {
-    const req = await this.prisma.rescheduleRequest.findUnique({
-      where: { id: requestId },
-      include: { booking: true },
-    });
-    if (!req) throw new NotFoundException('Request not found');
-    if (req.status !== 'pending') throw new BadRequestException('Request already decided');
-    await this.assertVenue(user, req.booking.venueId);
-
-    const court = await this.prisma.court.findUniqueOrThrow({ where: { id: req.booking.courtId } });
-    const { startMinutes, endMinutes } = {
-      startMinutes: req.requestedStartMinutes,
-      endMinutes: req.requestedEndMinutes,
-    };
+  /**
+   * Re-validates a pending reschedule request at accept time. The world
+   * may have changed since the player asked: the booking may have left
+   * the confirmed state, the venue may have been sanctioned / paused /
+   * archived, the court deactivated, the slot may have passed, or the
+   * promo may have died. Anything that fails here means the request
+   * can no longer be honoured (the caller auto-rejects it).
+   */
+  private async validateRescheduleAccept(
+    req: Prisma.RescheduleRequestGetPayload<{ include: { booking: true } }>,
+  ) {
+    // A booking that already left the confirmed state must never be
+    // resurrected by a stale pending request.
+    if (req.booking.status !== BookingStatus.confirmed) {
+      throw new BadRequestException('Only confirmed bookings can be rescheduled');
+    }
+    // Re-run the booking choke point + venue-actionable gates.
+    const court = await this.courtsSvc.getActiveCourt(req.booking.courtId);
+    await this.assertVenueActionable(req.booking.venueId);
+    const startMinutes = req.requestedStartMinutes;
+    const endMinutes = req.requestedEndMinutes;
+    // The requested slot may have passed since the request was made.
+    const slotAt = new Date(req.requestedDate);
+    slotAt.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
+    if (slotAt <= new Date()) {
+      throw new BadRequestException('Requested slot is no longer in the future');
+    }
     // Alignment + the requested day's open windows (weekly template
     // or the court's default hours).
     const reqWindows = await this.courtsSvc.windowsForDate(court, req.requestedDate);
@@ -1122,10 +1135,82 @@ export class OwnerService {
       },
     });
     if (clash) throw new ConflictException('Requested slot is no longer available');
+    // Re-validate any promo the booking carries (expiry, venue scope,
+    // per-user limit). The per-user count excludes this booking's own
+    // redemption — otherwise a perUserLimit of 1 would always fail its
+    // own booking.
+    let discount = Number(req.booking.discountAmount ?? 0);
+    if (req.booking.promoCodeId) {
+      const promo = await this.prisma.promoCode.findUnique({
+        where: { id: req.booking.promoCodeId },
+      });
+      if (!promo || !promo.isActive) {
+        throw new BadRequestException('The promo on this booking is no longer active');
+      }
+      if (promo.venueId && promo.venueId !== req.booking.venueId) {
+        throw new BadRequestException('This promo code is not valid for this venue');
+      }
+      const now = new Date();
+      if (promo.validFrom > now || promo.validTo < now) {
+        throw new BadRequestException('Promo code is expired');
+      }
+      if (req.booking.userId) {
+        const otherUses = await this.prisma.promoRedemption.count({
+          where: {
+            promoCodeId: promo.id,
+            userId: req.booking.userId,
+            bookingId: { not: req.bookingId },
+          },
+        });
+        if (otherUses >= promo.perUserLimit) {
+          throw new BadRequestException('Promo code already used');
+        }
+      }
+    }
+    return { court, startMinutes, endMinutes, discount };
+  }
+
+  async acceptReschedule(user: AuthUser, requestId: string) {
+    const req = await this.prisma.rescheduleRequest.findUnique({
+      where: { id: requestId },
+      include: { booking: true },
+    });
+    if (!req) throw new NotFoundException('Request not found');
+    if (req.status !== 'pending') throw new BadRequestException('Request already decided');
+    await this.assertVenue(user, req.booking.venueId);
+
+    // Any accept-time validation failure auto-rejects the request with
+    // the reason, instead of leaving it pending forever (which would
+    // block the player from requesting again). The update is guarded to
+    // pending so a concurrent decision is never overwritten.
+    let validated: {
+      court: Awaited<ReturnType<CourtsService['getActiveCourt']>>;
+      startMinutes: number;
+      endMinutes: number;
+      discount: number;
+    };
+    try {
+      validated = await this.validateRescheduleAccept(req);
+    } catch (err) {
+      if (
+        err instanceof BadRequestException ||
+        err instanceof ConflictException ||
+        err instanceof NotFoundException ||
+        err instanceof ForbiddenException
+      ) {
+        await this.prisma.rescheduleRequest.updateMany({
+          where: { id: requestId, status: 'pending' },
+          data: { status: 'rejected', reason: err.message, decidedAt: new Date() },
+        });
+      }
+      throw err;
+    }
+    const { court, startMinutes, endMinutes } = validated;
 
     // Re-price at the new slot with the same per-slot engine as booking
     // creation (peak/off-peak windows on the requested date), keeping
-    // any promo discount the player already had. Without this the moved
+    // any promo discount the player already had, capped at the new
+    // gross so the total can never go negative. Without this the moved
     // booking kept its old price — an off-peak booking could move into
     // peak hours, or a longer duration, for free.
     const priceWindows = await this.courtsSvc.priceWindowsForDate(
@@ -1139,10 +1224,8 @@ export class OwnerService {
         this.courtsSvc.priceRateForSlot(priceWindows, baseRate, s) *
         (court.slotMinutes / 60);
     }
-    const newTotal = Math.max(
-      0,
-      gross - Number(req.booking.discountAmount ?? 0),
-    );
+    const discount = Math.min(validated.discount, gross);
+    const newTotal = Math.max(0, gross - discount);
 
     const [booking] = await this.prisma.$transaction([
       this.prisma.booking.update({
@@ -1152,6 +1235,9 @@ export class OwnerService {
           startMinutes,
           endMinutes,
           totalPrice: newTotal,
+          discountAmount: discount,
+          // A moved booking has not been played at the new slot yet.
+          checkedInAt: null,
           status: BookingStatus.confirmed,
         },
       }),

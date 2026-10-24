@@ -2583,6 +2583,16 @@ export class AdminService {
       where: { id },
       data: { status: BookingStatus.cancelled },
     });
+    // A cancelled booking must never be resurrected by a stale pending
+    // reschedule request.
+    await this.prisma.rescheduleRequest.updateMany({
+      where: { bookingId: id, status: 'pending' },
+      data: {
+        status: 'rejected',
+        reason: 'Booking is no longer active',
+        decidedAt: new Date(),
+      },
+    });
     await this.audit(actorId, 'booking.cancel', 'booking', id);
     return updated;
   }

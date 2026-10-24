@@ -6,6 +6,7 @@ import { minutesSinceMidnight, startOfToday } from '../common/date.util';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ReferralsService } from '../promos/referrals.service';
 import { PlansService } from '../plans/plans.service';
+import { BookingsService } from '../bookings/bookings.service';
 
 @Injectable()
 export class SchedulerService {
@@ -16,6 +17,7 @@ export class SchedulerService {
     private notifications: NotificationsService,
     private referrals: ReferralsService,
     private plans: PlansService,
+    private bookings: BookingsService,
   ) {}
 
   private async setting(key: string, fallback: string): Promise<string> {
@@ -37,6 +39,7 @@ export class SchedulerService {
         where: { id: b.id },
         data: { status: BookingStatus.cancelled },
       });
+      await this.bookings.rejectPendingReschedules(b.id, 'Booking expired');
       if (b.userId) {
         await this.notifications.notifyPlayerDecision(b.userId, false, b.venue.name, '', 'The arena did not respond in time');
       }
@@ -187,20 +190,70 @@ export class SchedulerService {
   /** Nightly: complete past bookings, pay out referral rewards, recompute badges. */
   @Cron('0 2 * * *')
   async nightly() {
+    const now = new Date();
     const today = startOfToday();
+    // Booking dates are stored as UTC midnights, so "up to today" is
+    // everything before tomorrow's local midnight.
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
 
-    // 1. Past confirmed bookings → completed (unlocks reviews).
-    const done = await this.prisma.booking.updateMany({
-      where: { status: BookingStatus.confirmed, date: { lt: today } },
-      data: { status: BookingStatus.completed },
+    // 1. No-show sweep FIRST: past confirmed bookings that were never
+    // checked in become no-shows (with strikes, via the shared
+    // markNoShow path) — not completions. The slot end is play-date +
+    // end time, so an overnight booking ending after 02:00 is not
+    // swept early.
+    const unchecked = await this.prisma.booking.findMany({
+      where: {
+        status: BookingStatus.confirmed,
+        checkedInAt: null,
+        date: { lt: tomorrow },
+      },
+      select: { id: true, date: true, endMinutes: true },
     });
-    this.logger.log(`Auto-completed ${done.count} bookings`);
+    let noShows = 0;
+    for (const b of unchecked) {
+      if (this.bookings.slotEnded(b, now)) {
+        await this.bookings.markNoShow(b.id);
+        noShows++;
+      }
+    }
+    if (noShows > 0) this.logger.log(`Marked ${noShows} bookings as no-show`);
 
-    // 2. Referral rewards: referee's first completed booking → reward the referrer.
+    // 2. Past CHECKED-IN bookings → completed (unlocks reviews). A
+    // booking nobody checked into is a no-show by now (step 1), never
+    // a game that was played.
+    const checkedIn = await this.prisma.booking.findMany({
+      where: {
+        status: BookingStatus.confirmed,
+        checkedInAt: { not: null },
+        date: { lt: tomorrow },
+      },
+      select: { id: true, date: true, endMinutes: true },
+    });
+    const doneIds = checkedIn
+      .filter((b) => this.bookings.slotEnded(b, now))
+      .map((b) => b.id);
+    if (doneIds.length > 0) {
+      await this.prisma.booking.updateMany({
+        where: { id: { in: doneIds } },
+        data: { status: BookingStatus.completed },
+      });
+      await this.prisma.rescheduleRequest.updateMany({
+        where: { bookingId: { in: doneIds }, status: 'pending' },
+        data: {
+          status: 'rejected',
+          reason: 'Booking is no longer active',
+          decidedAt: new Date(),
+        },
+      });
+    }
+    this.logger.log(`Auto-completed ${doneIds.length} bookings`);
+
+    // 3. Referral rewards: referee's first completed booking → reward the referrer.
     const { granted } = await this.referrals.grantReferralRewards();
     if (granted > 0) this.logger.log(`Referral rewards granted: ${granted}`);
 
-    // 3. Badge eligibility (simple v1 rule; refined with real data later).
+    // 4. Badge eligibility (simple v1 rule; refined with real data later).
     const candidates = await this.prisma.venue.findMany({
       where: { status: 'approved', rating: { gte: 4.5 }, ratingCount: { gte: 5 } },
       select: { id: true },

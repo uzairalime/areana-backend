@@ -301,6 +301,7 @@ export class BookingsService {
       data: { status: BookingStatus.cancelled },
     });
     for (const b of affected) {
+      await this.rejectPendingReschedules(b.id);
       await this.cleanupGamePost(b.id, 'The host cancelled their booking, so this game is off.');
       const full = await this.prisma.booking.findUnique({
         where: { id: b.id },
@@ -378,6 +379,7 @@ export class BookingsService {
       where: { id: bookingId },
       data: { status: BookingStatus.cancelled },
     });
+    await this.rejectPendingReschedules(bookingId);
     await this.cleanupGamePost(bookingId, 'The host cancelled their booking, so this game is off.');
     await this.notifyWaitlist(booking);
     return updated;
@@ -526,6 +528,19 @@ export class BookingsService {
     if (booking.status !== BookingStatus.confirmed) {
       throw new BadRequestException('Only confirmed bookings can be rescheduled');
     }
+    // The original slot must not have started (or ended), and a booking
+    // already checked in can no longer move — otherwise an in-progress
+    // game could be teleported to another day.
+    if (booking.checkedInAt) {
+      throw new BadRequestException('A checked-in booking cannot be rescheduled');
+    }
+    const now = new Date();
+    const started =
+      booking.date < startOfToday() ||
+      (isSameDay(booking.date, now) && booking.startMinutes <= minutesSinceMidnight(now));
+    if (started) {
+      throw new BadRequestException('Cannot reschedule a slot that already started');
+    }
     const existing = await this.prisma.rescheduleRequest.findFirst({
       where: { bookingId, status: 'pending' },
     });
@@ -657,6 +672,11 @@ export class BookingsService {
     if (booking.status !== BookingStatus.confirmed) {
       throw new BadRequestException('Only confirmed bookings can be marked as no-show');
     }
+    // A player who checked in played the game — striking them would be
+    // a data error, not a no-show.
+    if (booking.checkedInAt) {
+      throw new BadRequestException('A checked-in booking cannot be marked as no-show');
+    }
     // A no-show can only be recorded once the slot has actually ended.
     const today = startOfToday();
     const ended =
@@ -675,6 +695,9 @@ export class BookingsService {
       return this.prisma.booking.findUnique({ where: { id: bookingId } });
     }
     const updated = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    // A no-showed booking must never be resurrected by a stale pending
+    // reschedule request.
+    await this.rejectPendingReschedules(bookingId);
     if (booking.userId) {
       const user = await this.prisma.user.update({
         where: { id: booking.userId },
@@ -716,6 +739,7 @@ export class BookingsService {
         where: { id: b.id },
         data: { status: BookingStatus.cancelled },
       });
+      await this.rejectPendingReschedules(b.id);
       await this.cleanupGamePost(b.id, 'This game is off — the host is no longer on Areana.');
       await this.notifyWaitlist(b);
       if (b.venue.owner?.email) {
@@ -848,9 +872,35 @@ export class BookingsService {
       where: { id: bookingId },
       data: { status: BookingStatus.cancelled },
     });
+    await this.rejectPendingReschedules(bookingId);
     await this.cleanupGamePost(bookingId, 'The venue cancelled the booking, so this game is off.');
     await this.notifyWaitlist(booking);
     return updated;
+  }
+
+  /**
+   * A booking leaving the active states must never be resurrected by a
+   * stale pending reschedule request — reject them all, with a reason,
+   * so the owner can no longer accept one.
+   */
+  async rejectPendingReschedules(bookingId: string, reason = 'Booking is no longer active') {
+    await this.prisma.rescheduleRequest.updateMany({
+      where: { bookingId, status: 'pending' },
+      data: { status: 'rejected', reason, decidedAt: new Date() },
+    });
+  }
+
+  /**
+   * True once the slot's end has passed. endMinutes is minutes since
+   * play-day midnight and may exceed 1440 for overnight bookings, so
+   * the end day is derived from it instead of assuming the play date.
+   */
+  slotEnded(b: { date: Date; endMinutes: number }, now = new Date()): boolean {
+    const endDay = new Date(b.date);
+    endDay.setDate(endDay.getDate() + Math.floor(b.endMinutes / 1440));
+    const endMin = b.endMinutes % 1440;
+    const today = startOfToday();
+    return endDay < today || (isSameDay(endDay, today) && endMin <= minutesSinceMidnight(now));
   }
 
   private async getPending(bookingId: string) {
