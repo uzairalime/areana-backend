@@ -117,6 +117,10 @@ export class UpdateSettingsDto {
 export class AnalyticsQueryDto {
   @ApiPropertyOptional({ example: 30 }) @IsOptional() @Type(() => Number) @IsInt() @Min(1) days?: number = 30;
   @ApiPropertyOptional({ enum: ['day', 'week', 'month'] }) @IsOptional() @IsIn(['day', 'week', 'month']) granularity?: 'day' | 'week' | 'month' = 'day';
+  /** Inclusive start date (YYYY-MM-DD, PKT day). Overrides `days` when set. */
+  @ApiPropertyOptional({ example: '2026-10-01' }) @IsOptional() @IsString() from?: string;
+  /** Inclusive end date (YYYY-MM-DD, PKT day). */
+  @ApiPropertyOptional({ example: '2026-10-24' }) @IsOptional() @IsString() to?: string;
 }
 
 // --------------------------------------------------------------- onboarding

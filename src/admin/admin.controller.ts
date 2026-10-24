@@ -45,27 +45,31 @@ export class AdminController {
   // ---------------------------------------------------------------- analytics
   @ApiTags('admin · analytics')
   @Get('analytics/overview')
-  overview() {
-    return this.analytics.overview();
+  overview(@Query() q: AnalyticsQueryDto) {
+    return this.analytics.overview({ from: q.from, to: q.to });
   }
 
   @ApiTags('admin · analytics')
   @Get('analytics/trends')
   trends(@Query() q: AnalyticsQueryDto) {
-    return this.analytics.trends(q.days, q.granularity);
+    return this.analytics.trends(q.days, q.granularity, { from: q.from, to: q.to });
   }
 
   @ApiTags('admin · analytics')
   @Get('analytics/breakdown')
-  breakdown() {
-    return this.analytics.breakdown();
+  breakdown(@Query() q: AnalyticsQueryDto) {
+    return this.analytics.breakdown({ from: q.from, to: q.to });
   }
 
   @ApiTags('admin · analytics')
   @Get('analytics/venues')
-  async venueLeaderboard(@Query() query: OffsetQueryDto) {
+  async venueLeaderboard(
+    @Query() query: OffsetQueryDto,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
     return offsetPage(
-      await this.analytics.venueLeaderboard(),
+      await this.analytics.venueLeaderboard({ from, to }),
       query.page ?? 1,
       pageLimit(query.limit, 50),
     );

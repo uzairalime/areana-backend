@@ -4,6 +4,29 @@ import { PrismaService } from '../common/prisma';
 
 const ACTIVE_BOOKING: BookingStatus[] = [BookingStatus.confirmed, BookingStatus.completed];
 
+/** Shared date-range filter for analytics queries. Dates are PKT days
+ * (booking.date / event.day are @db.Date at UTC midnight); `to` is
+ * inclusive, implemented as an exclusive upper bound on the next day.
+ * A reversed range is swapped rather than returning nothing. */
+export interface AnalyticsRange {
+  from?: string;
+  to?: string;
+}
+
+function dayBounds(range: AnalyticsRange): { gte?: Date; lt?: Date } {
+  let { from, to } = range;
+  if (from && to && from > to) [from, to] = [to, from];
+  const out: { gte?: Date; lt?: Date } = {};
+  if (from) out.gte = new Date(`${from}T00:00:00.000Z`);
+  if (to) out.lt = new Date(new Date(`${to}T00:00:00.000Z`).getTime() + 86400000);
+  return out;
+}
+
+function dateWhere(range: AnalyticsRange) {
+  const b = dayBounds(range);
+  return Object.keys(b).length > 0 ? b : undefined;
+}
+
 @Injectable()
 export class AnalyticsService {
   constructor(private prisma: PrismaService) {}
@@ -14,7 +37,11 @@ export class AnalyticsService {
   }
 
   // ------------------------------------------------------- 1. platform KPIs
-  async overview() {
+  // The range filters ACTIVITY (bookings, GMV, commission, payments,
+  // views/clicks). Platform totals (players, owners, venues, pending
+  // queues, live subscriptions, active bookings) are current state and
+  // stay all-time — the panel labels this under the filter bar.
+  async overview(range: AnalyticsRange = {}) {
     const [
       players,
       owners,
@@ -29,9 +56,14 @@ export class AnalyticsService {
       this.prisma.user.count({ where: { role: { name: 'player' } } }),
       this.prisma.user.count({ where: { role: { name: 'owner' } } }),
       this.prisma.venue.groupBy({ by: ['status'], _count: true }),
-      this.prisma.booking.groupBy({ by: ['status'], _count: true, _sum: { totalPrice: true } }),
+      this.prisma.booking.groupBy({
+        by: ['status'],
+        _count: true,
+        _sum: { totalPrice: true },
+        where: { date: dateWhere(range) },
+      }),
       this.prisma.booking.aggregate({
-        where: { status: { in: ACTIVE_BOOKING } },
+        where: { status: { in: ACTIVE_BOOKING }, date: dateWhere(range) },
         _sum: { totalPrice: true },
       }),
       this.prisma.booking.count({ where: { status: BookingStatus.pending } }),
@@ -50,7 +82,7 @@ export class AnalyticsService {
       ),
       gmv,
       accruedCommission: Math.round((gmv * pct) / 100),
-      ...(await this.platformExtras()),
+      ...(await this.platformExtras(range)),
       pendingApprovals: { bookings: pendingBookings, owners: pendingOwners, venues: pendingVenues },
       openDisputes,
     };
@@ -58,7 +90,7 @@ export class AnalyticsService {
 
   /** Super-admin v2 headline numbers: live bookings, subscriptions,
    * ledger revenue and tracked engagement. */
-  private async platformExtras() {
+  private async platformExtras(range: AnalyticsRange = {}) {
     const dayStr = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'Asia/Karachi',
     }).format(new Date());
@@ -75,9 +107,12 @@ export class AnalyticsService {
             billingPaused: false,
           },
         }),
-        this.prisma.venuePayment.aggregate({ _sum: { amount: true } }),
-        this.prisma.venueEvent.count({ where: { type: 'view' } }),
-        this.prisma.venueEvent.count({ where: { type: 'click' } }),
+        this.prisma.venuePayment.aggregate({
+          where: { createdAt: dateWhere(range) },
+          _sum: { amount: true },
+        }),
+        this.prisma.venueEvent.count({ where: { type: 'view', day: dateWhere(range) } }),
+        this.prisma.venueEvent.count({ where: { type: 'click', day: dateWhere(range) } }),
         this.prisma.venueReport.count({ where: { status: 'open' } }),
       ]);
     return {
@@ -91,13 +126,23 @@ export class AnalyticsService {
   }
 
   // ------------------------------------------------- 2. day/week/month graphs
-  async trends(days = 30, granularity: 'day' | 'week' | 'month' = 'day') {
-    const since = new Date();
-    since.setDate(since.getDate() - days);
-    since.setHours(0, 0, 0, 0);
+  async trends(
+    days = 30,
+    granularity: 'day' | 'week' | 'month' = 'day',
+    range: AnalyticsRange = {},
+  ) {
+    const bounds = dayBounds(range);
+    const since =
+      bounds.gte ??
+      (() => {
+        const d = new Date();
+        d.setDate(d.getDate() - days);
+        d.setHours(0, 0, 0, 0);
+        return d;
+      })();
     const rows = await this.prisma.booking.groupBy({
       by: ['date'],
-      where: { date: { gte: since }, status: { in: ACTIVE_BOOKING } },
+      where: { date: { gte: since, ...(bounds.lt ? { lt: bounds.lt } : {}) }, status: { in: ACTIVE_BOOKING } },
       _count: true,
       _sum: { totalPrice: true },
       orderBy: { date: 'asc' },
@@ -127,7 +172,7 @@ export class AnalyticsService {
   }
 
   // ---------------------------------------------------------- 3. breakdowns
-  async breakdown() {
+  async breakdown(range: AnalyticsRange = {}) {
     const [byCity, bySport, venueStatus] = await Promise.all([
       this.prisma.venue.groupBy({ by: ['city'], _count: true }),
       this.prisma.court.groupBy({ by: ['sport'], _count: true }),
@@ -135,7 +180,7 @@ export class AnalyticsService {
     ]);
     const cityBookings = await this.prisma.booking.groupBy({
       by: ['venueId'],
-      where: { status: { in: ACTIVE_BOOKING } },
+      where: { status: { in: ACTIVE_BOOKING }, date: dateWhere(range) },
       _count: true,
       _sum: { totalPrice: true },
     });
@@ -162,7 +207,7 @@ export class AnalyticsService {
   }
 
   // ------------------------------------------------- 4. arena leaderboard
-  async venueLeaderboard() {
+  async venueLeaderboard(range: AnalyticsRange = {}) {
     const venues = await this.prisma.venue.findMany({
       where: { status: VenueStatus.approved },
       select: {
@@ -177,7 +222,7 @@ export class AnalyticsService {
     const rows: any[] = [];
     for (const v of venues) {
       const bookings = await this.prisma.booking.findMany({
-        where: { venueId: v.id },
+        where: { venueId: v.id, date: dateWhere(range) },
         select: { userId: true, date: true, status: true, totalPrice: true, startMinutes: true, endMinutes: true },
       });
       const active = bookings.filter((b) => ACTIVE_BOOKING.includes(b.status));
