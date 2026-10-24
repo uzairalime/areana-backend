@@ -714,7 +714,9 @@ export class OwnerService {
     // simultaneous creates can't both pass the limit check. Only
     // ACTIVE, non-rejected courts consume quota — a deactivated court
     // frees its slot, and a rejected one never took one.
-    const court = await this.prisma.$transaction(async (tx) => {
+    let court;
+    try {
+      court = await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
       if (limit !== null) {
         const count = await tx.court.count({
@@ -729,6 +731,16 @@ export class OwnerService {
       // New courts need super-admin approval before players can see/book them.
       return tx.court.create({ data: { venueId, ...data, status: 'pending' } });
     });
+    } catch (e) {
+      // The case-insensitive pre-check (assertCourtNameFree) can be
+      // raced by two simultaneous creates; the DB unique index below
+      // is the backstop, and its P2002 must surface as a clean 409.
+      if ((e as { code?: string })?.code === 'P2002') {
+        throw new ConflictException('A court with this name already exists at this arena');
+      }
+      throw e;
+    }
+
     await this.syncVenueSports(venueId);
     return court;
   }
@@ -2057,6 +2069,10 @@ export class OwnerService {
     await this.assertVenue(user, dto.venueId);
     const code = dto.code.toUpperCase().trim();
     if (!code) throw new BadRequestException('Promo code is required');
+    // Panel caps codes at 24 chars (Round 3 T5); the API enforces the
+    // same bound so a long code can't arrive from any other client and
+    // overflow the card/voucher display.
+    if (code.length > 24) throw new BadRequestException('Promo code must be at most 24 characters');
     if (dto.kind === 'percent' && (dto.value < 1 || dto.value > 100)) {
       throw new BadRequestException('Percent promo value must be between 1 and 100');
     }

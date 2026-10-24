@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { addMonths } from '../common/date.util';
@@ -43,6 +43,70 @@ export class CourtsService {
       return [{ startMinutes: court.openMinutes, endMinutes: court.closeMinutes }];
     }
     return []; // template exists, this weekday is closed
+  }
+
+  /**
+   * The court's open windows for one date, read through the caller's
+   * transaction client — the tx-aware twin of windowsForDate, for
+   * checks that must see uncommitted work inside that transaction.
+   */
+  async windowsForDateInTx(
+    tx: Prisma.TransactionClient,
+    court: { id: string; openMinutes: number; closeMinutes: number },
+    date: Date,
+  ): Promise<DayWindow[]> {
+    const rows = await tx.courtWeeklyWindow.findMany({
+      where: { courtId: court.id, weekday: date.getDay() },
+      orderBy: { startMinutes: 'asc' },
+      select: { startMinutes: true, endMinutes: true },
+    });
+    if (rows.length > 0) return rows;
+    const any = await tx.courtWeeklyWindow.count({
+      where: { courtId: court.id },
+    });
+    if (any === 0) {
+      return [{ startMinutes: court.openMinutes, endMinutes: court.closeMinutes }];
+    }
+    return []; // template exists, this weekday is closed
+  }
+
+  /**
+   * Re-validate a slot against the CURRENT windows inside the creation
+   * transaction (same messages as the pre-check's validateSlotGrid).
+   * The pre-check alone is stale by commit time: an owner shrinking
+   * hours — or adding a template that closes the weekday — between
+   * pre-check and insert used to strand a booking outside the hours it
+   * was sold under. The court row is read fresh inside the tx (the
+   * caller holds its row lock), so a concurrent court edit is seen.
+   * Blocked ranges are NOT re-checked here: assertNoOverlap already
+   * re-checks them in-tx via blockedRangesForDate.
+   */
+  async assertSlotInTx(
+    tx: Prisma.TransactionClient,
+    courtId: string,
+    date: Date,
+    startMinutes: number,
+    endMinutes: number,
+  ): Promise<void> {
+    const court = await tx.court.findUnique({
+      where: { id: courtId },
+      select: { slotMinutes: true, openMinutes: true, closeMinutes: true },
+    });
+    if (!court) throw new NotFoundException('Court not found');
+    const windows = await this.windowsForDateInTx(
+      tx,
+      { id: courtId, openMinutes: court.openMinutes, closeMinutes: court.closeMinutes },
+      date,
+    );
+    if (windows.length === 0) {
+      throw new BadRequestException('Court is closed on this day');
+    }
+    const w = windows.find(
+      (x) => startMinutes >= x.startMinutes && endMinutes <= x.endMinutes,
+    );
+    if (!w || (startMinutes - w.startMinutes) % court.slotMinutes !== 0) {
+      throw new BadRequestException('Slot is outside court hours or misaligned');
+    }
   }
 
   /** Price windows (peak/off-peak rates) applying on a given date. */

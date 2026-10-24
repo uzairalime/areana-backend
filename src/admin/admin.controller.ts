@@ -2,6 +2,7 @@ import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UploadedFile,
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { PERMISSION_LIST } from '../common/permissions';
+import { IdempotencyInterceptor } from '../common/idempotency/idempotency.interceptor';
 import { AuthUser, CurrentUser, RequirePerm } from '../common/auth';
 import { AdminService } from './admin.service';
 import { CursorQueryDto, OffsetQueryDto, offsetPage, pageLimit, wrapList } from '../common/pagination';
@@ -132,6 +133,7 @@ export class AdminController {
 
   @ApiTags('admin · users')
   @Patch('users/:id/status')
+  @UseInterceptors(IdempotencyInterceptor)
   setUserStatus(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: SetUserStatusDto) {
     return this.admin.setUserStatus(u.id, id, dto.status);
   }
@@ -181,6 +183,7 @@ export class AdminController {
 
   @ApiTags('admin · roles & permissions')
   @Post('roles')
+  @UseInterceptors(IdempotencyInterceptor)
   createRole(@CurrentUser() u: AuthUser, @Body() dto: CreateRoleDto) {
     return this.admin.createRole(u.id, dto);
   }
@@ -228,6 +231,7 @@ export class AdminController {
 
   @ApiTags('admin · approvals')
   @Post('venues/:id/suspend')
+  @UseInterceptors(IdempotencyInterceptor)
   suspendVenue(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.admin.suspendVenue(u.id, id);
   }
@@ -542,6 +546,7 @@ export class AdminController {
 
   @ApiTags('admin · plans')
   @Post('venues/:id/plan')
+  @UseInterceptors(IdempotencyInterceptor)
   assignVenuePlan(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: AssignPlanDto) {
     return this.admin.assignVenuePlan(u.id, id, dto.planId, dto.restartBilling ?? false, dto.confirmBelowUsage ?? false);
   }
@@ -554,6 +559,7 @@ export class AdminController {
 
   @ApiTags('admin · plans')
   @Post('venues/:id/billing/mark-paid')
+  @UseInterceptors(IdempotencyInterceptor)
   markVenuePaid(
     @CurrentUser() u: AuthUser,
     @Param('id') id: string,
@@ -611,6 +617,7 @@ export class AdminController {
 
   @ApiTags('admin · venues')
   @Post('venues/:id/unsuspend')
+  @UseInterceptors(IdempotencyInterceptor)
   unsuspendVenue(@CurrentUser() u: AuthUser, @Param('id') id: string) {
     return this.admin.unsuspendVenue(u.id, id);
   }

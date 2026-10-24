@@ -117,6 +117,12 @@ export class BookingsService {
       await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${court.venueId} FOR UPDATE`;
       await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${court.id} FOR UPDATE`;
       await this.courts.assertBookableInTx(tx, court.id);
+      // Hours re-validation inside the tx: the pre-check's windows can
+      // go stale between pre-check and insert (owner shrinks hours, or
+      // adds a template closing the weekday), stranding a booking
+      // outside the hours it was sold under. Blocks are covered by
+      // assertNoOverlap below, which already re-checks them in-tx.
+      await this.courts.assertSlotInTx(tx, court.id, date, startMinutes, endMinutes);
       await this.assertNoOverlap(court.id, date, startMinutes, endMinutes, tx);
       const b = await tx.booking.create({
         data: {
@@ -1072,21 +1078,102 @@ export class BookingsService {
       });
       if (claimed.count === 0) continue;
       cancelled++;
-      await this.rejectPendingReschedules(b.id);
-      await this.cleanupGamePost(b.id, 'The arena cancelled the booking, so this game is off.');
-      await this.notifyWaitlist(b);
-      await this.releasePromo(b.id);
-      if (b.userId) {
-        await this.notifications
-          .pushToUser(b.userId, {
-            title: 'Booking cancelled',
-            body: `Your booking at ${venue?.name ?? 'the arena'} on ${b.date.toISOString().slice(0, 10)} was cancelled: ${reason}.`,
-            data: { type: 'booking_cancelled', venueId },
-          })
-          .catch(() => {});
+      await this.finalizeCascadeCancel(b, venue?.name, venueId, reason);
+    }
+    // Drain: a booking inserting while the cascade snapshots can
+    // survive at a suspended venue. Venue-row flips (suspendVenue,
+    // moderation) serialize against creation's venue lock, but an
+    // OWNER suspension flips the user row, not the venue row — so a
+    // creation whose re-verification ran before the flip can commit
+    // mid-cascade, invisible to the snapshot above. Each drain pass
+    // locks the venue row first (creation txs hold that lock from
+    // re-verification to commit, so a pass either waits for an
+    // in-flight insert and then sees it, or runs after the insert
+    // committed and sees it), claims whatever is still standing, and
+    // repeats until a pass finds nothing. The status-change stop rule
+    // applies here too, and the pass cap bounds the loop if bookings
+    // keep arriving (a creation starting after the final pass still
+    // fails its own re-verification against the suspended venue/owner).
+    for (let pass = 0; pass < 5; pass++) {
+      if (statusAtStart !== undefined) {
+        const current = await this.prisma.venue.findUnique({
+          where: { id: venueId },
+          select: { status: true },
+        });
+        if (!current || current.status !== statusAtStart) break;
+      }
+      const claimed = await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+        const rows = await tx.booking.findMany({
+          where: {
+            venueId,
+            date: { gte: startOfToday() },
+            status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          },
+          select: {
+            id: true,
+            userId: true,
+            date: true,
+            courtId: true,
+            startMinutes: true,
+            endMinutes: true,
+            checkedInAt: true,
+          },
+        });
+        const standing = rows.filter((b) => !this.slotLive(b));
+        const done: typeof standing = [];
+        for (const b of standing) {
+          const c = await tx.booking.updateMany({
+            where: { id: b.id, status: { in: [BookingStatus.pending, BookingStatus.confirmed] } },
+            data: { status: BookingStatus.cancelled },
+          });
+          if (c.count > 0) done.push(b);
+        }
+        return done;
+      });
+      if (claimed.length === 0) break;
+      cancelled += claimed.length;
+      for (const b of claimed) {
+        await this.finalizeCascadeCancel(b, venue?.name, venueId, reason);
       }
     }
     return cancelled;
+  }
+
+  /**
+   * The per-booking wake after a cascade claim: reschedule rejection,
+   * game-post cleanup, waitlist ping, promo refund, player notice.
+   * Shared by the snapshot loop and the drain passes so a booking
+   * cancelled late gets exactly the same treatment as one cancelled
+   * early — never a silent cancellation.
+   */
+  private async finalizeCascadeCancel(
+    b: {
+      id: string;
+      userId: string | null;
+      date: Date;
+      courtId: string;
+      startMinutes: number;
+      endMinutes: number;
+      checkedInAt: Date | null;
+    },
+    venueName: string | undefined,
+    venueId: string,
+    reason: string,
+  ) {
+    await this.rejectPendingReschedules(b.id);
+    await this.cleanupGamePost(b.id, 'The arena cancelled the booking, so this game is off.');
+    await this.notifyWaitlist(b);
+    await this.releasePromo(b.id);
+    if (b.userId) {
+      await this.notifications
+        .pushToUser(b.userId, {
+          title: 'Booking cancelled',
+          body: `Your booking at ${venueName ?? 'the arena'} on ${b.date.toISOString().slice(0, 10)} was cancelled: ${reason}.`,
+          data: { type: 'booking_cancelled', venueId },
+        })
+        .catch(() => {});
+    }
   }
 
   /**

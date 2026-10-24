@@ -170,7 +170,10 @@ export class AnalyticsService {
           timeZone: 'Asia/Karachi',
         }).format(new Date());
         const d = new Date(`${pktToday}T00:00:00.000Z`);
-        d.setUTCDate(d.getUTCDate() - days);
+        // `days` counts today: days=30 must return 30 buckets, not 31
+        // (today plus 30 prior days). The old `- days` silently added
+        // one extra bucket to every default trends view.
+        d.setUTCDate(d.getUTCDate() - days + 1);
         return new Date(`${d.toISOString().slice(0, 10)}T00:00:00+05:00`);
       })();
     const rows = await this.prisma.booking.groupBy({

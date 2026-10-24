@@ -818,6 +818,26 @@ model Sport {
   updatedAt DateTime @updatedAt
 }
 
+/// Idempotency records for destructive admin mutations (mark-paid,
+/// suspend/unsuspend, role create, plan assign). The panel sends a fresh
+/// `Idempotency-Key` per user-confirmed action and reuses it across
+/// retries of that action (timeout, 401-refresh); a replay within 24h
+/// returns the stored response instead of re-executing. Scope includes
+/// the route so a key can never replay across endpoints. Rows older
+/// than 24h are pruned opportunistically on each write and never replay.
+/// NOTE: this model needs a migration (prisma migrate dev generates it).
+model IdempotencyKey {
+  id        String   @id @default(cuid())
+  scope     String // e.g. "POST /admin/venues/abc123/billing/mark-paid" (method + concrete path, no query)
+  actorId   String
+  key       String
+  response  Json
+  createdAt DateTime @default(now())
+
+  @@unique([scope, actorId, key])
+  @@index([createdAt])
+}
+
 /** Canonical amenity list, super-admin managed like the sports catalog. */
 model Amenity {
   id        String   @id @default(cuid())

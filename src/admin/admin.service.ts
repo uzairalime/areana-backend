@@ -2325,7 +2325,9 @@ export class AdminService {
     // simultaneous admin creates land 5 courts on a 4-court plan.
     const { limit: courtLimit } = await this.plans.effectiveCourtLimit(venueId);
     const sport = await this.sports.normalizeSport(dto.sport);
-    const court = await this.prisma.$transaction(async (tx) => {
+    let court;
+    try {
+      court = await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
       if (courtLimit !== null) {
         const usage = await tx.court.count({
@@ -2353,6 +2355,15 @@ export class AdminService {
         },
       });
     });
+    } catch (e) {
+      // Same race as the owner path: the pre-check can be beaten by a
+      // simultaneous create; the DB unique index is the backstop.
+      if ((e as { code?: string })?.code === 'P2002') {
+        throw new ConflictException('A court with this name already exists at this arena');
+      }
+      throw e;
+    }
+
     await this.syncVenueSports(venueId);
     await this.audit(actorId, 'court.create', 'court', court.id, `${court.name} at venue ${venueId}`);
     await this.notifications
@@ -3301,6 +3312,9 @@ export class AdminService {
       throw new BadRequestException('Promo code is required');
     }
     const code = (rawCode ?? `PROMO-${Math.random().toString(36).slice(2, 8).toUpperCase()}`).toUpperCase();
+    // Same 24-char bound as the panel (Round 3 T5) and the owner path:
+    // a long code overflows the card/voucher display.
+    if (code.length > 24) throw new BadRequestException('Promo code must be at most 24 characters');
     // Pre-check the code so a clash is a clean 409, not a raw Prisma
     // error — and still map P2002, because two admins can race the
     // pre-check.

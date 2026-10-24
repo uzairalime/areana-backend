@@ -28,6 +28,7 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { StorageModule } from './storage/storage.module';
 import { SchedulerModule } from './scheduler/scheduler.module';
 import { HealthModule } from './health/health.module';
+import { IdempotencyModule } from './common/idempotency/idempotency.module';
 import { SportsModule } from './sports/sports.module';
 import { AmenitiesModule } from './amenities/amenities.module';
 
@@ -65,6 +66,7 @@ import { AmenitiesModule } from './amenities/amenities.module';
     StorageModule,
     SchedulerModule,
     HealthModule,
+    IdempotencyModule,
     SportsModule,
     AmenitiesModule,
   ],
