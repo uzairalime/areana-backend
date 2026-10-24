@@ -91,7 +91,13 @@ export class PlansService {
   }) {
     this.assertFeatures(dto.features ?? []);
     const plan = await this.prisma.$transaction(async (tx) => {
-      if (dto.isDefault) {
+      // The first plan must be the default: with no default, venues
+      // approve with billing running but no plan and no gates. An
+      // explicit isDefault=false is overridden only when no default
+      // exists yet — afterwards it is honored.
+      const existingDefault = await tx.plan.count({ where: { isDefault: true } });
+      const makeDefault = (dto.isDefault ?? false) || existingDefault === 0;
+      if (makeDefault) {
         await tx.plan.updateMany({ data: { isDefault: false } });
       }
       return tx.plan.create({
@@ -103,7 +109,7 @@ export class PlansService {
           maxVenues: dto.maxVenues ?? null,
           maxCourts: dto.maxCourts ?? null,
           maxStaff: dto.maxStaff ?? null,
-          isDefault: dto.isDefault ?? false,
+          isDefault: makeDefault,
           isCustom: dto.isCustom ?? false,
         },
       });
@@ -170,6 +176,13 @@ export class PlansService {
     if (!plan) throw new NotFoundException('Plan not found');
     if (plan.isDefault) {
       throw new BadRequestException('The default plan cannot be deleted — make another plan the default first');
+    }
+    // The sole plan cannot go either: deleting it leaves zero plans
+    // and no default for venues to bill against — approved venues
+    // would run with billing started but no plan and no gates.
+    const totalPlans = await this.prisma.plan.count();
+    if (totalPlans <= 1) {
+      throw new BadRequestException('The only plan cannot be deleted — create another plan first');
     }
     if (plan._count.venues > 0) {
       throw new BadRequestException(`This plan still has ${plan._count.venues} venue(s) on it — move them first`);
@@ -360,9 +373,24 @@ export class PlansService {
     // Flag update + ledger insert in ONE transaction: a failed insert
     // must not leave the venue marked paid with no ledger row.
     return this.prisma.$transaction(async (tx) => {
-      const updated = await tx.venue.update({
-        where: { id: venueId },
+      // Claim the settlement inside the transaction: the
+      // idempotency check above races a concurrent mark-paid, which
+      // used to sail past it and insert a second ledger row, doubling
+      // revenue. The claim re-tests "period still unpaid" (paidUntil
+      // still before this period's end) on the current row state — the
+      // loser gets "already paid" and inserts nothing.
+      const claimed = await tx.venue.updateMany({
+        where: {
+          id: venueId,
+          OR: [{ billingPaidUntil: null }, { billingPaidUntil: { lt: ctx.periodEnd } }],
+        },
         data: { billingPaidUntil: paidUntil, billingPaused: false },
+      });
+      if (claimed.count === 0) {
+        throw new BadRequestException('This billing period is already paid');
+      }
+      const updated = await tx.venue.findUniqueOrThrow({
+        where: { id: venueId },
         include: { plan: true },
       });
       // Every settlement lands in the payments ledger, so platform revenue
@@ -520,6 +548,18 @@ export class PlansService {
         amountDue: 0,
       };
     }
+    // A zero-price period is not a debt: it never goes due/overdue.
+    // The sweep auto-settles it (see sweepBilling), but between the
+    // period start and the next sweep the panel must not show a Rs 0
+    // "due" with disabled Mark paid buttons — report it active.
+    if (ctx.price === 0) {
+      return {
+        ...base,
+        status: 'active',
+        nextDueAt: ctx.periodEnd.toISOString(),
+        amountDue: 0,
+      };
+    }
     const grace = await this.graceDays();
     const graceEnd = new Date(periodStart.getTime() + grace * 24 * 3600_000);
     const overdue = now > graceEnd;
@@ -551,7 +591,50 @@ export class PlansService {
     // Sweep never resumes (see below); kept for return-shape compat.
     const resumed = 0;
     for (const venue of venues) {
-      const summary = await this.billingSummary(venue);
+      // Zero-price periods auto-settle: a Rs 0 period is not a debt.
+      // The old code let it go due → overdue → sweep-paused with
+      // bookings cancelled, while both Mark paid buttons were disabled
+      // at amountDue <= 0 — a venue stuck with no settlement path.
+      // Settle every consecutive started zero-price period (paidUntil =
+      // period end, un-pause) so the walk advances to the first priced
+      // period, and venues already paused over a Rs 0 debt come back.
+      // Each iteration settles one period, so the loop ends at the
+      // first priced or not-yet-started period.
+      let settledVenue = venue;
+      let autoSettled = false;
+      for (;;) {
+        const ctx = await this.context(settledVenue);
+        if (!ctx || ctx.price !== 0) break;
+        if (ctx.periodStart > new Date()) break;
+        if (ctx.paidUntil && ctx.paidUntil >= ctx.periodEnd) break;
+        settledVenue = await this.prisma.venue.update({
+          where: { id: venue.id },
+          data: { billingPaidUntil: ctx.periodEnd, billingPaused: false },
+          include: { plan: true, owner: { select: { id: true, name: true } } },
+        });
+        autoSettled = true;
+        await this.prisma.auditLog
+          .create({
+            data: {
+              actorId: null,
+              action: 'venue.billing.auto_settled',
+              entity: 'venue',
+              entityId: venue.id,
+              details: `zero-price period ${ctx.periodStart.toISOString().slice(0, 10)} – ${ctx.periodEnd.toISOString().slice(0, 10)} settled automatically (Rs 0 plan)`,
+            },
+          })
+          .catch(() => {});
+      }
+      if (autoSettled && venue.billingPaused) {
+        await this.notifications
+          .pushToUser(venue.ownerId, {
+            title: 'Venue live again',
+            body: `${venue.name} is visible to players again — its plan periods cost Rs 0, so they settle automatically and never pause the venue.`,
+            data: { type: 'billing_settled' },
+          })
+          .catch(() => {});
+      }
+      const summary = await this.billingSummary(settledVenue);
       const shouldPause = summary.status === 'overdue';
       // Pause-only sweep: a billing-paused venue resumes solely via an
       // explicit action (markPaid, extendFree, plan restart) — never via
@@ -559,11 +642,41 @@ export class PlansService {
       // venues back to due and auto-resume them with zero payment, so
       // grace changes now only affect computed status display for
       // venues that are not paused.
-      if (shouldPause && !venue.billingPaused) {
-        await this.prisma.venue.update({
+      if (shouldPause && !settledVenue.billingPaused) {
+        // Re-read at decision time + claim the pause: a mark-paid
+        // landing between the sweep's snapshot and this write used to
+        // be overwritten by the pause, and re-marking was then refused
+        // ("already paid"). The fresh summary decides, and the
+        // conditional update (still unpaused AND still unpaid for this
+        // period) makes the sweep lose that race — a settled period
+        // never gets paused, and the cascade below runs only when the
+        // pause actually claimed.
+        const fresh = await this.prisma.venue.findUnique({
           where: { id: venue.id },
-          data: { billingPaused: true },
         });
+        const freshCtx = fresh ? await this.context(fresh) : null;
+        const freshSummary = fresh ? await this.billingSummary(fresh) : null;
+        const stillOverdue =
+          !!fresh &&
+          !!freshCtx &&
+          freshSummary?.status === 'overdue' &&
+          !fresh.billingPaused;
+        let claimed = false;
+        if (stillOverdue) {
+          const res = await this.prisma.venue.updateMany({
+            where: {
+              id: venue.id,
+              billingPaused: false,
+              OR: [
+                { billingPaidUntil: null },
+                { billingPaidUntil: { lt: freshCtx!.periodEnd } },
+              ],
+            },
+            data: { billingPaused: true },
+          });
+          claimed = res.count > 0;
+        }
+        if (!claimed) continue;
         // The pause that hides a venue (and cancels its bookings) had
         // no audit trail at all. System rows carry a null actor — the
         // panel renders those as "System / automated".
@@ -574,7 +687,7 @@ export class PlansService {
               action: 'venue.billing.paused',
               entity: 'venue',
               entityId: venue.id,
-              details: `overdue: Rs ${summary.amountDue.toLocaleString('en-PK')} due for period ${summary.nextDueAt ?? 'unknown'}`,
+              details: `overdue: Rs ${freshSummary!.amountDue.toLocaleString('en-PK')} due for period ${freshSummary!.nextDueAt ?? 'unknown'}`,
             },
           })
           .catch(() => {});

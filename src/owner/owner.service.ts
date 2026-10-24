@@ -455,9 +455,29 @@ export class OwnerService {
         `This arena has ${upcoming} upcoming booking(s) — cancel or complete them before archiving`,
       );
     }
-    return this.prisma.venue.update({
-      where: { id: venue.id },
-      data: { archivedAt: new Date() },
+    // The guard re-checked under locks: venue row first, then every
+    // court row (the same order booking creation uses), so a booking
+    // created between the pre-check above and this write is seen and
+    // refuses the archive instead of being stranded at a hidden arena.
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venue.id} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM "Court" WHERE "venueId" = ${venue.id} FOR UPDATE`;
+      const upcomingNow = await tx.booking.count({
+        where: {
+          venueId,
+          status: { in: ['pending', 'confirmed'] },
+          date: { gte: startOfToday() },
+        },
+      });
+      if (upcomingNow > 0) {
+        throw new ConflictException(
+          `This arena has ${upcomingNow} upcoming booking(s) — cancel or complete them before archiving`,
+        );
+      }
+      return tx.venue.update({
+        where: { id: venue.id },
+        data: { archivedAt: new Date() },
+      });
     });
   }
 
@@ -603,6 +623,12 @@ export class OwnerService {
   }
 
   async createCourt(user: AuthUser, venueId: string, dto: CreateCourtDto) {
+    // Defense in depth behind the DTO @Min(15): a slot length of 0 or less
+    // mints inverted bookings and hangs the cancel/reschedule loops that
+    // step by slotMinutes, so it is rejected here too, not only at the edge.
+    if (dto.slotMinutes !== undefined && dto.slotMinutes < 15) {
+      throw new BadRequestException('slotMinutes must be at least 15');
+    }
     const venue = await this.assertVenue(user, venueId);
     // Courts for a dead venue would pile into the approvals queue and
     // could be approved into nothing bookable.
@@ -641,6 +667,9 @@ export class OwnerService {
   }
 
   async updateCourt(user: AuthUser, courtId: string, dto: UpdateCourtDto) {
+    if (dto.slotMinutes !== undefined && dto.slotMinutes < 15) {
+      throw new BadRequestException('slotMinutes must be at least 15');
+    }
     const court = await this.prisma.court.findUnique({ where: { id: courtId } });
     if (!court) throw new NotFoundException('Court not found');
     await this.assertVenue(user, court.venueId);
@@ -704,10 +733,37 @@ export class OwnerService {
         requeueFields.some(
           (f) => (data as Record<string, unknown>)[f] !== undefined && (data as Record<string, unknown>)[f] !== court[f],
         ));
-    const updated = await this.prisma.court.update({
-      where: { id: courtId },
-      data: requeue ? { ...data, status: 'pending', rejectionReason: null } : data,
-    });
+    // Deactivation re-checks its guard under the court row lock: a
+    // booking created between the pre-check above and this write
+    // would otherwise be stranded on a switched-off court. The lock
+    // serializes against booking creation (which locks the same row),
+    // so the recount sees any booking that landed after the pre-check.
+    // Non-deactivation edits keep the plain update.
+    const updated =
+      dto.isActive === false && court.isActive
+        ? await this.prisma.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${courtId} FOR UPDATE`;
+            const upcoming = await tx.booking.count({
+              where: {
+                courtId,
+                date: { gte: startOfToday() },
+                status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+              },
+            });
+            if (upcoming > 0) {
+              throw new ConflictException(
+                `${upcoming} upcoming booking(s) still sit on this court — move or cancel them first`,
+              );
+            }
+            return tx.court.update({
+              where: { id: courtId },
+              data: requeue ? { ...data, status: 'pending', rejectionReason: null } : data,
+            });
+          })
+        : await this.prisma.court.update({
+            where: { id: courtId },
+            data: requeue ? { ...data, status: 'pending', rejectionReason: null } : data,
+          });
     await this.syncVenueSports(court.venueId);
     return updated;
   }
@@ -1425,6 +1481,13 @@ export class OwnerService {
     }
     const { court, startMinutes, endMinutes } = validated;
 
+    // A legacy court with slotMinutes <= 0 (no longer creatable) would
+    // hang the re-price loop below stepping by slotMinutes — fail
+    // loudly instead of hanging the request.
+    if (court.slotMinutes <= 0) {
+      throw new BadRequestException('Court slot length is invalid');
+    }
+
     // Re-price at the new slot with the same per-slot engine as booking
     // creation (peak/off-peak windows on the requested date). Without
     // this the moved booking kept its old price — an off-peak booking
@@ -1463,25 +1526,87 @@ export class OwnerService {
     discount = Math.min(discount, gross);
     const newTotal = Math.max(0, gross - discount);
 
-    const [booking] = await this.prisma.$transaction([
-      this.prisma.booking.update({
-        where: { id: req.bookingId },
-        data: {
-          date: req.requestedDate,
-          startMinutes,
-          endMinutes,
-          totalPrice: newTotal,
-          discountAmount: discount,
-          // A moved booking has not been played at the new slot yet.
-          checkedInAt: null,
-          status: BookingStatus.confirmed,
-        },
-      }),
-      this.prisma.rescheduleRequest.update({
-        where: { id: requestId },
-        data: { status: 'approved', decidedAt: new Date() },
-      }),
-    ]);
+    // The commit claims both rows: the request must still be pending
+    // and the booking must still be confirmed and unchecked-in. A
+    // cancel/expiry/check-in between validation and commit aborts the
+    // whole transaction instead of resurrecting, teleporting, or
+    // double-deciding the booking. The court row lock + clash re-check
+    // close the same race against a concurrent booking creation into
+    // the requested slot (the R1 pattern, applied to moves).
+    let booking: Prisma.BookingGetPayload<{}>;
+    try {
+      booking = await this.prisma.$transaction(async (tx) => {
+        // Venue row first, then court — the same lock order booking
+        // creation and archiving use, so the paths can never deadlock.
+        await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${req.booking.venueId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${court.id} FOR UPDATE`;
+        // The court (or its venue) may have been deactivated, archived,
+        // or suspended since validation — a move into it must fail
+        // rather than confirm onto a dead court.
+        await this.courtsSvc.assertBookableInTx(tx, court.id);
+        const clash = await tx.booking.findFirst({
+          where: {
+            id: { not: req.bookingId },
+            courtId: req.booking.courtId,
+            date: req.requestedDate,
+            status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+            startMinutes: { lt: endMinutes },
+            endMinutes: { gt: startMinutes },
+          },
+          select: { id: true },
+        });
+        if (clash) throw new ConflictException('Requested slot is no longer available');
+        const reqClaimed = await tx.rescheduleRequest.updateMany({
+          where: { id: requestId, status: 'pending' },
+          data: { status: 'approved', decidedAt: new Date() },
+        });
+        if (reqClaimed.count === 0) {
+          throw new BadRequestException('Request already decided');
+        }
+        const bookingClaimed = await tx.booking.updateMany({
+          where: {
+            id: req.bookingId,
+            status: BookingStatus.confirmed,
+            checkedInAt: null,
+          },
+          data: {
+            date: req.requestedDate,
+            startMinutes,
+            endMinutes,
+            totalPrice: newTotal,
+            discountAmount: discount,
+            // A moved booking has not been played at the new slot yet.
+            checkedInAt: null,
+            status: BookingStatus.confirmed,
+          },
+        });
+        if (bookingClaimed.count === 0) {
+          throw new BadRequestException('Booking is no longer active');
+        }
+        return tx.booking.findUniqueOrThrow({ where: { id: req.bookingId } });
+      });
+    } catch (err) {
+      // A commit-time booking claim miss means the booking left the
+      // confirmed state (cancelled, expired, or checked in) after
+      // validation: auto-reject the request like a validation failure,
+      // so the player is not left waiting on a dead request.
+      if (err instanceof BadRequestException && err.message === 'Booking is no longer active') {
+        await this.prisma.rescheduleRequest.updateMany({
+          where: { id: requestId, status: 'pending' },
+          data: { status: 'rejected', reason: err.message, decidedAt: new Date() },
+        });
+        if (req.booking.userId) {
+          await this.notifications
+            .pushToUser(req.booking.userId, {
+              title: 'Reschedule declined',
+              body: `Your reschedule request at ${venue.name} could not be honoured: ${err.message}`,
+              data: { type: 'reschedule_decision' },
+            })
+            .catch(() => {});
+        }
+      }
+      throw err;
+    }
     // The old slot just freed up — ping its waitlist (whole old range).
     for (
       let s = req.booking.startMinutes;
@@ -1556,16 +1681,24 @@ export class OwnerService {
     if (!req) throw new NotFoundException('Request not found');
     if (req.status !== 'pending') throw new BadRequestException('Request already decided');
     const venue = await this.assertVenue(user, req.booking.venueId);
-    const rejected = await this.prisma.rescheduleRequest.update({
-      where: { id: requestId },
+    // Claim the decision: a concurrent accept must win over this
+    // reject (and vice versa) instead of the last write silently
+    // overwriting the first.
+    const rejected = await this.prisma.rescheduleRequest.updateMany({
+      where: { id: requestId, status: 'pending' },
       data: { status: 'rejected', reason, decidedAt: new Date() },
     });
+    if (rejected.count === 0) {
+      throw new BadRequestException('Request already decided');
+    }
     if (req.booking.userId) {
       await this.notifications
         .notifyRescheduleDecision(req.booking.userId, false, venue.name)
         .catch(() => {});
     }
-    return rejected;
+    // updateMany returns only a count — re-read so the response keeps
+    // the request shape the panel expects.
+    return this.prisma.rescheduleRequest.findUniqueOrThrow({ where: { id: requestId } });
   }
 
   // ------------------------------------------------------------------ staff

@@ -311,16 +311,33 @@ export class SchedulerService implements OnModuleInit {
    */
   @Cron('*/15 * * * *', PKT)
   async closeExpiredGamePosts() {
-    const today = startOfToday();
-    const nowMin = minutesSinceMidnight();
-    const res = await this.prisma.gamePost.updateMany({
-      where: {
-        status: { in: ['open', 'full'] },
-        OR: [
-          { date: { lt: today } },
-          { date: today, startMinutes: { lte: nowMin } },
-        ],
+    // Close on the game's END, not its start or play date: a
+    // booking-linked post for an overnight game (Fri 23:00–01:00)
+    // used to close at the 00:00 tick, before its game had ended.
+    // Booking-linked posts use the booking's slot end (slotEnded
+    // handles the midnight rollover); curated posts carry no end time,
+    // so they still close once their start has passed.
+    const posts = await this.prisma.gamePost.findMany({
+      where: { status: { in: ['open', 'full'] } },
+      select: {
+        id: true,
+        date: true,
+        startMinutes: true,
+        booking: { select: { date: true, endMinutes: true } },
       },
+    });
+    const now = new Date();
+    const expiredIds = posts
+      .filter((p) => {
+        if (p.booking) return this.bookings.slotEnded(p.booking, now);
+        const start = new Date(p.date.getFullYear(), p.date.getMonth(), p.date.getDate());
+        start.setMinutes(p.startMinutes);
+        return start <= now;
+      })
+      .map((p) => p.id);
+    if (expiredIds.length === 0) return;
+    const res = await this.prisma.gamePost.updateMany({
+      where: { id: { in: expiredIds }, status: { in: ['open', 'full'] } },
       data: { status: 'closed' },
     });
     if (res.count > 0) {
@@ -363,9 +380,29 @@ export class SchedulerService implements OnModuleInit {
     }
   }
 
+  // Single-flight flag for the nightly job: overlapping runs (a
+  // restart near the 02:00 tick, a second instance) used to
+  // double-mint referral rewards and resurrect bookings cancelled
+  // after the snapshot. The flag stops same-process overlap; the
+  // status-conditioned claims below stop cross-process overlap too.
+  private nightlyRunning = false;
+
   /** Nightly: complete past bookings, pay out referral rewards, recompute badges. */
   @Cron('0 2 * * *', PKT)
   async nightly() {
+    if (this.nightlyRunning) {
+      this.logger.log('Nightly already running — skipping overlapping run');
+      return;
+    }
+    this.nightlyRunning = true;
+    try {
+      await this.runNightly();
+    } finally {
+      this.nightlyRunning = false;
+    }
+  }
+
+  private async runNightly() {
     const now = new Date();
     const today = startOfToday();
     // Booking dates are stored as UTC midnights, so "up to today" is
@@ -410,12 +447,21 @@ export class SchedulerService implements OnModuleInit {
       .filter((b) => this.bookings.slotEnded(b, now))
       .map((b) => b.id);
     if (doneIds.length > 0) {
+      // Claim the completion: a booking cancelled after the snapshot
+      // (a late owner cancel, a player cancel) must not be resurrected
+      // to completed by this unconditional write. The reschedule
+      // rejection below is likewise scoped to bookings that actually
+      // completed here.
       await this.prisma.booking.updateMany({
-        where: { id: { in: doneIds } },
+        where: { id: { in: doneIds }, status: BookingStatus.confirmed },
         data: { status: BookingStatus.completed },
       });
       await this.prisma.rescheduleRequest.updateMany({
-        where: { bookingId: { in: doneIds }, status: 'pending' },
+        where: {
+          bookingId: { in: doneIds },
+          status: 'pending',
+          booking: { status: BookingStatus.completed },
+        },
         data: {
           status: 'rejected',
           reason: 'Booking is no longer active',

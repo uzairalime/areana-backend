@@ -1,5 +1,5 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { UserStatus, VenueStatus } from '@prisma/client';
+import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 
 export interface DayWindow {
@@ -91,19 +91,27 @@ export class CourtsService {
    * RecurringBlocks whose weekday matches and whose optional date range
    * covers the date.
    */
-  async blockedRangesForDate(courtId: string, date: Date): Promise<DayWindow[]> {
+  async blockedRangesForDate(
+    courtId: string,
+    date: Date,
+    tx?: Prisma.TransactionClient,
+  ): Promise<DayWindow[]> {
+    // Pass the caller's transaction client when the check must see
+    // uncommitted work inside that transaction (booking creation
+    // re-checks overlap under the court row lock).
+    const db = tx ?? this.prisma;
     const nextDay = new Date(date);
     nextDay.setDate(nextDay.getDate() + 1);
     const [oneOff, recurring, nextBlocks] = await Promise.all([
-      this.prisma.slotBlock.findMany({
+      db.slotBlock.findMany({
         where: { courtId, date },
         select: { startMinutes: true, endMinutes: true },
       }),
-      this.prisma.recurringBlock.findMany({ where: { courtId } }),
+      db.recurringBlock.findMany({ where: { courtId } }),
       // Overnight spill: an early-morning block on the NEXT date (e.g.
       // Sat 01:00–02:00) also blocks this date's overnight window
       // (Fri 18:00–02:00), where those hours are minutes 1500–1560.
-      this.prisma.slotBlock.findMany({
+      db.slotBlock.findMany({
         where: { courtId, date: nextDay, startMinutes: { lt: 360 } },
         select: { startMinutes: true, endMinutes: true },
       }),
@@ -139,6 +147,7 @@ export class CourtsService {
     freeUntilOverride: Date | null;
     billingPeriodStart: Date | null;
     billingPeriodEnd: Date | null;
+    billingPeriodPrice?: unknown;
     planId: string | null;
   }): Promise<boolean> {
     if (!venue.billingStartAt) return false;
@@ -175,6 +184,19 @@ export class CourtsService {
         periodStart = addMonths(periodStart, -12);
       }
     }
+    // Zero-price periods are never overdue (mirror of billingSummary):
+    // a Rs 0 period is not a debt, so it must not block bookings. The
+    // frozen price governs while the walk is still inside the frozen
+    // period, else the plan price — same rule as plans.context().
+    const frozenPrice =
+      venue.billingPeriodStart &&
+      venue.billingPeriodEnd &&
+      periodStart.getTime() === venue.billingPeriodStart.getTime() &&
+      venue.billingPeriodPrice != null
+        ? Number(venue.billingPeriodPrice)
+        : null;
+    const price = frozenPrice ?? plan.priceYearly;
+    if (price === 0) return false;
     const setting = await this.prisma.setting.findUnique({
       where: { key: 'billingGraceDays' },
     });
@@ -204,6 +226,7 @@ export class CourtsService {
         freeUntilOverride: true,
         billingPeriodStart: true,
         billingPeriodEnd: true,
+        billingPeriodPrice: true,
         planId: true,
       },
     });
@@ -230,5 +253,27 @@ export class CourtsService {
       throw new NotFoundException('Court not found');
     }
     return court;
+  }
+
+  /**
+   * The getActiveCourt predicate re-run inside the caller's transaction
+   * (booking creation re-verifies under the venue + court row locks).
+   * Without it, a court deleted, deactivated, re-queued, or a venue
+   * archived/suspended between the pre-check and the insert would take
+   * a booking it must not take — or FK-fail on a deleted court.
+   */
+  async assertBookableInTx(tx: Prisma.TransactionClient, courtId: string): Promise<void> {
+    const court = await tx.court.findFirst({
+      where: {
+        id: courtId,
+        isActive: true,
+        status: 'approved',
+        venue: this.venuePredicate(),
+      },
+      include: { venue: true },
+    });
+    if (!court || (await this.isBillingOverdue(court.venue))) {
+      throw new NotFoundException('Court not found');
+    }
   }
 }

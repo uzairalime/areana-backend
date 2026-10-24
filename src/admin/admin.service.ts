@@ -520,10 +520,20 @@ export class AdminService {
     }
     // Approval/reactivation clears any stored rejection reason, so a
     // stale reason never shows on a live account.
-    const user = await this.prisma.user.update({
-      where: { id },
+    // Claim the transition: two concurrent unsuspends used to both
+    // read "suspended", both update, and both forgive the billing
+    // window — shifting the clock twice (20 free days instead of 10).
+    // The loser gets "already changed" instead of a second forgiveness.
+    const claimed = await this.prisma.user.updateMany({
+      where: { id, status: target.status },
       data: status === UserStatus.active ? { status, rejectionReason: null } : { status },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException(
+        'This account status already changed — refresh and try again',
+      );
+    }
+    const user = await this.prisma.user.findUniqueOrThrow({ where: { id } });
     await this.audit(actorId, `user.${status}`, 'user', id);
     if (status === UserStatus.suspended && target.role.name === 'owner') {
       // Owner suspension follows the venue-suspension policy: upcoming
@@ -667,6 +677,22 @@ export class AdminService {
       orderBy: { createdAt: 'desc' },
     });
     if (!suspendedRow) return;
+    // Forgiveness marker: if this suspension was already forgiven (a
+    // forgiveness audit row newer than the suspension row), skip —
+    // the status-transition claim above blocks the concurrent double
+    // unsuspend, and this blocks any second forgiveness of the same
+    // suspension window through any other path. A LATER suspension
+    // writes a newer suspended row, so its forgiveness is unaffected.
+    const alreadyForgiven = await this.prisma.auditLog.findFirst({
+      where: {
+        entity: 'user',
+        entityId: ownerId,
+        action: 'billing.suspension_forgiven',
+        createdAt: { gt: suspendedRow.createdAt },
+      },
+      select: { id: true },
+    });
+    if (alreadyForgiven) return;
     const ms = Date.now() - suspendedRow.createdAt.getTime();
     if (ms <= 0) return;
     const venues = await this.prisma.venue.findMany({
@@ -1082,6 +1108,15 @@ export class AdminService {
     if (existing.billingPaused) {
       throw new BadRequestException('This arena\'s billing is paused — settle billing before approving');
     }
+    // No plan at all means no billing and no gates: approving would
+    // put a live arena on the platform that can never be billed and
+    // whose feature gates all deny. The first plan is auto-default
+    // (see createPlan), so this only bites on a plan-less platform.
+    if (!(await this.plans.defaultPlan())) {
+      throw new BadRequestException(
+        'No default plan exists — create a plan before approving arenas',
+      );
+    }
     // Computed billing, not just the materialized flag: the flag only
     // flips on the nightly sweep, so a venue whose grace ended since
     // the last sweep would otherwise be approved into a listing that
@@ -1111,10 +1146,20 @@ export class AdminService {
         `This venue isn't ready to go live: ${readiness.missing.join('; ')}`,
       );
     }
-    const venue = await this.prisma.venue.update({
-      where: { id: venueId },
+    // Claim the approval: a concurrent reject must win over this
+    // approve (and vice versa) instead of the last write leaving the
+    // billing clock running on a rejected venue plus two contradictory
+    // owner notices.
+    const claimed = await this.prisma.venue.updateMany({
+      where: { id: venueId, status: { in: [VenueStatus.pending, VenueStatus.draft] } },
       data: { status: VenueStatus.approved },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException(
+        'This venue has already been decided — refresh the queue.',
+      );
+    }
+    const venue = await this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
     // First approval starts the plan billing clock (default plan,
     // free period first) — see PlansService.
     await this.plans.startBilling(venueId);
@@ -2094,10 +2139,14 @@ export class AdminService {
         );
       }
     }
-    const updated = await this.prisma.court.update({
-      where: { id: courtId },
+    const claimed = await this.prisma.court.updateMany({
+      where: { id: courtId, status: 'pending' },
       data: { status: 'approved', rejectionReason: null },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException('This court has already been decided');
+    }
+    const updated = await this.prisma.court.findUniqueOrThrow({ where: { id: courtId } });
     await this.audit(actorId, 'court.approve', 'court', courtId);
     const arenaLive =
       court.venue.status === 'approved' &&
@@ -2144,10 +2193,14 @@ export class AdminService {
       );
     }
     const reason = note?.trim() || null;
-    const updated = await this.prisma.court.update({
-      where: { id: courtId },
+    const claimed = await this.prisma.court.updateMany({
+      where: { id: courtId, status: 'pending' },
       data: { status: 'rejected', rejectionReason: reason },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException('This court has already been decided');
+    }
+    const updated = await this.prisma.court.findUniqueOrThrow({ where: { id: courtId } });
     await this.audit(actorId, 'court.reject', 'court', courtId, reason ?? undefined);
     await this.notifications
       .pushToUser(court.venue.ownerId, {
@@ -2215,6 +2268,11 @@ export class AdminService {
       slotMinutes?: number;
     },
   ) {
+    // Defense in depth behind the DTO @Min(15): slotMinutes <= 0 mints inverted
+    // bookings and hangs the loops that step by slotMinutes.
+    if (dto.slotMinutes !== undefined && dto.slotMinutes < 15) {
+      throw new BadRequestException('slotMinutes must be at least 15');
+    }
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
     if (venue.archivedAt || venue.status === 'suspended' || venue.status === 'rejected') {
@@ -2285,6 +2343,9 @@ export class AdminService {
       isActive?: boolean;
     },
   ) {
+    if (dto.slotMinutes !== undefined && dto.slotMinutes < 15) {
+      throw new BadRequestException('slotMinutes must be at least 15');
+    }
     const court = await this.prisma.court.findUnique({
       where: { id: courtId },
       include: { venue: { select: { name: true, ownerId: true } } },
@@ -2349,7 +2410,29 @@ export class AdminService {
       data.status = 'pending';
       data.rejectionReason = null;
     }
-    const updated = await this.prisma.court.update({ where: { id: courtId }, data });
+    // Deactivation re-checks its guard under the court row lock, like
+    // the owner path: a booking created between the pre-check above
+    // and this write would otherwise be stranded on a switched-off
+    // court. Non-deactivation edits keep the plain update.
+    const updated =
+      dto.isActive === false && court.isActive
+        ? await this.prisma.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${courtId} FOR UPDATE`;
+            const upcoming = await tx.booking.count({
+              where: {
+                courtId,
+                date: { gte: startOfToday() },
+                status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+              },
+            });
+            if (upcoming > 0) {
+              throw new ConflictException(
+                `${upcoming} upcoming booking(s) still sit on this court — move or cancel them first`,
+              );
+            }
+            return tx.court.update({ where: { id: courtId }, data });
+          })
+        : await this.prisma.court.update({ where: { id: courtId }, data });
     await this.syncVenueSports(court.venueId);
     await this.audit(
       actorId,
@@ -2391,6 +2474,9 @@ export class AdminService {
       include: { venue: { select: { name: true, ownerId: true } } },
     });
     if (!court) throw new NotFoundException('Court not found');
+    // Fast pre-checks with the same messages as the authoritative
+    // re-checks inside the transaction below — the pre-checks fail
+    // fast, the in-transaction ones close the race.
     const live = await this.prisma.booking.count({
       where: { courtId, status: { in: [BookingStatus.pending, BookingStatus.confirmed] } },
     });
@@ -2412,34 +2498,49 @@ export class AdminService {
         'This court has bookings with open disputes — resolve them before deleting it',
       );
     }
-    // Waiters are told BEFORE their rows are deleted — unlike the
-    // player-suspend path, which pings waiters on freed slots, a court
-    // delete used to silently drop waitlist entries.
-    const waiters = await this.prisma.slotWaitlist.findMany({
-      where: { courtId },
-      select: { userId: true },
-    });
-    for (const w of waiters) {
-      await this.notifications
-        .pushToUser(w.userId, {
-          title: 'Court removed',
-          body: `A court you were waiting on at "${court.venue.name}" was removed by Areana admin, so your waitlist entry is closed.`,
-          data: { type: 'court_deleted', venueId: court.venueId },
-        })
-        .catch(() => {});
-    }
-    // Deleting the court deletes its bookings — their promos must be
-    // refunded first, or usedCount stays inflated for games that no
-    // longer exist. (Cancelled bookings were already refunded at
-    // cancel time; refundBookingPromo is a no-op for those.)
-    const doomed = await this.prisma.booking.findMany({
-      where: { courtId },
-      select: { id: true },
-    });
-    for (const b of doomed) {
-      await this.bookings.releasePromo(b.id);
-    }
-    await this.prisma.$transaction(async (tx) => {
+    // Guard + refund + delete in ONE transaction under the court row
+    // lock: a booking created mid-delete used to be deleted silently,
+    // promo unrefunded, player unnotified. The lock serializes against
+    // booking creation (which locks the same row), so the re-checks
+    // below see any booking that landed after the pre-checks — and a
+    // refused delete refunds nothing and notifies nobody, because the
+    // refunds and notices run only after this commit. Deleting the
+    // court deletes its bookings, so their promos are refunded inside
+    // the same transaction (a post-commit refund could not find the
+    // redemptions — their bookingId nulls on delete). Cancelled
+    // bookings were already refunded at cancel time; the refund is a
+    // no-op for those.
+    const waiterIds = await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${courtId} FOR UPDATE`;
+      const locked = await tx.court.findUnique({ where: { id: courtId }, select: { id: true } });
+      if (!locked) throw new NotFoundException('Court not found');
+      const liveNow = await tx.booking.count({
+        where: { courtId, status: { in: [BookingStatus.pending, BookingStatus.confirmed] } },
+      });
+      if (liveNow > 0) {
+        throw new ConflictException(
+          `This court has ${liveNow} live booking(s) — cancel or complete them first, or deactivate it instead of deleting it`,
+        );
+      }
+      const openNow = await tx.dispute.count({
+        where: { booking: { courtId }, status: 'open' },
+      });
+      if (openNow > 0) {
+        throw new ConflictException(
+          'This court has bookings with open disputes — resolve them before deleting it',
+        );
+      }
+      const waiters = await tx.slotWaitlist.findMany({
+        where: { courtId },
+        select: { userId: true },
+      });
+      const doomed = await tx.booking.findMany({
+        where: { courtId },
+        select: { id: true },
+      });
+      for (const b of doomed) {
+        await this.bookings.releasePromo(b.id, tx);
+      }
       // Only historical bookings can remain at this point; resolved or
       // dismissed disputes on them are removed explicitly (their
       // history goes with the court; Dispute.bookingId SetNull is the
@@ -2450,7 +2551,20 @@ export class AdminService {
       await tx.booking.deleteMany({ where: { courtId } });
       await tx.slotWaitlist.deleteMany({ where: { courtId } });
       await tx.court.delete({ where: { id: courtId } });
+      return waiters.map((w) => w.userId);
     });
+    // Waiters are told only once the delete has committed — unlike the
+    // player-suspend path, which pings waiters on freed slots, a court
+    // delete used to silently drop waitlist entries.
+    for (const userId of waiterIds) {
+      await this.notifications
+        .pushToUser(userId, {
+          title: 'Court removed',
+          body: `A court you were waiting on at "${court.venue.name}" was removed by Areana admin, so your waitlist entry is closed.`,
+          data: { type: 'court_deleted', venueId: court.venueId },
+        })
+        .catch(() => {});
+    }
     // The court's photo files go with it (single-photo deletes already
     // clean up; a whole-court delete must not leak the files). This
     // runs after the commit and is best-effort: a storage failure
@@ -2795,10 +2909,16 @@ export class AdminService {
         `This venue is ${existing.status} — only a pending submission can be rejected. Refresh the queue.`,
       );
     }
-    const venue = await this.prisma.venue.update({
-      where: { id: venueId },
+    const claimed = await this.prisma.venue.updateMany({
+      where: { id: venueId, status: { in: [VenueStatus.pending, VenueStatus.draft] } },
       data: { status: VenueStatus.rejected, rejectionReason: reason?.trim() || null },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException(
+        'This venue has already been decided — refresh the queue.',
+      );
+    }
+    const venue = await this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
     await this.audit(actorId, 'venue.reject', 'venue', venueId, reason);
     await this.notifications
       .pushToUser(venue.ownerId, {
@@ -2820,10 +2940,16 @@ export class AdminService {
         `This venue is ${existing.status} — only a pending or live venue can be suspended.`,
       );
     }
-    const venue = await this.prisma.venue.update({
-      where: { id: venueId },
+    const claimed = await this.prisma.venue.updateMany({
+      where: { id: venueId, status: { in: [VenueStatus.pending, VenueStatus.approved] } },
       data: { status: VenueStatus.suspended },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException(
+        'This venue has already been decided — refresh and try again.',
+      );
+    }
+    const venue = await this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
     await this.audit(actorId, 'venue.suspend', 'venue', venueId);
     // A suspended venue's upcoming bookings do not stand.
     await this.bookings
@@ -2872,10 +2998,18 @@ export class AdminService {
       !billingOverdue &&
       owner?.status === UserStatus.active &&
       readiness.ready;
-    const venue = await this.prisma.venue.update({
-      where: { id: venueId },
+    // Claim the reinstatement: a concurrent suspend must not be
+    // silently overwritten back to approved by this write.
+    const claimed = await this.prisma.venue.updateMany({
+      where: { id: venueId, status: VenueStatus.suspended },
       data: { status: canGoLive ? VenueStatus.approved : VenueStatus.pending },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException(
+        'This venue has already been decided — refresh and try again.',
+      );
+    }
+    const venue = await this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
     // A reinstated venue with no billing clock never started one (it
     // was suspended before approval, or its clock was stopped) — start
     // it now, or the venue goes live unbilled.
@@ -3632,10 +3766,17 @@ export class AdminService {
         `This booking is ${booking.status} — only pending or confirmed bookings can be cancelled`,
       );
     }
-    await this.prisma.booking.update({
-      where: { id },
+    // Claim the cancel: a concurrent owner-accept, expiry, or check-in
+    // decision that already moved the booking out of pending/confirmed
+    // wins — an unconditional update here would resurrect it and run
+    // the full side-effect chain a second time.
+    const claimed = await this.prisma.booking.updateMany({
+      where: { id, status: { in: [BookingStatus.pending, BookingStatus.confirmed] } },
       data: { status: BookingStatus.cancelled },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException('This booking has already been decided');
+    }
     // Same cleanup as the owner cancel path: stale pending reschedules
     // must never resurrect it, its game post dies, the waitlist gets
     // the freed slot, and its promo use is refunded.
@@ -3680,10 +3821,16 @@ export class AdminService {
         `This booking is ${booking.status} — only a pending booking can be force-confirmed`,
       );
     }
-    await this.prisma.booking.update({
-      where: { id },
+    // Claim the confirm: an expiry-cancel landing between the read and
+    // this write must win — an unconditional update would resurrect a
+    // cancelled booking as confirmed.
+    const claimed = await this.prisma.booking.updateMany({
+      where: { id, status: BookingStatus.pending },
       data: { status: BookingStatus.confirmed },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException('This booking has already been decided');
+    }
     await this.audit(actorId, 'booking.force_confirm', 'booking', id);
     // A force-confirm is still a confirmation the player must hear
     // about — the same push the owner-accept path sends.

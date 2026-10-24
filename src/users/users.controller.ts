@@ -1,4 +1,5 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, Param, Patch, Post, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { UserStatus } from '@prisma/client';
 import { ApiBearerAuth, ApiConsumes, ApiProperty, ApiPropertyOptional, ApiTags } from '@nestjs/swagger';
 import { IsOptional, IsString } from 'class-validator';
 import { AuthUser, CurrentUser, RequirePerm } from '../common/auth';
@@ -80,6 +81,28 @@ export class UsersController {
   @Delete('me')
   async deleteMe(@CurrentUser() user: AuthUser) {
     const id = user.id;
+    // The last active super admin must not delete themselves out of
+    // the platform: demote and suspend both refuse it, and self-delete
+    // must match — otherwise there is no in-product path left to admin
+    // anything, and recovery is database surgery.
+    const self = await this.prisma.user.findUnique({
+      where: { id },
+      include: { role: { select: { name: true } } },
+    });
+    if (self?.role?.name === 'super_admin') {
+      const others = await this.prisma.user.count({
+        where: {
+          id: { not: id },
+          status: UserStatus.active,
+          role: { name: 'super_admin' },
+        },
+      });
+      if (others === 0) {
+        throw new BadRequestException(
+          "You can't delete the last active super admin",
+        );
+      }
+    }
     // Leave nothing live behind: future bookings are cancelled (venue
     // owners told), hosted games come down, and squad spots are given
     // back — then the profile itself is anonymized below.

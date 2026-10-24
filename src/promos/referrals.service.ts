@@ -61,10 +61,14 @@ export class ReferralsService {
         where: { userId: r.refereeId, status: 'completed' },
       });
       if (completed > 0) {
-        await this.prisma.referral.update({
-          where: { id: r.id },
+        // Claim the reward: two overlapping nightly runs used to both
+        // read this row as pending and mint a promo each. The loser
+        // gets count 0 and mints nothing.
+        const claimed = await this.prisma.referral.updateMany({
+          where: { id: r.id, status: 'pending' },
           data: { status: 'rewarded' },
         });
+        if (claimed.count === 0) continue;
         await this.promos.createPersonalPromo(r.referrerId, 'percent', 10, 60, 'REWARD');
         granted++;
       }

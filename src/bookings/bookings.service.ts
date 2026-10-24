@@ -94,6 +94,21 @@ export class BookingsService {
     }
 
     const booking = await this.prisma.$transaction(async (tx) => {
+      // Serialize creation per court (venue row first, then court —
+      // the same order the archive path uses, so the two can never
+      // deadlock). The locks make the re-checks below see every
+      // concurrent insert AND every concurrent guard change: two
+      // players booking overlapping (not just identical) slots in the
+      // same second cannot both confirm — the @@unique backstop only
+      // matches identical start minutes — and a court deleted,
+      // deactivated, or re-queued, or a venue archived/suspended,
+      // between the pre-check and the insert no longer takes a booking
+      // it must not take. The early checks above stay as fail-fasts;
+      // these are authoritative.
+      await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${court.venueId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${court.id} FOR UPDATE`;
+      await this.courts.assertBookableInTx(tx, court.id);
+      await this.assertNoOverlap(court.id, date, startMinutes, endMinutes, tx);
       const b = await tx.booking.create({
         data: {
           userId: input.userId,
@@ -191,8 +206,17 @@ export class BookingsService {
     if (bookingAt <= now) throw new BadRequestException('Cannot book a slot in the past');
   }
 
-  private async assertNoOverlap(courtId: string, date: Date, startMinutes: number, endMinutes: number) {
-    const clash = await this.prisma.booking.findFirst({
+  private async assertNoOverlap(
+    courtId: string,
+    date: Date,
+    startMinutes: number,
+    endMinutes: number,
+    tx?: Prisma.TransactionClient,
+  ) {
+    // With a transaction client the reads see that transaction's
+    // uncommitted work (booking creation re-checks under the court lock).
+    const db = tx ?? this.prisma;
+    const clash = await db.booking.findFirst({
       where: {
         courtId,
         date,
@@ -204,7 +228,7 @@ export class BookingsService {
     });
     if (clash) throw new ConflictException('Slot overlaps an existing booking');
 
-    const ranges = await this.courts.blockedRangesForDate(courtId, date);
+    const ranges = await this.courts.blockedRangesForDate(courtId, date, tx);
     if (
       ranges.some((r) => startMinutes < r.endMinutes && endMinutes > r.startMinutes)
     ) {
@@ -217,7 +241,7 @@ export class BookingsService {
     if (endMinutes > 1440) {
       const nextDate = new Date(date);
       nextDate.setDate(nextDate.getDate() + 1);
-      const spillClash = await this.prisma.booking.findFirst({
+      const spillClash = await db.booking.findFirst({
         where: {
           courtId,
           date: nextDate,
@@ -232,7 +256,7 @@ export class BookingsService {
     if (startMinutes < 360) {
       const prevDate = new Date(date);
       prevDate.setDate(prevDate.getDate() - 1);
-      const prev = await this.prisma.booking.findMany({
+      const prev = await db.booking.findMany({
         where: {
           courtId,
           date: prevDate,
@@ -300,7 +324,7 @@ export class BookingsService {
         status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
         date: { gte: startOfToday() },
       },
-      select: { id: true, date: true, startMinutes: true },
+      select: { id: true, date: true, startMinutes: true, status: true },
     });
     // The started-check applies to today's occurrence too: a series
     // cancel must not kill a slot that is already in play — it stays
@@ -314,11 +338,20 @@ export class BookingsService {
           (isSameDay(b.date, now) && b.startMinutes <= nowMin)
         ),
     );
-    const res = await this.prisma.booking.updateMany({
-      where: { id: { in: affected.map((b) => b.id) } },
-      data: { status: BookingStatus.cancelled },
-    });
+    // Claim each occurrence with the status it had when read: an owner
+    // accept landing between the read and this write wins — the
+    // just-confirmed occurrence is not silently cancelled, and its side
+    // effects (promo refund, waitlist ping, game-post cleanup) run only
+    // for occurrences actually cancelled here, never for ones another
+    // path already decided.
+    let cancelled = 0;
     for (const b of affected) {
+      const claimed = await this.prisma.booking.updateMany({
+        where: { id: b.id, status: b.status },
+        data: { status: BookingStatus.cancelled },
+      });
+      if (claimed.count === 0) continue;
+      cancelled++;
       await this.rejectPendingReschedules(b.id);
       await this.releasePromo(b.id);
       await this.cleanupGamePost(b.id, 'The host cancelled their booking, so this game is off.');
@@ -331,34 +364,57 @@ export class BookingsService {
     // The series player gets the same booking_cancelled signal as any
     // other cancellation, so a cancelled series never silently stands
     // on their calendar.
-    if (res.count > 0) {
+    if (cancelled > 0) {
       await this.notifications
         .pushToUser(userId, {
           title: 'Recurring series cancelled',
-          body: `${res.count} booking${res.count === 1 ? '' : 's'} in your recurring series were cancelled. Any promos used have been refunded.`,
+          body: `${cancelled} booking${cancelled === 1 ? '' : 's'} in your recurring series were cancelled. Any promos used have been refunded.`,
           data: { type: 'booking_cancelled' },
         })
         .catch(() => {});
     }
-    return { cancelled: res.count };
+    return { cancelled };
   }
 
   // ------------------------------------------------------------------ read
   async listMine(userId: string, query: MyBookingsQueryDto) {
     const today = startOfToday();
+    // Past/upcoming is decided by the slot's END instant, not the play
+    // date: an overnight booking (endMinutes > 1440, stored on the
+    // evening's date) is still upcoming while it is being played after
+    // midnight, and only becomes past once its end instant passes. The
+    // end instant for a yesterday-evening game is today at
+    // (endMinutes − 1440), so "yesterday, endMinutes > 1440 + nowMin"
+    // is exactly "still in play". Slots never span more than one
+    // midnight (court windows cap at 20h), so three clauses are exact.
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const nowMin = minutesSinceMidnight();
+    const ACTIVE: BookingStatus[] = [BookingStatus.pending, BookingStatus.confirmed];
+    const TERMINAL: BookingStatus[] = [
+      BookingStatus.cancelled,
+      BookingStatus.completed,
+      BookingStatus.no_show,
+    ];
     const where =
       query.filter === 'past'
         ? {
             userId,
             OR: [
-              { date: { lt: today } },
-              { status: { in: [BookingStatus.cancelled, BookingStatus.completed, BookingStatus.no_show] } },
+              { status: { in: TERMINAL } },
+              { status: { in: ACTIVE }, date: { lt: yesterday } },
+              { status: { in: ACTIVE }, date: yesterday, endMinutes: { lte: 1440 + nowMin } },
+              { status: { in: ACTIVE }, date: today, endMinutes: { lte: nowMin } },
             ],
           }
         : {
             userId,
-            date: { gte: today },
-            status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+            status: { in: ACTIVE },
+            OR: [
+              { date: { gt: today } },
+              { date: today, endMinutes: { gt: nowMin } },
+              { date: yesterday, endMinutes: { gt: 1440 + nowMin } },
+            ],
           };
 
     const page = query.page ?? 1;
@@ -486,6 +542,10 @@ export class BookingsService {
       include: { venue: { select: { name: true } } },
     });
     if (!court) return;
+    // A legacy court with slotMinutes <= 0 (no longer creatable, but
+    // possibly already stored) would loop forever stepping by 0 or
+    // backwards — skip the notify rather than hang the request.
+    if (court.slotMinutes <= 0) return;
     // Every slot in the freed range — a 2-hour cancellation frees two
     // waitlist slots, not just the first.
     for (
@@ -525,12 +585,10 @@ export class BookingsService {
     if (!booking || booking.status === BookingStatus.cancelled) {
       throw new NotFoundException('Booking link is invalid or expired');
     }
-    // A link for a game that already happened can't take new joiners.
-    if (
-      booking.date < startOfToday() ||
-      (isSameDay(booking.date, startOfToday()) &&
-        booking.endMinutes <= minutesSinceMidnight())
-    ) {
+    // A link for a game that already happened can't take new joiners —
+    // end instant, so an overnight game still accepts joiners after
+    // midnight while it is being played.
+    if (this.slotEnded(booking)) {
       throw new BadRequestException('This game has already taken place');
     }
     // One join per phone number — stops accidental (or spammed) duplicates.
@@ -718,12 +776,29 @@ export class BookingsService {
         }
       }
       if (skipReason) {
-        await this.prisma.booking.update({ where: { id: b.id }, data: { status: BookingStatus.cancelled } });
+        // Claim with the read status: a concurrent single-accept or
+        // cancel that already decided this occurrence wins, and its
+        // side effects are that path's job — not a double refund here.
+        const claimed = await this.prisma.booking.updateMany({
+          where: { id: b.id, status: BookingStatus.pending },
+          data: { status: BookingStatus.cancelled },
+        });
+        if (claimed.count === 0) {
+          skipped.push({ id: b.id, reason: 'Already decided' });
+          continue;
+        }
         await this.releasePromo(b.id);
         skipped.push({ id: b.id, reason: skipReason });
         continue;
       }
-      await this.prisma.booking.update({ where: { id: b.id }, data: { status: BookingStatus.confirmed } });
+      const claimed = await this.prisma.booking.updateMany({
+        where: { id: b.id, status: BookingStatus.pending },
+        data: { status: BookingStatus.confirmed },
+      });
+      if (claimed.count === 0) {
+        skipped.push({ id: b.id, reason: 'Already decided' });
+        continue;
+      }
       accepted.push(b.id);
       if (b.userId) {
         await this.notifications.notifyPlayerDecision(b.userId, true, b.venue.name, this.fmtWhen(b)).catch(() => {});
@@ -774,18 +849,21 @@ export class BookingsService {
     // Scan responses used to return bare booking details, leaving the
     // panel to guess whether check-in would succeed. The flag mirrors
     // checkIn's own rules exactly: confirmed, not already checked in,
-    // game day, inside [start − 30min, end], and on an active court.
+    // inside [start − 30min, end] as instants, and on an active court.
     // Non-confirmed codes are always false — a pending/cancelled
-    // booking is never check-in-able, whatever the clock says.
+    // booking is never check-in-able, whatever the clock says. The
+    // window is instant-based, not play-date-based, so an overnight
+    // booking stays check-in-able after midnight.
     const now = new Date();
-    const nowMin = minutesSinceMidnight(now);
+    const openAt = this.slotStartAt(booking);
+    openAt.setMinutes(openAt.getMinutes() - 30);
+    const endAt = this.slotEndAt(booking);
     const canCheckIn =
       booking.status === BookingStatus.confirmed &&
       !booking.checkedInAt &&
       booking.court.isActive &&
-      isSameDay(booking.date, now) &&
-      nowMin >= booking.startMinutes - 30 &&
-      nowMin <= booking.endMinutes;
+      now >= openAt &&
+      now <= endAt;
     return { ...booking, canCheckIn };
   }
 
@@ -808,17 +886,19 @@ export class BookingsService {
     if (booking.status !== BookingStatus.confirmed) {
       throw new BadRequestException('Only confirmed bookings can be checked in');
     }
-    // Check-in window: game day only, from 30 minutes before the slot
-    // until the slot ends. Anything else is almost certainly a wrong scan.
-    const today = startOfToday();
-    if (!isSameDay(booking.date, today)) {
-      throw new BadRequestException('Check-in is only available on the day of the booking');
-    }
-    const nowMin = minutesSinceMidnight();
-    if (nowMin < booking.startMinutes - 30) {
+    // Check-in window: from 30 minutes before the slot until the slot
+    // ends, as instants — not "game day". An overnight booking's end
+    // lives on the next calendar day, so a play-date check would refuse
+    // a player arriving after midnight and then strike them no-show.
+    // Anything outside the window is almost certainly a wrong scan.
+    const now = new Date();
+    const openAt = this.slotStartAt(booking);
+    openAt.setMinutes(openAt.getMinutes() - 30);
+    const endAt = this.slotEndAt(booking);
+    if (now < openAt) {
       throw new BadRequestException('Check-in opens 30 minutes before the slot');
     }
-    if (nowMin > booking.endMinutes) {
+    if (now > endAt) {
       throw new BadRequestException('This slot has already ended');
     }
     return this.prisma.booking.update({
@@ -841,18 +921,19 @@ export class BookingsService {
     if (booking.checkedInAt) {
       throw new BadRequestException('A checked-in booking cannot be marked as no-show');
     }
-    // A no-show can only be recorded once the slot has actually ended.
-    const today = startOfToday();
-    const ended =
-      booking.date < today ||
-      (isSameDay(booking.date, today) && booking.endMinutes <= minutesSinceMidnight());
-    if (!ended) {
+    // A no-show can only be recorded once the slot has actually ended —
+    // end instant, not play date, so an overnight game is never struck
+    // mid-game after midnight.
+    if (!this.slotEnded(booking)) {
       throw new BadRequestException('A booking can only be marked no-show after its slot ends');
     }
-    // Atomic claim: the status condition inside the UPDATE means two
-    // staff members marking at once can't both pass — one strike total.
+    // Atomic claim: the status AND checkedInAt conditions inside the
+    // UPDATE mean two staff members marking at once can't both pass —
+    // one strike total — and a check-in landing between the read and
+    // this write wins instead of striking a player who showed up
+    // (mirrors the dispute confirm_no_show claim).
     const claimed = await this.prisma.booking.updateMany({
-      where: { id: bookingId, status: BookingStatus.confirmed },
+      where: { id: bookingId, status: BookingStatus.confirmed, checkedInAt: null },
       data: { status: BookingStatus.no_show },
     });
     if (claimed.count === 0) {
@@ -915,8 +996,8 @@ export class BookingsService {
   }
 
   /** Refund a booking's promo (uses are given back on cancel/expiry). */
-  async releasePromo(bookingId: string) {
-    await this.promos.refundBookingPromo(bookingId);
+  async releasePromo(bookingId: string, tx?: Prisma.TransactionClient) {
+    await this.promos.refundBookingPromo(bookingId, tx);
   }
 
   /**
@@ -930,7 +1011,7 @@ export class BookingsService {
   async cancelVenueUpcomingBookings(venueId: string, reason: string) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
-      select: { name: true },
+      select: { name: true, status: true },
     });
     const candidates = await this.prisma.booking.findMany({
       where: {
@@ -949,11 +1030,28 @@ export class BookingsService {
       },
     });
     const upcoming = candidates.filter((b) => !this.slotLive(b));
+    // The snapshot above can go stale mid-loop: an unsuspend landing
+    // while a suspension cascade is still cancelling would otherwise
+    // keep cancelling a live venue's weekend. Re-read the venue status
+    // before each booking and stop the moment it changed — a human
+    // just decided something about this venue, and the cascade must
+    // not overrule them.
+    const statusAtStart = venue?.status;
+    let cancelled = 0;
     for (const b of upcoming) {
-      await this.prisma.booking.update({
-        where: { id: b.id },
+      if (statusAtStart !== undefined) {
+        const current = await this.prisma.venue.findUnique({
+          where: { id: venueId },
+          select: { status: true },
+        });
+        if (!current || current.status !== statusAtStart) break;
+      }
+      const claimed = await this.prisma.booking.updateMany({
+        where: { id: b.id, status: { in: [BookingStatus.pending, BookingStatus.confirmed] } },
         data: { status: BookingStatus.cancelled },
       });
+      if (claimed.count === 0) continue;
+      cancelled++;
       await this.rejectPendingReschedules(b.id);
       await this.cleanupGamePost(b.id, 'The arena cancelled the booking, so this game is off.');
       await this.notifyWaitlist(b);
@@ -968,7 +1066,7 @@ export class BookingsService {
           .catch(() => {});
       }
     }
-    return upcoming.length;
+    return cancelled;
   }
 
   /**
@@ -1186,6 +1284,25 @@ export class BookingsService {
     const endMin = b.endMinutes % 1440;
     const today = startOfToday();
     return endDay < today || (isSameDay(endDay, today) && endMin <= minutesSinceMidnight(now));
+  }
+
+  /**
+   * Slot start/end as instants. Built from local midnight of the play day
+   * — not from the stored Date, which is UTC midnight (05:00 PKT) and
+   * would shift every instant by five hours — and setMinutes rolls
+   * values past 1440 (or below 0) across midnight, so overnight slots
+   * get their true end instant on the next calendar day.
+   */
+  slotStartAt(b: { date: Date; startMinutes: number }): Date {
+    const d = new Date(b.date.getFullYear(), b.date.getMonth(), b.date.getDate());
+    d.setMinutes(b.startMinutes);
+    return d;
+  }
+
+  slotEndAt(b: { date: Date; endMinutes: number }): Date {
+    const d = new Date(b.date.getFullYear(), b.date.getMonth(), b.date.getDate());
+    d.setMinutes(b.endMinutes);
+    return d;
   }
 
   private async getPending(bookingId: string) {

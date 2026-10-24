@@ -122,18 +122,42 @@ export class PromosService {
    * back. Called on every cancel/expiry path, so a cancelled booking
    * never permanently burns a single-use code.
    */
-  async refundBookingPromo(bookingId: string) {
-    const redemptions = await this.prisma.promoRedemption.findMany({
+  /**
+   * Refund a booking's promo. Pass the caller's transaction client to
+   * run the cleanup inside that transaction (court delete refunds
+   * doomed bookings' promos in the same transaction that deletes them,
+   * so a failed delete never leaves refunded promos on surviving
+   * bookings); otherwise it opens its own transaction.
+   */
+  async refundBookingPromo(bookingId: string, tx?: Prisma.TransactionClient) {
+    if (tx) return this.refundBookingPromoInTx(tx, bookingId);
+    return this.prisma.$transaction((t) => this.refundBookingPromoInTx(t, bookingId));
+  }
+
+  private async refundBookingPromoInTx(tx: Prisma.TransactionClient, bookingId: string) {
+    // Delete + decrement, decrementing only by the rows actually
+    // deleted: two concurrent releases of the same booking used to
+    // both read the row before either deleted, so one redemption
+    // decremented usedCount twice and granted a phantom use past
+    // maxUses. The promo row lock (same one applyPromo uses) serializes
+    // concurrent releases of one booking: the loser waits, then finds
+    // nothing left to refund.
+    const promos = await tx.promoRedemption.findMany({
       where: { bookingId },
       select: { promoCodeId: true },
+      distinct: ['promoCodeId'],
     });
-    if (redemptions.length === 0) return;
-    await this.prisma.promoRedemption.deleteMany({ where: { bookingId } });
-    for (const r of redemptions) {
-      await this.prisma.promoCode.updateMany({
-        where: { id: r.promoCodeId, usedCount: { gt: 0 } },
-        data: { usedCount: { decrement: 1 } },
+    // Deterministic lock order, so two refunds touching several
+    // promos can never deadlock each other.
+    promos.sort((a, b) => a.promoCodeId.localeCompare(b.promoCodeId));
+    for (const { promoCodeId } of promos) {
+      await tx.$queryRaw`SELECT id FROM "PromoCode" WHERE id = ${promoCodeId} FOR UPDATE`;
+      const deleted = await tx.promoRedemption.deleteMany({
+        where: { bookingId, promoCodeId },
       });
+      if (deleted.count > 0) {
+        await tx.$executeRaw`UPDATE "PromoCode" SET "usedCount" = GREATEST("usedCount" - ${deleted.count}, 0) WHERE "id" = ${promoCodeId}`;
+      }
     }
   }
 

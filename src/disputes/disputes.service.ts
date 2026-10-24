@@ -167,8 +167,12 @@ export class DisputesService {
           strikeUserId = struck.id;
         }
       }
-      const updated = await tx.dispute.update({
-        where: { id },
+      // Claim the resolution: two admins resolving at once must not
+      // both run their cascades — the loser gets 'already resolved'
+      // and the whole transaction (including the booking claim and
+      // strike above) rolls back.
+      const claimed = await tx.dispute.updateMany({
+        where: { id, status: 'open' },
         data: {
           status: action === 'dismiss' ? 'dismissed' : 'resolved',
           resolution: resolution.trim(),
@@ -177,6 +181,10 @@ export class DisputesService {
           openKey: null,
         },
       });
+      if (claimed.count === 0) {
+        throw new BadRequestException('Dispute is already resolved');
+      }
+      const updated = await tx.dispute.findUniqueOrThrow({ where: { id } });
       await tx.auditLog.create({
         data: {
           actorId: resolvedById,

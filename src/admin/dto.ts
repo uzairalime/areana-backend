@@ -219,7 +219,7 @@ export class AdminCreateCourtDto {
   @ApiProperty({ example: 2500 }) @IsNumber() @Min(0) pricePerHour: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() openMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() closeMinutes?: number;
-  @ApiPropertyOptional() @IsOptional() @IsInt() slotMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(15) slotMinutes?: number;
 }
 
 export class AdminUpdateCourtDto {
@@ -231,7 +231,7 @@ export class AdminUpdateCourtDto {
   @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) pricePerHour?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() openMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() closeMinutes?: number;
-  @ApiPropertyOptional() @IsOptional() @IsInt() slotMinutes?: number;
+  @ApiPropertyOptional() @IsOptional() @IsInt() @Min(15) slotMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() isActive?: boolean;
 }
 
