@@ -2,6 +2,9 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { BookingStatus, Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { addMonths, startOfToday } from '../common/date.util';
+import { offsetPageFromDb, pageLimit } from '../common/pagination';
+import { haversineKm, roundKm } from '../common/distance';
+import { QueryCourtsDto } from './dto';
 
 export interface DayWindow {
   startMinutes: number;
@@ -462,6 +465,164 @@ export class CourtsService {
       where: { venueId, isActive: true, status: 'approved' },
       orderBy: { pricePerHour: 'asc' },
     });
+  }
+
+  /**
+   * Public courts discovery (browse Courts tab). Same visibility rules as
+   * the venues list: the court is active + approved, its venue is
+   * approved / not archived / not billing-paused / moderation 'none' /
+   * owner active, and the venue is not live-overdue (same nightly-sweep
+   * gap as venues — the materialized flag alone would leak overdue
+   * venues until 00:30).
+   */
+  async list(query: QueryCourtsDto) {
+    const { q, city, sport, surface, sort, lat, lng } = query;
+    if (sort !== undefined && !['price_asc', 'price_desc', 'distance', 'name'].includes(sort)) {
+      throw new BadRequestException(
+        `Unknown sort: ${sort} — expected price_asc, price_desc, distance, or name`,
+      );
+    }
+    if ((lat === undefined) !== (lng === undefined)) {
+      throw new BadRequestException('lat and lng must be provided together');
+    }
+    const distanceSort = sort === 'distance';
+    if (distanceSort && (lat === undefined || lng === undefined)) {
+      throw new BadRequestException('Distance sort needs lat and lng');
+    }
+    const page = query.page ?? 1;
+    const limit = pageLimit(query.limit, 20);
+
+    const venueFilter: Prisma.VenueWhereInput = { ...this.venuePredicate() };
+    if (city) venueFilter.city = { equals: city, mode: 'insensitive' };
+    const where: Prisma.CourtWhereInput = {
+      isActive: true,
+      status: 'approved',
+      venue: venueFilter,
+    };
+    if (sport) where.sport = { equals: sport, mode: 'insensitive' };
+    if (surface) where.surface = { equals: surface, mode: 'insensitive' };
+    if (q) {
+      where.OR = [
+        { name: { contains: q, mode: 'insensitive' } },
+        { venue: { name: { contains: q, mode: 'insensitive' } } },
+      ];
+    }
+
+    // Live-overdue filter, mirroring the venues list: candidates first,
+    // then drop venues whose COMPUTED billing status is overdue.
+    const candidates = await this.prisma.court.findMany({
+      where,
+      select: {
+        venueId: true,
+        venue: {
+          select: {
+            billingStartAt: true,
+            billingPaidUntil: true,
+            freeUntilOverride: true,
+            billingPeriodStart: true,
+            billingPeriodEnd: true,
+            billingPeriodPrice: true,
+            planId: true,
+          },
+        },
+      },
+    });
+    const liveVenueIds = new Set<string>();
+    const seenVenues = new Set<string>();
+    for (const c of candidates) {
+      if (seenVenues.has(c.venueId)) continue;
+      seenVenues.add(c.venueId);
+      if (!(await this.isBillingOverdue(c.venue))) liveVenueIds.add(c.venueId);
+    }
+    where.venueId = { in: [...liveVenueIds] };
+
+    const venueSelect = {
+      id: true,
+      name: true,
+      city: true,
+      address: true,
+      lat: true,
+      lng: true,
+      rating: true,
+      ratingCount: true,
+      images: true,
+      photos: true,
+    } as const;
+    const findArgs: Prisma.CourtFindManyArgs = {
+      where,
+      include: { venue: { select: venueSelect } },
+      orderBy:
+        sort === 'price_desc'
+          ? { pricePerHour: 'desc' }
+          : sort === 'name'
+            ? { name: 'asc' }
+            : { pricePerHour: 'asc' },
+      ...(distanceSort
+        ? { take: 500 }
+        : { skip: (page - 1) * limit, take: limit }),
+    };
+    const [total, data] = await Promise.all([
+      this.prisma.court.count({ where }),
+      this.prisma.court.findMany(findArgs),
+    ]);
+    const shaped = data.map((c: any) => {
+      const d =
+        lat !== undefined && lng !== undefined
+          ? haversineKm(lat, lng, c.venue?.lat, c.venue?.lng)
+          : null;
+      return {
+        ...c,
+        pricePerHour: Number(c.pricePerHour),
+        venue: c.venue,
+        distanceKm: d === null ? null : roundKm(d),
+      };
+    });
+    if (distanceSort) {
+      // Pure nearest-first; courts whose venue has no coordinates last.
+      shaped.sort(
+        (a: any, b: any) =>
+          (a.distanceKm ?? Number.MAX_SAFE_INTEGER) -
+          (b.distanceKm ?? Number.MAX_SAFE_INTEGER),
+      );
+      return offsetPageFromDb(
+        shaped.slice((page - 1) * limit, page * limit),
+        total,
+        page,
+        limit,
+      );
+    }
+    return offsetPageFromDb(shaped, total, page, limit);
+  }
+
+  /**
+   * Public court detail (court page). Reuses getActiveCourt so an
+   * invisible court (pending, inactive, overdue/suspended venue) 404s
+   * exactly like a booking attempt would — no separate visibility logic
+   * to drift. The venue payload is picked field-by-field: billing and
+   * plan internals never leave the server.
+   */
+  async getOne(courtId: string) {
+    const court = await this.getActiveCourt(courtId);
+    const v: any = court.venue;
+    return {
+      ...court,
+      pricePerHour: Number(court.pricePerHour),
+      venue: {
+        id: v.id,
+        name: v.name,
+        city: v.city,
+        address: v.address,
+        lat: v.lat,
+        lng: v.lng,
+        rating: v.rating,
+        ratingCount: v.ratingCount,
+        images: v.images,
+        photos: v.photos,
+        amenities: v.amenities,
+        maxAdvanceDays: v.maxAdvanceDays,
+        minAdvanceMinutes: v.minAdvanceMinutes,
+      },
+    };
   }
 
   async getActiveCourt(courtId: string) {
