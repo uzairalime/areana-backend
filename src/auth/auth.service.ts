@@ -76,16 +76,27 @@ export class AuthService {
       }
     }
 
-    // Invalidate older unconsumed codes for this email first: verify
-    // always tests the NEWEST code but increments ITS attempt counter
-    // on every wrong guess, so typing an old code five times used to
-    // lock the current code the user never mistyped. With only one
-    // live code at a time, the attempt budget means what the UI implies.
+    // Round 4, P-B2: the old order was invalidate predecessors, then
+    // create, then send (bare, unguarded). A failed send — the default
+    // behaviour when prod SMTP is forgotten, since the config defaulted
+    // to localhost:1025 — destroyed the previous working code AND
+    // burned the hourly cap (the failed row still counted), leaving
+    // the player locked out for up to an hour through no fault of
+    // their own. New order: SEND FIRST, persist only on success. A
+    // failed send persists nothing, so the previous code stays live
+    // and the hourly count (which counts stored rows) is untouched.
+    // The single-live-code invariant is preserved by invalidating
+    // predecessors immediately after a successful send, before the new
+    // row is created: verify always tests the NEWEST code but
+    // increments ITS attempt counter on every wrong guess, so typing
+    // an old code five times used to lock the current code the user
+    // never mistyped.
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    await this.mail.sendOtp(email, code);
     await this.prisma.otpCode.updateMany({
       where: { email, consumedAt: null },
       data: { consumedAt: new Date() },
     });
-    const code = String(Math.floor(100000 + Math.random() * 900000));
     await this.prisma.otpCode.create({
       data: {
         email,
@@ -94,7 +105,6 @@ export class AuthService {
         ip: ip ?? undefined,
       },
     });
-    await this.mail.sendOtp(email, code);
     return { message: 'Login code sent to your email' };
   }
 
@@ -233,10 +243,16 @@ export class AuthService {
       data: { passwordHash: await bcrypt.hash(dto.newPassword, 10) },
     });
     await this.prisma.refreshSession.deleteMany({ where: { userId } });
+    // Round 4, P-S9: password change promises "log the account out
+    // everywhere" — device tokens are a push channel, not a session,
+    // so they used to survive and keep delivering booking notices to
+    // a device whose credentials were just rotated. Revoke them with
+    // the sessions.
+    await this.prisma.deviceToken.deleteMany({ where: { userId } });
     return { message: 'Password changed — please sign in again' };
   }
 
-  async logout(refreshToken: string) {
+  async logout(refreshToken: string, deviceToken?: string) {
     try {
       const payload = await this.jwt.verifyAsync<{ sub: string; sid?: string }>(
         refreshToken,
@@ -246,6 +262,14 @@ export class AuthService {
         await this.prisma.refreshSession.updateMany({
           where: { id: payload.sid, revokedAt: null },
           data: { revokedAt: new Date() },
+        });
+      }
+      // Round 4, P-S9: sign-out on a device also revokes that
+      // device's push token (when the client passes it), so a
+      // shared/sold device stops receiving booking notices.
+      if (deviceToken) {
+        await this.prisma.deviceToken.deleteMany({
+          where: { token: deviceToken, userId: payload.sub },
         });
       }
     } catch {

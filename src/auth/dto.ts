@@ -46,6 +46,17 @@ export class RefreshDto {
   refreshToken: string;
 }
 
+export class LogoutDto extends RefreshDto {
+  // Round 4, P-S9: the client passes its own push token so sign-out
+  // also kills the push channel on that device (a shared/sold device
+  // kept receiving booking notices after sign-out). Optional — old
+  // clients that omit it keep the previous session-only behaviour.
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  deviceToken?: string;
+}
+
 export class OwnerRegisterDto {
   @ApiProperty({ example: 'owner@arena.pk' })
   @IsEmail()

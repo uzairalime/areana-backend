@@ -15,7 +15,12 @@
  *
  * Demo owners sign in with password "Demo@1234". Dates are computed
  * relative to today, so the statuses hold whenever the script runs.
- * Running it twice is safe: it exits early if the demo data exists.
+ * Running it twice is safe: every section is idempotent on its own
+ * (scenario arenas are keyed by owner email + venue name, so a partial
+ * run is repaired by re-running — Round 4, M-S4 used to gate the whole
+ * core block on ANY @demo.areana.pk user, so one stray demo-domain
+ * signup silently skipped all 7 arenas while the script printed
+ * success).
  */
 import { BookingStatus, PrismaClient, VenueStatus } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
@@ -31,6 +36,34 @@ function monthsFromNow(months: number): Date {
   const d = new Date();
   d.setMonth(d.getMonth() + months);
   return d;
+}
+// Clamped month arithmetic (mirrors src/common/date.util addMonths):
+// setMonth alone rolls Jan 31 + 1mo to Mar 3; clamping to the target
+// month's last day keeps billing periods exactly 12 months long.
+function addMonths(d: Date, months: number): Date {
+  const day = d.getDate();
+  const out = new Date(d);
+  out.setDate(1);
+  out.setMonth(out.getMonth() + months);
+  const last = new Date(out.getFullYear(), out.getMonth() + 1, 0).getDate();
+  out.setDate(Math.min(day, last));
+  return out;
+}
+
+// Round 4, M-S5: demo venues used to be approved with ZERO photos, so
+// the first later edit dropped them to pending and re-approval was
+// blocked by the readiness gate (4+ photos, one tagged per sport).
+// Seeded venues now carry 4 placeholder photos tagged per sport, so
+// they satisfy the gate they bypassed at creation.
+function demoPhotos(seed: string, sports: string[]): { images: string[]; photos: { url: string; sport: string }[] } {
+  const images = [1, 2, 3, 4].map(
+    (k) => `https://picsum.photos/seed/areana-demo-${seed}-${k}/800/600`,
+  );
+  const photos = images.map((url, i) => ({
+    url,
+    sport: sports[i % sports.length],
+  }));
+  return { images, photos };
 }
 
 const COURTS = [
@@ -59,15 +92,12 @@ const COURTS = [
 ];
 
 async function main() {
-  const marker = await prisma.user.findFirst({
-    where: { email: { endsWith: '@demo.areana.pk' } },
-  });
-  const hasCore = !!marker;
-  if (hasCore) {
-    console.log('Core demo data already exists — skipping the scenario arenas.');
-  }
-
-  const ownerRole = await prisma.role.findFirst({ where: { name: 'owner' } });
+  // Round 4, M-S7: role lookups are owner-scoped now — the old
+  // unscoped findFirst({ name: 'owner' }) could attach another
+  // owner's custom role to demo users, and findMany({ scope: 'arena' })
+  // attached EVERY arena-scope role (including owner-created custom
+  // roles) to demo venues via VenueAllowedRole.
+  const ownerRole = await prisma.role.findFirst({ where: { name: 'owner', ownerId: null } });
   if (!ownerRole) throw new Error('Owner role missing — run `npm run db:seed` first.');
   const plans = await prisma.plan.findMany({ where: { isCustom: false } });
   const basic = plans.find((p) => p.name === 'Basic');
@@ -76,9 +106,13 @@ async function main() {
   if (!basic || !normal || !premium) {
     throw new Error('Launch plans missing — run `npm run db:seed` first.');
   }
-  const arenaRoles = await prisma.role.findMany({ where: { scope: 'arena' } });
+  const arenaRoles = await prisma.role.findMany({ where: { scope: 'arena', ownerId: null } });
 
-  if (!hasCore) {
+  // Round 4, M-S8: the Founding plan used to live inside the core
+  // block, so deleting the demo venues (plan-delete guard permits it
+  // once the venue count is 0) while any demo-domain user remained
+  // meant the plan was never recreated on re-run. It is guarded by
+  // its own name lookup now, independent of the core block.
   let founding = await prisma.plan.findFirst({
     where: { name: 'Founding Partner (Demo)', isCustom: true },
   });
@@ -163,36 +197,58 @@ async function main() {
     },
   ];
 
+  // Round 4, M-S4: each scenario is idempotent on its own (owner
+  // email + venue name), so a partial run is repaired by re-running
+  // instead of silently skipping everything behind a domain marker.
   for (let i = 0; i < scenarios.length; i++) {
     const s = scenarios[i];
-    const owner = await prisma.user.create({
-      data: {
-        email: `demo.owner${i + 1}@demo.areana.pk`,
-        name: `Demo Owner ${i + 1}`,
-        phone: `+92 300 000000${i + 1}`,
-        passwordHash,
-        roleId: ownerRole.id,
-        status: 'active',
-      },
+    const ownerEmail = `demo.owner${i + 1}@demo.areana.pk`;
+    let owner = await prisma.user.findUnique({ where: { email: ownerEmail } });
+    if (!owner) {
+      owner = await prisma.user.create({
+        data: {
+          email: ownerEmail,
+          name: `Demo Owner ${i + 1}`,
+          phone: `+92 300 000000${i + 1}`,
+          passwordHash,
+          roleId: ownerRole.id,
+          status: 'active',
+        },
+      });
+    }
+    const gallery = demoPhotos(`arena${i + 1}`, ['Football', 'Padel']);
+    let venue = await prisma.venue.findFirst({
+      where: { ownerId: owner.id, name: s.venueName },
     });
-    const venue = await prisma.venue.create({
-      data: {
-        ownerId: owner.id,
-        name: s.venueName,
-        address: `${i + 1} Demo Street, DHA Phase 5`,
-        city: 'Lahore',
-        phone: '+92 42 35770000',
-        lat: 31.4697 + i * 0.01,
-        lng: 74.3723 + i * 0.01,
-        sports: ['Football', 'Padel'],
-        amenities: ['Floodlights', 'Parking', 'Cafe', 'Changing rooms'],
-        status: s.status,
-        planId: s.planId,
-        billingStartAt: s.billingStartAt,
-        billingPaidUntil: s.billingPaidUntil,
-        billingPaused: s.billingPaused ?? false,
-      },
-    });
+    if (!venue) {
+      venue = await prisma.venue.create({
+        data: {
+          ownerId: owner.id,
+          name: s.venueName,
+          address: `${i + 1} Demo Street, DHA Phase 5`,
+          city: 'Lahore',
+          phone: '+92 42 35770000',
+          lat: 31.4697 + i * 0.01,
+          lng: 74.3723 + i * 0.01,
+          sports: ['Football', 'Padel'],
+          amenities: ['Floodlights', 'Parking', 'Cafe', 'Changing rooms'],
+          images: gallery.images,
+          photos: gallery.photos,
+          status: s.status,
+          planId: s.planId,
+          billingStartAt: s.billingStartAt,
+          billingPaidUntil: s.billingPaidUntil,
+          billingPaused: s.billingPaused ?? false,
+        },
+      });
+    } else if (!venue.images || venue.images.length === 0) {
+      // Backfill the gallery for arenas seeded before photos existed,
+      // so they satisfy the readiness gate on their next edit.
+      await prisma.venue.update({
+        where: { id: venue.id },
+        data: { images: gallery.images, photos: gallery.photos },
+      });
+    }
     if (arenaRoles.length > 0) {
       await prisma.venueAllowedRole.createMany({
         data: arenaRoles.map((r) => ({ venueId: venue.id, roleId: r.id })),
@@ -200,11 +256,38 @@ async function main() {
       });
     }
     for (const c of COURTS) {
-      await prisma.court.create({ data: { venueId: venue.id, ...c } });
+      const exists = await prisma.court.findFirst({
+        where: { venueId: venue.id, name: c.name },
+      });
+      if (!exists) await prisma.court.create({ data: { venueId: venue.id, ...c } });
     }
-    console.log(`✓ ${s.label}: ${s.venueName} (owner login demo.owner${i + 1}@demo.areana.pk)`);
-  }
-
+    // Round 4, M-S6: the Active arena used to claim a paid period
+    // (billingPaidUntil) with ZERO ledger rows, so mark-paid could
+    // double-settle or skip a period. The claimed period now gets
+    // its matching VenuePayment row — derived from the venue's stored
+    // billingPaidUntil (not recomputed dates), so re-runs agree with
+    // the original run instead of drifting by setMonth clamping.
+    if (s.venueName === 'Demo Active Arena' && venue.billingPaidUntil && venue.planId) {
+      const periodEnd = venue.billingPaidUntil;
+      const existingPayment = await prisma.venuePayment.findFirst({
+        where: { venueId: venue.id, periodEnd },
+      });
+      if (!existingPayment) {
+        await prisma.venuePayment.create({
+          data: {
+            venueId: venue.id,
+            planId: venue.planId,
+            amount: premium.priceYearly,
+            method: 'other',
+            note: 'Demo seed — matches seeded billingPaidUntil',
+            periodStart: addMonths(periodEnd, -12),
+            periodEnd,
+            recordedById: null,
+          },
+        });
+      }
+    }
+    console.log(`✓ ${s.label}: ${s.venueName} (owner login ${ownerEmail})`);
   }
 
   // ------------------------------------------------------------------
@@ -301,7 +384,9 @@ async function main() {
     },
   ];
   for (const sub of courtSubmissions) {
-    const venue = await prisma.venue.findFirst({ where: { name: sub.venueName } });
+    const venue = await prisma.venue.findFirst({
+      where: { name: sub.venueName, owner: { email: { endsWith: '@demo.areana.pk' } } },
+    });
     if (!venue) continue;
     const exists = await prisma.court.findFirst({
       where: { venueId: venue.id, name: sub.court.name },
@@ -328,6 +413,7 @@ async function main() {
         status: 'active',
       },
     });
+    const coastalGallery = demoPhotos('coastal', ['Football', 'Cricket']);
     const venue8 = await prisma.venue.create({
       data: {
         ownerId: owner8.id,
@@ -339,6 +425,8 @@ async function main() {
         lng: 67.0299,
         sports: ['Football', 'Cricket'],
         amenities: ['Floodlights', 'Parking', 'Showers', 'Washrooms'],
+        images: coastalGallery.images,
+        photos: coastalGallery.photos,
         status: VenueStatus.pending,
         planId: null,
       },
@@ -480,7 +568,9 @@ async function main() {
       const checkInCode = `DEMO-DISP-${i + 1}`;
       const existing = await prisma.booking.findUnique({ where: { checkInCode } });
       if (existing) continue;
-      const venue = await prisma.venue.findFirst({ where: { name: spec.venueName } });
+      const venue = await prisma.venue.findFirst({
+        where: { name: spec.venueName, owner: { email: { endsWith: '@demo.areana.pk' } } },
+      });
       const court = venue
         ? await prisma.court.findFirst({ where: { venueId: venue.id }, orderBy: { name: 'asc' } })
         : null;
@@ -532,8 +622,9 @@ async function main() {
   // Suggestions inbox demo — venue suggestions (arena leads) in every
   // state, so Admin → Suggestions shows real cards, working status
   // counts and the status-change actions. Idempotent on its own:
-  // suggestions are keyed by their (unique demo) venue name and an
-  // existing one is skipped. Suggested-by points at the demo players
+  // suggestions are keyed by name + exact note (Round 4 trivial: a
+  // bare-name key let a real lead sharing a demo name silently skip
+  // the demo suggestion). Suggested-by points at the demo players
   // from the disputes section, with two anonymous entries to show the
   // "Anonymous" rendering.
   // ------------------------------------------------------------------
@@ -609,7 +700,7 @@ async function main() {
   ];
   for (const spec of suggestionSpecs) {
     const exists = await prisma.venueSuggestion.findFirst({
-      where: { name: spec.name },
+      where: { name: spec.name, note: spec.note },
     });
     if (exists) continue;
     const suggester = spec.byPlayer

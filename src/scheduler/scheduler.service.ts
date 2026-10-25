@@ -30,6 +30,14 @@ export class SchedulerService implements OnModuleInit {
    * Startup catch-up (best-effort, never blocks boot): a restart
    * during the night must not skip a billing pause, and a restart
    * inside a booking's reminder window must not drop its reminder.
+   * Round 4, P-S5 adds the nightly itself: a missed 02:00 tick used
+   * to slip strikes, completions, rewards and badges a full day (the
+   * next night's date-based queries self-heal, but a Monday no-show
+   * was struck Tuesday). If the last nightly run is older than a day
+   * — or never recorded — the nightly runs once at startup. A restart
+   * hours after a successful 02:00 run does NOT re-run it (the
+   * watermark is fresh), and the nightly's own single-flight flag
+   * still guards a restart landing exactly on the tick.
    */
   async onModuleInit() {
     await this.billingSweep().catch((e) =>
@@ -38,6 +46,19 @@ export class SchedulerService implements OnModuleInit {
     await this.sendReminders().catch((e) =>
       this.logger.warn(`Startup reminders failed: ${(e as Error).message}`),
     );
+    await this.catchUpNightlyIfMissed().catch((e) =>
+      this.logger.warn(`Startup nightly catch-up failed: ${(e as Error).message}`),
+    );
+  }
+
+  private async catchUpNightlyIfMissed() {
+    const row = await this.prisma.setting.findUnique({ where: { key: 'nightlyLastRun' } });
+    const last = row?.value ? new Date(row.value).getTime() : 0;
+    if (Date.now() - last <= 24 * 3600_000) return;
+    this.logger.log(
+      `Nightly last ran ${row?.value ?? 'never'} — running missed nightly at startup`,
+    );
+    await this.nightly();
   }
 
   // In-process record of reminders this instance already sent (booking
@@ -404,14 +425,30 @@ export class SchedulerService implements OnModuleInit {
    * Nightly housekeeping: auth tables grow on every login/refresh/OTP —
    * drop expired sessions, week-old revocations and day-old OTP rows.
    */
+  // Round 4, P-S4: the billing sweep had no single-flight guard —
+  // unlike the nightly — so a restart near 00:30 ran it twice, and
+  // the due-reminder (check-then-write) pushed duplicates. Same flag
+  // shape as nightly; the reminder claim itself moved into
+  // sweepBilling (claim-before-push on billingDueNotifiedFor).
+  private billingSweepRunning = false;
+
   /** Venue plan billing: pause overdue venues, remind on due dates. */
   @Cron('30 0 * * *', PKT)
   async billingSweep() {
-    const result = await this.plans.sweepBilling();
-    if (result.paused > 0 || result.resumed > 0) {
-      this.logger.log(
-        `Billing sweep: ${result.checked} venues, ${result.paused} paused, ${result.resumed} resumed`,
-      );
+    if (this.billingSweepRunning) {
+      this.logger.log('Billing sweep already running — skipping overlapping run');
+      return;
+    }
+    this.billingSweepRunning = true;
+    try {
+      const result = await this.plans.sweepBilling();
+      if (result.paused > 0 || result.resumed > 0) {
+        this.logger.log(
+          `Billing sweep: ${result.checked} venues, ${result.paused} paused, ${result.resumed} resumed`,
+        );
+      }
+    } finally {
+      this.billingSweepRunning = false;
     }
   }
 
@@ -545,5 +582,14 @@ export class SchedulerService implements OnModuleInit {
         });
       }
     }
+    // Watermark for the startup catch-up (P-S5): a successful nightly
+    // stamps its completion time, so a later restart knows the tick
+    // already ran. Written last — a crashed nightly leaves the old
+    // watermark and is caught up on the next boot.
+    await this.prisma.setting.upsert({
+      where: { key: 'nightlyLastRun' },
+      update: { value: new Date().toISOString() },
+      create: { key: 'nightlyLastRun', value: new Date().toISOString() },
+    });
   }
 }

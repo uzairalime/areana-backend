@@ -234,4 +234,33 @@ export class UsersController {
       create: { token: dto.token, userId: user.id, platform: dto.platform },
     });
   }
+
+  // Round 4, P-S9: device tokens used to survive sign-out AND password
+  // change — the push channel outlived the credential rotation meant
+  // to kill it, so a changed password ("log me out everywhere") still
+  // left the old device receiving booking notices (venue, time,
+  // amounts). Per-device sign-out: list + revoke one token; sign out
+  // everywhere for push: revoke all. Logout and password change also
+  // revoke (see auth.service) — these endpoints are the manual path.
+  @Get('me/device-tokens')
+  async listDeviceTokens(@CurrentUser() user: AuthUser) {
+    return this.prisma.deviceToken.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  @Delete('me/device-tokens/:id')
+  async revokeDeviceToken(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    const res = await this.prisma.deviceToken.deleteMany({
+      where: { id, userId: user.id },
+    });
+    return { revoked: res.count };
+  }
+
+  @Delete('me/device-tokens')
+  async revokeAllDeviceTokens(@CurrentUser() user: AuthUser) {
+    const res = await this.prisma.deviceToken.deleteMany({ where: { userId: user.id } });
+    return { revoked: res.count };
+  }
 }

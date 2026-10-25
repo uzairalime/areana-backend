@@ -5,6 +5,7 @@ import { AuthUser, CurrentUser, Public } from '../common/auth';
 import { AuthService } from './auth.service';
 import {
   ChangePasswordDto,
+  LogoutDto,
   OwnerRegisterDto,
   RefreshDto,
   RequestOtpDto,
@@ -41,8 +42,8 @@ export class AuthController {
   /** Revokes the refresh session behind the given refresh token. */
   @Public()
   @Post('logout')
-  logout(@Body() dto: RefreshDto) {
-    return this.auth.logout(dto.refreshToken);
+  logout(@Body() dto: LogoutDto) {
+    return this.auth.logout(dto.refreshToken, dto.deviceToken);
   }
 
   /** Signed-in password accounts (owner/staff/admin) rotate their password. */

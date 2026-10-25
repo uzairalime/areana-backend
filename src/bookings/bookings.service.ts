@@ -210,14 +210,13 @@ export class BookingsService {
       const hh = String(Math.floor(startMinutes / 60)).padStart(2, '0');
       const mm = String(startMinutes % 60).padStart(2, '0');
       const summary = `${booking.court.name} — ${input.date} ${hh}:${mm} (${slotCount} slot${slotCount > 1 ? 's' : ''}), Rs ${Number(booking.totalPrice).toFixed(0)}`;
+      // Fire-and-forget (Round 4, P-S7): the owner email must not
+      // hang this response after the booking committed — the helper
+      // retries once and logs failures with context, never throws.
       if (booking.status === BookingStatus.pending) {
-        await this.notifications
-          .notifyOwnerNewBooking(ownerEmail, booking.venue.name, summary)
-          .catch(() => {});
+        void this.notifications.notifyOwnerNewBooking(ownerEmail, booking.venue.name, summary);
       } else if (booking.status === BookingStatus.confirmed) {
-        await this.notifications
-          .notifyOwnerConfirmedBooking(ownerEmail, booking.venue.name, summary)
-          .catch(() => {});
+        void this.notifications.notifyOwnerConfirmedBooking(ownerEmail, booking.venue.name, summary);
       }
     }
     return booking;
@@ -573,9 +572,7 @@ export class BookingsService {
       const mm = String(booking.startMinutes % 60).padStart(2, '0');
       const summary = `${booking.date.toISOString().slice(0, 10)} ${hh}:${mm}`;
       if (venue.owner?.email) {
-        await this.notifications
-          .notifyOwnerCancelledBooking(venue.owner.email, venue.name, summary)
-          .catch(() => {});
+        void this.notifications.notifyOwnerCancelledBooking(venue.owner.email, venue.name, summary);
       }
       await this.notifications
         .pushToUser(venue.ownerId, {
@@ -1313,6 +1310,12 @@ export class BookingsService {
         if (!current || !this.sameSanction(current, sanctionAtStart)) break;
       }
       const { stopped, done } = await this.prisma.$transaction(async (tx) => {
+        // Round 4, P-S12/P-S13: the claim holds the venue lock while
+        // iterating bookings — bound the lock wait so a slow cascade
+        // cannot wedge the pool (a timeout aborts this pass, which the
+        // caller logs and the next pass retries; it surfaces as a
+        // retryable 503, never a wedged connection).
+        await tx.$executeRaw`SET LOCAL lock_timeout = '5s'`;
         await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
         // Re-check the sanction predicate INSIDE the transaction,
         // after the row lock (Round 4, R-S3): a sanction change that
@@ -1525,13 +1528,11 @@ export class BookingsService {
       await this.cleanupGamePost(b.id, 'This game is off — the host is no longer on Areana.');
       await this.notifyWaitlist(b);
       if (b.venue.owner?.email) {
-        await this.notifications
-          .notifyOwnerNewBooking(
-            b.venue.owner.email,
-            b.venue.name,
-            `A booking on ${b.date.toISOString().slice(0, 10)} was cancelled ${ownerNote}.`,
-          )
-          .catch(() => {});
+        void this.notifications.notifyOwnerNewBooking(
+          b.venue.owner.email,
+          b.venue.name,
+          `A booking on ${b.date.toISOString().slice(0, 10)} was cancelled ${ownerNote}.`,
+        );
       }
     }
     return future.length;

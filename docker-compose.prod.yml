@@ -1,0 +1,83 @@
+# Production Compose (Round 4, P-S14) — versioned in the repo.
+#
+# The dev docker-compose.yml (db + mailpit only) is NOT a production
+# file: the old "real prod Compose" was unversioned, had no api
+# service, no healthchecks and no depends_on, so an API starting before
+# Postgres was ready failed `migrate deploy` and stayed down. This
+# file is the production shape: api + db with healthchecks, the api
+# gated on a HEALTHY db, and restart policies on everything.
+#
+# First install on an EMPTY database is NOT `migrate deploy` (the
+# migrations folder is not a full baseline — see docs/DEPLOY.md §1):
+# run `npx prisma db push` once, verify + resolve the hand-written
+# migrations, and only then let this Compose file's CMD run deploy.
+#
+# Required env (via environment below or an env_file — note the
+# precedence rule in docs/DEPLOY.md §6: `environment:` wins over
+# `env_file:` wins over `.env`):
+#   DATABASE_URL, JWT_ACCESS_SECRET, JWT_REFRESH_SECRET,
+#   SMTP_HOST (real host — never localhost in prod), CORS_ORIGIN
+#   (explicit origins, never *), TRUST_PROXY=1, TZ=Asia/Karachi.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-areana}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-areana}
+      TZ: Asia/Karachi
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready is the readiness signal depends_on waits on. NOTE:
+      # changing TZ here does NOT change an existing cluster's
+      # timezone (baked at initdb) — see docs/DEPLOY.md §6.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-areana} -d ${POSTGRES_DB:-areana}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      TZ: Asia/Karachi
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      PORT: "3000"
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET is required}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
+      CORS_ORIGIN: ${CORS_ORIGIN:?CORS_ORIGIN must list explicit origins in production}
+      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST must be a real host in production}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-Areana <no-reply@areana.pk>}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      FCM_ENABLED: ${FCM_ENABLED:-false}
+      FCM_SERVICE_ACCOUNT: ${FCM_SERVICE_ACCOUNT:-}
+      STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+      STORAGE_DIR: ./uploads
+    ports:
+      - "3000:3000"
+    volumes:
+      - uploads:/app/uploads
+    healthcheck:
+      # /api/health returns 503 when the DB is down (Round 4, P-S16),
+      # so this gate can actually fail — a 200-only check could not.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    # The Dockerfile CMD runs `prisma migrate deploy && node dist/main`.
+    # On a fresh DB that is NOT the install path (see header note).
+
+volumes:
+  pgdata:
+  uploads:

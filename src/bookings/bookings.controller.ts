@@ -92,6 +92,13 @@ export class BookingsController {
     @Query('date') dateStr?: string,
     @Query('startMinutes') startMinutesRaw?: string,
   ) {
+    // Round 4, L-S6: a stored "" code used to be FOUND by preview
+    // (lookup trims; booking creation skips falsy codes), so a player
+    // saw a discount a booking could never apply. Preview rejects
+    // empty codes exactly like booking creation does.
+    if (!code || !code.trim()) {
+      throw new BadRequestException('Promo code must not be empty');
+    }
     const court = await this.courts.getActiveCourt(courtId);
     // Garbage slot inputs must not reach the pricing loop (Round 4
     // trivial): parseInt('abc') is NaN, and Math.max(1, NaN) is NaN,

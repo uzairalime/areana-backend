@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma, Venue } from '@prisma/client';
@@ -65,6 +66,8 @@ export interface BillingSummary {
 
 @Injectable()
 export class PlansService {
+  private readonly logger = new Logger(PlansService.name);
+
   constructor(
     private prisma: PrismaService,
     private notifications: NotificationsService,
@@ -141,6 +144,7 @@ export class PlansService {
     const existing = await this.prisma.plan.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Plan not found');
     if (dto.features) this.assertFeatures(dto.features);
+    let frozenVenues = 0;
     const plan = await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(${PLAN_WRITE_LOCK})`;
       // The platform must never be left with zero default plans: venues
@@ -160,6 +164,62 @@ export class PlansService {
       }
       if (dto.isDefault) {
         await tx.plan.updateMany({ data: { isDefault: false } });
+      }
+      // Round 4, L-S5: editing a plan's price/freeMonths used to
+      // retroactively reprice/re-anchor every unfrozen venue on it —
+      // a venue 2 months into a 3-free-months trial went instantly
+      // due/overdue when freeMonths dropped to 0, and a Rs 0 plan
+      // edited to Rs 36,000 turned a legacy Rs 0 period into priced
+      // debt overnight. Like assignPlan's freeze, an edit now pins
+      // each in-flight period BEFORE the plan row changes: the frozen
+      // period boundaries + price (billingPeriod*) and — because
+      // context() derives freeUntil from the plan row's freeMonths
+      // even for frozen venues — the trial end itself, via
+      // freeUntilOverride (left alone when an extend-free already
+      // set one). The new price/freeMonths apply from the NEXT period,
+      // never mid-period. No panel change: this is automatic, and the
+      // frozen venue count rides along on the return value.
+      const priceChange =
+        dto.priceYearly !== undefined && dto.priceYearly !== existing.priceYearly;
+      const freeChange =
+        dto.freeMonths !== undefined && dto.freeMonths !== existing.freeMonths;
+      if (priceChange || freeChange) {
+        const affected = await tx.venue.findMany({
+          where: {
+            billingStartAt: { not: null },
+            billingPeriodStart: null,
+            OR: [{ planId: id }, ...(existing.isDefault ? [{ planId: null }] : [])],
+          },
+          select: {
+            id: true,
+            billingStartAt: true,
+            billingPaidUntil: true,
+            freeUntilOverride: true,
+          },
+        });
+        for (const v of affected) {
+          // Mirror context()'s unfrozen walk, using the OLD plan
+          // values (the row has not been updated yet inside this tx).
+          const freeUntil =
+            v.freeUntilOverride ?? addMonths(v.billingStartAt!, existing.freeMonths);
+          let periodStart = freeUntil;
+          let periodEnd = addMonths(periodStart, 12);
+          while (v.billingPaidUntil && v.billingPaidUntil >= periodEnd) {
+            periodStart = periodEnd;
+            periodEnd = addMonths(periodStart, 12);
+          }
+          await tx.venue.update({
+            where: { id: v.id },
+            data: {
+              billingPeriodStart: periodStart,
+              billingPeriodEnd: periodEnd,
+              billingPeriodPrice: existing.priceYearly,
+              frozenPlanId: id,
+              ...(v.freeUntilOverride ? {} : { freeUntilOverride: freeUntil }),
+            },
+          });
+          frozenVenues++;
+        }
       }
       // maxVenues 0 floors to 1 (see createPlan) — a zero venue cap
       // locks out every new owner.
@@ -185,7 +245,7 @@ export class PlansService {
         },
       });
     });
-    return { ...plan, features: this.asKeys(plan.features) };
+    return { ...plan, features: this.asKeys(plan.features), frozenVenues };
   }
 
   async deletePlan(id: string) {
@@ -361,7 +421,15 @@ export class PlansService {
   }
 
   async defaultPlan() {
-    return this.prisma.plan.findFirst({ where: { isDefault: true } });
+    // Round 4, M-B4 (service half): findFirst with no orderBy picked
+    // nondeterministically when two defaults coexisted. The seed fix
+    // stops creating a second default; the deterministic order here
+    // means that even a legacy duplicate resolves to the earliest
+    // default every time, never an arbitrary one.
+    return this.prisma.plan.findFirst({
+      where: { isDefault: true },
+      orderBy: { createdAt: 'asc' },
+    });
   }
 
   // ------------------------------------------------------------- assignment
@@ -906,18 +974,39 @@ export class PlansService {
           !fresh.billingPaused;
         let claimed = false;
         if (stillOverdue) {
-          const res = await this.prisma.venue.updateMany({
-            where: {
-              id: venue.id,
-              billingPaused: false,
-              OR: [
-                { billingPaidUntil: null },
-                { billingPaidUntil: { lt: freshCtx!.periodEnd } },
-              ],
-            },
-            data: { billingPaused: true },
-          });
-          claimed = res.count > 0;
+          // Round 4, P-S13: this claim used to be a plain updateMany
+          // OUTSIDE any transaction — no Prisma timeout applies to
+          // single queries — so a slow venue-cascade transaction
+          // holding venue V's lock made the sweep block on the claim
+          // forever while holding a pooled connection, and a second
+          // (startup) sweep blocked on the same lock: pool exhaustion
+          // turned a billing stall into a site-wide outage. The claim
+          // now runs in a transaction with a 5s lock timeout: on
+          // timeout the venue is skipped (logged) for this sweep
+          // instead of wedging the pool. P-S4's single-flight flag
+          // stops two sweeps running concurrently in the first place.
+          try {
+            const res = await this.prisma.$transaction(async (tx) => {
+              await tx.$executeRaw`SET LOCAL lock_timeout = '5s'`;
+              return tx.venue.updateMany({
+                where: {
+                  id: venue.id,
+                  billingPaused: false,
+                  OR: [
+                    { billingPaidUntil: null },
+                    { billingPaidUntil: { lt: freshCtx!.periodEnd } },
+                  ],
+                },
+                data: { billingPaused: true },
+              });
+            });
+            claimed = res.count > 0;
+          } catch (e) {
+            this.logger.warn(
+              `Billing sweep: pause claim for venue ${venue.id} timed out on the venue lock — skipping this sweep: ${(e as Error).message}`,
+            );
+            continue;
+          }
         }
         if (!claimed) continue;
         // The pause that hides a venue (and cancels its bookings) had
@@ -950,18 +1039,28 @@ export class PlansService {
       }
       // One due-reminder per period. The key is the period's start
       // (nextDueAt): frozen billing periods make it stable across
-      // plan changes within the same period. The push goes FIRST and
-      // the record is written only after it resolves, so a failed
-      // send does not burn the period's one reminder — with the caveat
-      // that pushToUser swallows inbox/FCM failures internally and
-      // resolves anyway, so "after a successful push" here means
-      // after the push attempt completed, not after delivery.
+      // plan changes within the same period. Round 4, P-S4: the old
+      // code pushed FIRST and recorded after, so two overlapping
+      // sweeps (restart near 00:30) both read "not notified" and both
+      // pushed "Plan payment due". The reminder is now CLAIMED first
+      // with a conditional update — only the sweep that wins the
+      // claim pushes. A push failure after a won claim burns the
+      // period's reminder (logged by pushToUser's own handling), which
+      // is the safe direction: duplicates are user-visible spam,
+      // while a missed reminder is covered by the next period's.
       if (summary.status === 'due' && summary.nextDueAt) {
         const periodKey = new Date(summary.nextDueAt);
-        const already =
-          venue.billingDueNotifiedFor &&
-          venue.billingDueNotifiedFor.getTime() === periodKey.getTime();
-        if (!already) {
+        const claimedReminder = await this.prisma.venue.updateMany({
+          where: {
+            id: venue.id,
+            OR: [
+              { billingDueNotifiedFor: null },
+              { billingDueNotifiedFor: { not: periodKey } },
+            ],
+          },
+          data: { billingDueNotifiedFor: periodKey },
+        });
+        if (claimedReminder.count > 0) {
           await this.notifications
             .pushToUser(venue.ownerId, {
               title: 'Plan payment due',
@@ -969,10 +1068,6 @@ export class PlansService {
               data: { type: 'billing_due' },
             })
             .catch(() => {});
-          await this.prisma.venue.update({
-            where: { id: venue.id },
-            data: { billingDueNotifiedFor: periodKey },
-          });
         }
       }
     }

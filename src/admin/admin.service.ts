@@ -2682,6 +2682,19 @@ export class AdminService {
     // bookings were already refunded at cancel time; the refund is a
     // no-op for those.
     const waiterIds = await this.prisma.$transaction(async (tx) => {
+      // Round 4, P-S12: this transaction used to hold the court row
+      // lock while looping releasePromo over EVERY historical booking
+      // on the court — a 300-booking court held the lock for seconds
+      // while a player's booking creation on that court waited on the
+      // same lock past the 5s transaction timeout and surfaced as a
+      // generic P2028 500. Two bounds: the loop now touches only
+      // bookings that actually hold a live redemption (releasePromo
+      // is a no-op for the rest — cancelled bookings were refunded at
+      // cancel time), and the transaction carries lock + statement
+      // timeouts so a pathological case fails fast as a retryable 503
+      // (PrismaTimeoutFilter) instead of wedging the pool.
+      await tx.$executeRaw`SET LOCAL lock_timeout = '5s'`;
+      await tx.$executeRaw`SET LOCAL statement_timeout = '30s'`;
       await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${courtId} FOR UPDATE`;
       const locked = await tx.court.findUnique({ where: { id: courtId }, select: { id: true } });
       if (!locked) throw new NotFoundException('Court not found');
@@ -2705,12 +2718,17 @@ export class AdminService {
         where: { courtId },
         select: { userId: true },
       });
-      const doomed = await tx.booking.findMany({
-        where: { courtId },
-        select: { id: true },
+      // Only bookings holding a live redemption need the refund loop
+      // (releasePromo deletes the redemption rows and decrements
+      // usedCount by the deleted count — a booking with no rows is a
+      // no-op, so skipping it changes nothing but the lock hold time).
+      const doomed = await tx.promoRedemption.findMany({
+        where: { booking: { courtId } },
+        select: { bookingId: true },
+        distinct: ['bookingId'],
       });
       for (const b of doomed) {
-        await this.bookings.releasePromo(b.id, tx);
+        if (b.bookingId) await this.bookings.releasePromo(b.bookingId, tx);
       }
       // Only historical bookings can remain at this point; resolved or
       // dismissed disputes on them are removed explicitly (their
@@ -3893,12 +3911,24 @@ export class AdminService {
   }
 
   async sendBroadcast(actorId: string, title: string, body: string, city?: string) {
-    const targeted = await this.notifications.broadcastPush({ title, body }, city);
+    // Round 4, P-B1: history records the ACTUAL per-batch delivery
+    // counts now. A total failure (tokens existed, zero delivered) is
+    // a visible error, not a recorded success — the history row is
+    // still written first so the failure itself is auditable.
+    const { targeted, delivered, failed } = await this.notifications.broadcastPush(
+      { title, body },
+      city,
+    );
     await this.prisma.broadcast.create({
-      data: { title, body, city: city ?? null, targeted, sentById: actorId },
+      data: { title, body, city: city ?? null, targeted, delivered, failed, sentById: actorId },
     });
     await this.audit(actorId, 'broadcast.send', 'broadcast', city ?? 'all');
-    return { targeted };
+    if (targeted > 0 && delivered === 0) {
+      throw new BadRequestException(
+        `Broadcast failed to deliver to any of the ${targeted} targeted device(s) — see the server log for the FCM batch error.`,
+      );
+    }
+    return { targeted, delivered, failed };
   }
 
   async broadcastHistory(cursor?: string, rawLimit?: number) {

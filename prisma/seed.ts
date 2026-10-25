@@ -57,15 +57,17 @@ async function main() {
   for (const r of ROLES) {
     // Role.name is no longer globally unique (owner-created roles share
     // names across owners) — system roles are matched by name + ownerId null.
+    // Round 4, M-B5: re-running the seed used to OVERWRITE system-role
+    // permissions — an admin removing a dangerous key (e.g.
+    // staff.manage) from the owner role saw it silently restored, with
+    // no audit row, the next time anyone re-ran db:seed as a "repair".
+    // Create-if-missing only now, like settings/badges (update: {}):
+    // admin permission edits survive re-seeds. To deliberately reset
+    // a role's permissions, edit it in the panel.
     const existing = await prisma.role.findFirst({
       where: { name: r.name, ownerId: null },
     });
-    if (existing) {
-      await prisma.role.update({
-        where: { id: existing.id },
-        data: { permissions: r.permissions, description: r.description },
-      });
-    } else {
+    if (!existing) {
       await prisma.role.create({ data: r });
     }
   }
@@ -115,7 +117,27 @@ async function main() {
     const existing = await prisma.plan.findFirst({
       where: { name: planData.name, isCustom: false },
     });
-    if (!existing) await prisma.plan.create({ data: planData });
+    if (existing) continue;
+    // Round 4, M-B4: re-running the seed used to create a SECOND
+    // default plan (admin makes Premium the default, deletes Normal,
+    // someone re-runs db:seed: Normal is recreated with isDefault
+    // true, and defaultPlan() picked nondeterministically between
+    // two defaults). A seed plan only becomes the default when no
+    // default exists yet; otherwise it is created non-default and the
+    // operator is told to pick in the panel. (The service's
+    // defaultPlan() is also ordered by createdAt now, so even a
+    // legacy duplicate resolves deterministically.)
+    let isDefault = planData.isDefault;
+    if (isDefault) {
+      const anyDefault = await prisma.plan.findFirst({ where: { isDefault: true } });
+      if (anyDefault) {
+        console.log(
+          `Plan ${planData.name} would be a second default (existing: ${anyDefault.name}) — creating it non-default instead.`,
+        );
+        isDefault = false;
+      }
+    }
+    await prisma.plan.create({ data: { ...planData, isDefault } });
   }
   console.log('Plans seeded');
 
@@ -134,7 +156,11 @@ async function main() {
   ];
   // Defaults are a starting point ONLY: once the catalog exists it is
   // fully admin-managed, so re-seeding must never resurrect a sport the
-  // admin renamed or removed.
+  // admin renamed or removed. Round 4, borderline note: that holds
+  // for PARTIAL deletions only — if the admin deletes the ENTIRE
+  // catalog, count() === 0 and re-seed resurrects all 10 sports / 12
+  // amenities. That total-wipe case is accepted (an empty catalog is
+  // worse than a resurrected one); partial deletions stay deleted.
   if ((await prisma.sport.count()) === 0) {
     for (const [i, name] of DEFAULT_SPORTS.entries()) {
       await prisma.sport.create({ data: { name, sortOrder: i } });

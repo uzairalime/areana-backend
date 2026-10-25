@@ -30,7 +30,27 @@ export const validationSchema = Joi.object({
 
 export default () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
-  corsOrigin: (process.env.CORS_ORIGIN ?? '*').split(','),
+  // Round 4, Swagger trivial: /api/docs used to be served
+  // unconditionally, including in production. SWAGGER_ENABLED defaults
+  // to on outside production and off in production; set it to 'true'
+  // explicitly to re-enable docs on a prod deploy (e.g. a staging box).
+  docsEnabled:
+    process.env.SWAGGER_ENABLED !== undefined
+      ? process.env.SWAGGER_ENABLED === 'true'
+      : process.env.NODE_ENV !== 'production',
+  // Round 4, P-S1: CORS origins used to be matched literally and
+  // untrimmed — `CORS_ORIGIN=https://player.areana.pk,
+  // https://panels.areana.pk` left the second entry as
+  // `" https://panels.areana.pk"`, which never matches the Origin
+  // header, so a correctly-listed origin was still CORS-blocked; a
+  // spaced `" *"` slipped past the boot guard (exact `includes('*')`
+  // missed it) while matching nothing. Trim, strip trailing slashes,
+  // drop empties — and the boot guard in main.ts now checks this
+  // cleaned list, so `" *"` is caught as open.
+  corsOrigin: (process.env.CORS_ORIGIN ?? '*')
+    .split(',')
+    .map((o) => o.trim().replace(/\/+$/, ''))
+    .filter((o) => o.length > 0),
   isProd: process.env.NODE_ENV === 'production',
   jwt: {
     accessSecret: process.env.JWT_ACCESS_SECRET as string,

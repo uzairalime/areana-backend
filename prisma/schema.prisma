@@ -809,6 +809,13 @@ model Broadcast {
   body      String
   city      String?
   targeted  Int      @default(0)
+  /// Round 4, P-B1: `targeted` used to be the only count — and it was
+  /// the pre-send token count, so a broadcast that delivered to zero
+  /// phones (500-token batch throw) still recorded full delivery.
+  /// `delivered`/`failed` are the per-batch actuals from the chunked
+  /// send; history shows attempted vs delivered, never a lie.
+  delivered Int      @default(0)
+  failed    Int      @default(0)
   sentById  String?
   createdAt DateTime @default(now())
 
@@ -835,7 +842,16 @@ model Sport {
 /// returns the stored response instead of re-executing. Scope includes
 /// the route so a key can never replay across endpoints. Rows older
 /// than 24h are pruned opportunistically on each write and never replay.
-/// NOTE: this model needs a migration (prisma migrate dev generates it).
+/// Migration: prisma/migrations/20261025041600_idempotency_key (already
+/// applied on migrate-built DBs; see docs/DEPLOY.md for the db-push
+/// case — never hand-edit an applied migration file).
+/// NOTE (Round 4, M-S1): the two raw partial indexes (system role
+/// name, court venue+lower(name)) intentionally have NO Prisma
+/// declaration — the shadow-DB diff cannot match them and may propose
+/// dropping them. Never accept a generated DROP INDEX for
+/// "Role_system_name_key", "Role_system_name_ci_key", or
+/// "Court_venue_name_key"; run `migrate dev` on a scratch DB first
+/// and inspect the generated SQL (docs/DEPLOY.md).
 model IdempotencyKey {
   id        String   @id @default(cuid())
   scope     String // e.g. "POST /admin/venues/abc123/billing/mark-paid" (method + concrete path, no query)
