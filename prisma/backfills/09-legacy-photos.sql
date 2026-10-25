@@ -47,10 +47,14 @@ WHERE array_length("images", 1) > 0
   AND ("photos" IS NULL OR "photos"::text = '[]');
 
 UPDATE "Venue" v
-SET "photos" = (
+SET "photos" = COALESCE((
   SELECT jsonb_agg(jsonb_build_object('url', u))
   FROM unnest(v."images") AS t(u)
-)
+  -- Round 5, D5-S16: NULL/empty image elements used to produce
+  -- {"url": null} photo entries, keeping the count mismatched after
+  -- a "successful" repair. Filter them out of the built array.
+  WHERE u IS NOT NULL AND btrim(u) <> ''
+), '[]'::jsonb)
 WHERE v."id" IN (SELECT "id" FROM bf_photos_touched);
 
 INSERT INTO "AuditLog" ("id", "actorId", "action", "entity", "entityId", "details", "createdAt")
@@ -67,12 +71,22 @@ COMMIT;
 -- STEP 1 — report (read-only): venues with PARTIAL photos (some images
 -- without entries) — operator must tag the missing ones by hand; the
 -- script deliberately does not overwrite existing tags.
+-- Round 5, D5-S16: the old report compared COUNTS only, so images
+-- replaced with new URLs at the same count read "clean" while
+-- gallery and tagged photos diverged. This compares the URL SETS
+-- (distinct, sorted, NULL/empty filtered on both sides): any
+-- difference — count or content — is reported.
 SELECT 'partial-photos' AS issue, v."id", v."name", v."status",
        v."images" AS images, v."photos"::text AS photos
 FROM "Venue" v
 WHERE array_length(v."images", 1) > 0
   AND v."photos"::text <> '[]'
   AND (
-    SELECT COUNT(*) FROM jsonb_array_elements(v."photos"::jsonb) AS e
-    WHERE e->>'url' IS NOT NULL
-  ) < array_length(v."images", 1);
+    SELECT COALESCE(ARRAY_AGG(DISTINCT u ORDER BY u), ARRAY[]::text[])
+    FROM unnest(v."images") AS t(u)
+    WHERE u IS NOT NULL AND btrim(u) <> ''
+  ) IS DISTINCT FROM (
+    SELECT COALESCE(ARRAY_AGG(DISTINCT e->>'url' ORDER BY e->>'url'), ARRAY[]::text[])
+    FROM jsonb_array_elements(COALESCE(v."photos"::jsonb, '[]'::jsonb)) AS e
+    WHERE e->>'url' IS NOT NULL AND btrim(e->>'url') <> ''
+  );

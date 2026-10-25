@@ -1,4 +1,4 @@
-# Production Compose (Round 4, P-S14) — versioned in the repo.
+# Production Compose (Round 4, P-S14; Round 5, R2) — versioned in the repo.
 #
 # The dev docker-compose.yml (db + mailpit only) is NOT a production
 # file: the old "real prod Compose" was unversioned, had no api
@@ -12,12 +12,28 @@
 # run `npx prisma db push` once, verify + resolve the hand-written
 # migrations, and only then let this Compose file's CMD run deploy.
 #
-# Required env (via environment below or an env_file — note the
-# precedence rule in docs/DEPLOY.md §6: `environment:` wins over
-# `env_file:` wins over `.env`):
+# Required env (via environment below — note the precedence rule in
+# docs/DEPLOY.md §6: this file declares NO env_file:, so the project
+# .env only feeds interpolation of the listed environment: entries; a
+# value set under environment: wins over any .env edit):
 #   DATABASE_URL, JWT_ACCESS_SECRET, JWT_REFRESH_SECRET,
 #   SMTP_HOST (real host — never localhost in prod), CORS_ORIGIN
 #   (explicit origins, never *), TRUST_PROXY=1, TZ=Asia/Karachi.
+#
+# DATABASE_URL MUST point at the Compose `db` service (host `db`,
+# with the POSTGRES_USER / POSTGRES_DB credentials below). Nothing
+# validates this: a localhost:5432 (or stale-host) URL runs migrate
+# deploy and the app against the wrong database while the
+# healthcheck gate (which only waits on the local `db`) passes.
+#
+# Healthcheck failure does NOT restart the container: Docker marks a
+# container unhealthy but never restarts it on health failure, so a
+# pool-wedged API (health 503) stays up indefinitely unless something
+# external acts — run a watchdog or alerting on /api/health. Likewise
+# a failed migration restart-loops (CMD exits non-zero, unless-stopped
+# restarts it, deploy fails again on the failed _prisma_migrations
+# row) until someone runs `migrate resolve` manually (DEPLOY §4) —
+# alert on repeated migrate failures, do not let the loop run silent.
 services:
   db:
     image: postgres:16-alpine
@@ -28,7 +44,15 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-areana}
       TZ: Asia/Karachi
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # Round 5, D5-S44: deliberately NOT `pgdata` — dev and prod
+      # Compose files in one directory share the default project
+      # name and therefore the same named volume, so a dev-
+      # initialised volume used to leak into prod (POSTGRES_PASSWORD
+      # ignored on an existing volume → prod password fails auth,
+      # dev/demo data appears in prod). An existing prod install on
+      # `pgdata` must move its data deliberately, never just rename
+      # and boot empty.
+      - pgdata_prod:/var/lib/postgresql/data
     healthcheck:
       # pg_isready is the readiness signal depends_on waits on. NOTE:
       # changing TZ here does NOT change an existing cluster's
@@ -59,9 +83,22 @@ services:
       SMTP_PASS: ${SMTP_PASS:-}
       MAIL_FROM: ${MAIL_FROM:-Areana <no-reply@areana.pk>}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      # Round 5, D5-S42: ADMIN_EMAIL alone seeds nothing (the admin
+      # block requires both email and password) — pass the password
+      # via secret, and the seed now warns when it is missing.
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       FCM_ENABLED: ${FCM_ENABLED:-false}
       FCM_SERVICE_ACCOUNT: ${FCM_SERVICE_ACCOUNT:-}
       STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+      # Round 5, D5-S42: required whenever STORAGE_DRIVER=s3 (the
+      # boot guard fails/warns when the set is incomplete) — setting
+      # STORAGE_DRIVER=s3 without these used to boot fine and fail
+      # only at first upload.
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-}
       STORAGE_DIR: ./uploads
     ports:
       - "3000:3000"
@@ -79,5 +116,5 @@ services:
     # On a fresh DB that is NOT the install path (see header note).
 
 volumes:
-  pgdata:
+  pgdata_prod:
   uploads:

@@ -69,33 +69,41 @@ export class SportsService {
     if (dto.sortOrder !== undefined) data.sortOrder = dto.sortOrder;
     if (dto.isActive !== undefined) data.isActive = dto.isActive;
     const renamed = data.name !== undefined && data.name !== sport.name;
-    const updated = await this.prisma.sport.update({ where: { id }, data });
     if (renamed) {
-      // Cascade the rename everywhere the old name lives, so existing
-      // arenas/courts/photo tags keep working under the new spelling.
+      // Round 5, D5-S52: the rename used to run as a bare update
+      // followed by a per-venue loop with no transaction — a crash
+      // (or a concurrent venue/court create using the old name)
+      // mid-rename left courts on the new name while some venues
+      // and their photo sport tags still carried the old one.
+      // Everything now runs in one transaction, so the rename is
+      // atomic: either every reference moves or none does.
       const oldName = sport.name;
       const newName = data.name as string;
-      await this.prisma.court.updateMany({ where: { sport: oldName }, data: { sport: newName } });
-      const venues = await this.prisma.venue.findMany({
-        where: { sports: { has: oldName } },
-        select: { id: true, sports: true, photos: true },
-      });
-      for (const v of venues) {
-        const photos = Array.isArray(v.photos)
-          ? (v.photos as Record<string, unknown>[]).map((e) =>
-              e && e.sport === oldName ? { ...e, sport: newName } : e,
-            )
-          : v.photos;
-        await this.prisma.venue.update({
-          where: { id: v.id },
-          data: {
-            sports: v.sports.map((s) => (s === oldName ? newName : s)),
-            photos: photos as never,
-          },
+      return this.prisma.$transaction(async (tx) => {
+        const updated = await tx.sport.update({ where: { id }, data });
+        await tx.court.updateMany({ where: { sport: oldName }, data: { sport: newName } });
+        const venues = await tx.venue.findMany({
+          where: { sports: { has: oldName } },
+          select: { id: true, sports: true, photos: true },
         });
-      }
+        for (const v of venues) {
+          const photos = Array.isArray(v.photos)
+            ? (v.photos as Record<string, unknown>[]).map((e) =>
+                e && e.sport === oldName ? { ...e, sport: newName } : e,
+              )
+            : v.photos;
+          await tx.venue.update({
+            where: { id: v.id },
+            data: {
+              sports: v.sports.map((s) => (s === oldName ? newName : s)),
+              photos: photos as never,
+            },
+          });
+        }
+        return updated;
+      });
     }
-    return updated;
+    return this.prisma.sport.update({ where: { id }, data });
   }
 
   async remove(id: string) {

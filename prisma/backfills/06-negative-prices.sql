@@ -42,9 +42,14 @@ WHERE b."totalPrice" < 0
 ON CONFLICT ("id") DO NOTHING;
 
 -- STEP 2 — floor + cap (single statement: both expressions read the
--- old row, so the discount cap uses the pre-fix gross).
+-- old row, so the discount cap uses the pre-fix gross). Round 5,
+-- D5-B7: the cap is floored at 0 on BOTH sides — the old
+-- LEAST(discount, totalPrice + discount) wrote a NEGATIVE discount
+-- (e.g. total -1000, discount 500 → gross -500 → discount -500, a
+-- surcharge-shaped value no code path creates) alongside the floored
+-- total of 0.
 UPDATE "Booking"
-SET "discountAmount" = LEAST("discountAmount", "totalPrice" + "discountAmount"),
+SET "discountAmount" = GREATEST(LEAST("discountAmount", GREATEST("totalPrice" + "discountAmount", 0)), 0),
     "totalPrice" = GREATEST("totalPrice", 0)
 WHERE "totalPrice" < 0;
 

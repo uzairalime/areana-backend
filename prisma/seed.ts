@@ -77,7 +77,19 @@ async function main() {
   const adminPassword = process.env.ADMIN_PASSWORD;
   if (adminEmail && adminPassword) {
     const superAdmin = await prisma.role.findFirstOrThrow({ where: { name: 'super_admin', ownerId: null } });
-    await prisma.user.upsert({
+    // Round 5, D5-S27: the old upsert + unconditional "ready" log
+    // lied twice — an ADMIN_EMAIL matching an existing player or
+    // suspended user was left untouched while the log claimed the
+    // super admin was ready, and a rotated ADMIN_PASSWORD was
+    // silently ignored for an existing admin (update: {} never
+    // touches the password). Verify after the upsert instead.
+    const preExisting = await prisma.user.findUnique({ where: { email: adminEmail } });
+    if (preExisting) {
+      console.warn(
+        `Super admin ${adminEmail} already exists — ADMIN_PASSWORD was NOT applied (upsert never overwrites an existing password). Reset it in the panel if rotation was intended.`,
+      );
+    }
+    const admin = await prisma.user.upsert({
       where: { email: adminEmail },
       update: {},
       create: {
@@ -88,7 +100,19 @@ async function main() {
         passwordHash: await bcrypt.hash(adminPassword, 10),
       },
     });
-    console.log(`Super admin ready: ${adminEmail}`);
+    if (admin.roleId !== superAdmin.id || admin.status !== UserStatus.active) {
+      console.warn(
+        `Super admin ${adminEmail} is NOT ready: existing account holds role ${admin.roleId} / status ${admin.status} (expected the super_admin role, active). Fix the account in the panel — the seed deliberately does not overwrite it.`,
+      );
+    } else {
+      console.log(`Super admin ready: ${adminEmail}`);
+    }
+  } else if (adminEmail && !adminPassword) {
+    // Round 5, D5-S42: ADMIN_EMAIL alone seeds nothing — warn
+    // instead of silently skipping the admin block.
+    console.warn(
+      'ADMIN_EMAIL is set but ADMIN_PASSWORD is missing — no super admin was created or verified. Set both to seed the admin.',
+    );
   }
 
   // Arena badge series (tiers refined later with real data)

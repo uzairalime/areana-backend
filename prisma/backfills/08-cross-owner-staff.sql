@@ -44,11 +44,21 @@ WHERE r."ownerId" IS NOT NULL
 ORDER BY ro."email", u."email";
 
 -- VenueAllowedRole rows attaching a foreign owner's role to a venue
--- whose owner is not that role's owner.
+-- whose owner is not that role's owner — WITH the staffers who hold
+-- that role at that venue (Round 5, D5-S15: the old query listed
+-- only venue + role, so a staffer who staffs owner A's venue — and
+-- is therefore correctly excluded from query 1 — but whose A-owned
+-- role is allowed at owner B's venue still acted at B through the
+-- per-venue allowed-roles gate, with no user to re-point for that B
+-- access). VenueStaff carries no roleId, so "holding that role" is
+-- a staffer at this venue whose user.roleId IS the cross-owner role.
 SELECT var."venueId", v."name" AS venue_name, v."ownerId" AS venue_owner_id,
-       var."roleId", r."name" AS role_name, r."ownerId" AS role_owner_id
+       var."roleId", r."name" AS role_name, r."ownerId" AS role_owner_id,
+       u."id" AS staffer_user_id, u."email" AS staffer_email
 FROM "VenueAllowedRole" var
 JOIN "Venue" v ON v."id" = var."venueId"
 JOIN "Role" r ON r."id" = var."roleId"
+JOIN "VenueStaff" vs ON vs."venueId" = var."venueId"
+JOIN "User" u ON u."id" = vs."userId" AND u."roleId" = var."roleId"
 WHERE r."ownerId" IS NOT NULL AND r."ownerId" <> v."ownerId"
-ORDER BY v."name", r."name";
+ORDER BY v."name", r."name", u."email";

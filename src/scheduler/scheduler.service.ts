@@ -55,6 +55,36 @@ export class SchedulerService implements OnModuleInit {
     const row = await this.prisma.setting.findUnique({ where: { key: 'nightlyLastRun' } });
     const last = row?.value ? new Date(row.value).getTime() : 0;
     if (Date.now() - last <= 24 * 3600_000) return;
+    // Round 5, D5-S39: the old read-then-run was not atomic across
+    // instances — two boots after a missed nightly both ran it fully.
+    // Claim the watermark conditionally: the updateMany predicate pins
+    // the exact value this instance read, so the loser's predicate no
+    // longer matches once the winner's claim lands (count 0 = lost).
+    // A crash mid-nightly leaves the unparseable claim value, which
+    // the next boot treats as stale (NaN age) and re-claims — the
+    // catch-up self-heals instead of wedging. The cron nightly()
+    // path still relies on per-row claims inside runNightly; only
+    // this catch-up claim is cross-instance atomic.
+    const claim = `nightly-claim:${Date.now()}:${process.pid}`;
+    let claimed = false;
+    if (row) {
+      const res = await this.prisma.setting.updateMany({
+        where: { key: 'nightlyLastRun', value: row.value },
+        data: { value: claim },
+      });
+      claimed = res.count === 1;
+    } else {
+      try {
+        await this.prisma.setting.create({ data: { key: 'nightlyLastRun', value: claim } });
+        claimed = true;
+      } catch {
+        claimed = false; // another instance created the row first
+      }
+    }
+    if (!claimed) {
+      this.logger.log('Nightly catch-up claimed by another instance — skipping');
+      return;
+    }
     this.logger.log(
       `Nightly last ran ${row?.value ?? 'never'} — running missed nightly at startup`,
     );

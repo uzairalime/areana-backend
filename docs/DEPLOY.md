@@ -7,11 +7,22 @@ recovered with `--rolled-back`, never blind `--applied`.**
 
 ## 1. Fresh database (first install)
 
-`prisma/migrations/` holds only hand-written folders (the two partial
-indexes, the court-name index, the void-note index, the broadcast
-counts, plus `IdempotencyKey`). It is NOT a full baseline: `migrate
-deploy` on an empty database creates only those objects and the API
-then crashes on first query (every other table missing).
+`prisma/migrations/` holds only hand-written folders — 9 of them, and
+it is NOT a full baseline: `migrate deploy` on an empty database
+creates only those objects and the API then crashes on first query
+(every other table missing).
+
+| Migration folder | Object | Created by `db push`? |
+|---|---|---|
+| `20261025034800_system_role_name_unique` | Partial unique index `Role_system_name_key` (`name` WHERE `ownerId` IS NULL) | NO — raw SQL, no Prisma declaration |
+| `20261025041500_court_venue_name_unique` | Unique index `Court_venue_name_ci_key` (`venueId`, `lower(name)`) | NO — raw SQL, no Prisma declaration |
+| `20261025041600_idempotency_key` | Table `IdempotencyKey` | YES — declared in `schema.prisma` |
+| `20261025070700_void_note_unique` | Partial unique index `VenuePayment_void_note_key` (`note` WHERE `method = 'void'`) | NO — raw SQL, no Prisma declaration |
+| `20261025123000_round4_r2_court_weekly_hours_version` | Column `Court.weeklyHoursVersion` | YES — declared in `schema.prisma` |
+| `20261025123100_round4_r2_system_role_name_ci` | Partial unique index `Role_system_name_ci_key` (`lower(name)` WHERE `ownerId` IS NULL) | NO — raw SQL, no Prisma declaration |
+| `20261025123200_round4_r2_waitlist_slot_minutes` | Column `SlotWaitlist.slotMinutes` | YES — declared in `schema.prisma` |
+| `20261025140000_round4_r5b_broadcast_counts` | Columns `Broadcast.delivered`, `Broadcast.failed` | YES — declared in `schema.prisma` |
+| `20261025143000_round5_r1_refresh_replaced_by` | Column `RefreshSession.replacedById` | YES — declared in `schema.prisma` |
 
 **Fresh-install path (until a real baseline migration is committed):**
 
@@ -19,16 +30,28 @@ then crashes on first query (every other table missing).
 cd areana-api
 # 1. Create the full schema from schema.prisma (NOT migrate deploy):
 npx prisma db push
-# 2. Mark the hand-written migrations as applied ONLY after verifying
-#    each object below exists and matches the migration SQL (step 3):
-npx prisma migrate resolve --applied 20261025034800_system_role_name_unique
-npx prisma migrate resolve --applied 20261025041500_court_venue_name_unique
+# 2. For the objects `db push` DID create (table + columns above):
+#    verify each one exists and matches the migration SQL, then mark
+#    ONLY those migrations applied:
 npx prisma migrate resolve --applied 20261025041600_idempotency_key
-npx prisma migrate resolve --applied 20261025070700_void_note_unique
-npx prisma migrate resolve --applied 20261025123100_round4_r2_system_role_name_ci
-# ... plus every later migration folder, in folder-name order.
-# 3. Future deploys are plain `npx prisma migrate deploy`.
+npx prisma migrate resolve --applied 20261025123000_round4_r2_court_weekly_hours_version
+npx prisma migrate resolve --applied 20261025123200_round4_r2_waitlist_slot_minutes
+npx prisma migrate resolve --applied 20261025140000_round4_r5b_broadcast_counts
+npx prisma migrate resolve --applied 20261025143000_round5_r1_refresh_replaced_by
+# 3. For the objects `db push` did NOT create (the 4 partial/unique
+#    indexes above): do NOT resolve them — let deploy create them:
+npx prisma migrate deploy
+# 4. Future deploys are plain `npx prisma migrate deploy`.
 ```
+
+Resolving an index migration on a `db push` DB — where the index
+does NOT exist — is the exact failure §3 warns against: the
+migration is marked done while its backstop is absent, so duplicate
+system roles / courts become creatable with no error and the code's
+P2002 mappings keep compiling against an index that isn't there.
+`scripts/predeploy-check.js` enforces this split: an object without
+a migration row is BLOCKING until resolved, and a resolved migration
+without its object is BLOCKING until rolled back and deployed.
 
 Do NOT hand-write a 30-model baseline migration to "fix" this — a
 hand-written baseline drifts from `schema.prisma` on the next model
@@ -44,16 +67,26 @@ deploy — or run `node scripts/predeploy-check.js`, which runs them all
 and exits non-zero on blocking rows:
 
 ```sql
--- Duplicate system roles (exact AND case-insensitive):
+-- Duplicate system roles (exact AND case-insensitive). The CI index
+-- is lower(name) with NO trim, so the lower() query is the one that
+-- decides whether the index migration fails; the EXCEPT queries list
+-- trailing-space-only pairs, which PASS the index but FAIL the code
+-- check (the code trims) — warnings, not index blockers:
 SELECT name, COUNT(*) FROM "Role" WHERE "ownerId" IS NULL GROUP BY name HAVING COUNT(*) > 1;
-SELECT lower(btrim("name")), COUNT(*) FROM "Role" WHERE "ownerId" IS NULL GROUP BY 1 HAVING COUNT(*) > 1;
--- Duplicate courts per venue (trimmed, case-insensitive — the index is
--- lower(name) with no trim, while the code check trims, so "Turf A" vs
--- "Turf A " pass the index but fail the code check):
+SELECT lower("name"), COUNT(*) FROM "Role" WHERE "ownerId" IS NULL GROUP BY 1 HAVING COUNT(*) > 1;
+SELECT lower(btrim("name")), COUNT(*) FROM "Role" WHERE "ownerId" IS NULL GROUP BY 1 HAVING COUNT(*) > 1
+EXCEPT
+SELECT lower("name"), COUNT(*) FROM "Role" WHERE "ownerId" IS NULL GROUP BY 1 HAVING COUNT(*) > 1;
+-- Duplicate courts per venue (same split: lower() blocks the index,
+-- the EXCEPT query is code-check-only):
 SELECT "venueId", lower("name"), COUNT(*) FROM "Court" GROUP BY 1, 2 HAVING COUNT(*) > 1;
-SELECT "venueId", lower(btrim("name")), COUNT(*) FROM "Court" GROUP BY 1, 2 HAVING COUNT(*) > 1;
--- Duplicate void notes (blocks the void unique index):
-SELECT note, COUNT(*) FROM "VenuePayment" WHERE method = 'void' GROUP BY note HAVING COUNT(*) > 1;
+SELECT "venueId", lower(btrim("name")), COUNT(*) FROM "Court" GROUP BY 1, 2 HAVING COUNT(*) > 1
+EXCEPT
+SELECT "venueId", lower("name"), COUNT(*) FROM "Court" GROUP BY 1, 2 HAVING COUNT(*) > 1;
+-- Duplicate void notes (blocks the void unique index). NULL notes are
+-- EXCLUDED: Postgres groups NULLs together, but the partial unique
+-- index treats NULLs as distinct, so NULL-note void rows never block it:
+SELECT note, COUNT(*) FROM "VenuePayment" WHERE method = 'void' AND note IS NOT NULL GROUP BY note HAVING COUNT(*) > 1;
 ```
 
 If any query returns rows, dedupe FIRST — see
@@ -72,6 +105,27 @@ A database built by `db push` already HAS the `IdempotencyKey` table
 1. Verify the existing object matches the migration SQL, column for
    column (for `IdempotencyKey`: id, scope, actorId, key, response,
    createdAt; for the indexes: the exact partial-index predicates).
+   Name alone is NOT verification — a hand-applied index with the
+   right name but the wrong predicate (e.g. a full unique on
+   `VenuePayment.note` with no `WHERE method = 'void'`, or a
+   `lower(name)` index with no `WHERE ownerId IS NULL`) is skipped
+   by the migration's `IF NOT EXISTS` and leaves the wrong backstop
+   standing. Verify predicates with:
+   ```sql
+   SELECT c.relname AS indexname,
+          pg_get_expr(i.indpred, i.indrelid) AS predicate,
+          pg_get_expr(i.indexprs, i.indrelid) AS expression
+   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+   WHERE c.relname IN ('Role_system_name_key', 'Role_system_name_ci_key',
+     'Court_venue_name_ci_key', 'VenuePayment_void_note_key');
+   -- Expected predicates:
+   --   Role_system_name_key:        WHERE "ownerId" IS NULL
+   --   Role_system_name_ci_key:     WHERE "ownerId" IS NULL (on lower(name))
+   --   Court_venue_name_ci_key:    no predicate (unique on venueId, lower(name))
+   --   VenuePayment_void_note_key: WHERE "method" = 'void'
+   ```
+   `scripts/predeploy-check.js` runs this definition check
+   automatically (it compares the normalised `indexdef`).
 2. Only then mark it applied:
    `npx prisma migrate resolve --applied <migration-name>`.
 3. Re-run `npx prisma migrate deploy`.
@@ -113,9 +167,10 @@ migration done while its object does not exist.
   have NO Prisma declaration, so the shadow-DB diff cannot match them:
   it may propose DROPPING them, or flag drift and offer only a reset.
   Reject any generated `DROP INDEX` for `Role_system_name_key`,
-  `Role_system_name_ci_key`, or `Court_venue_name_key` — accepting a
-  drop silently removes the backstops. (`schema.prisma` carries a
-  comment saying exactly this at the `IdempotencyKey` model.)
+  `Role_system_name_ci_key`, `Court_venue_name_ci_key`, or
+  `VenuePayment_void_note_key` — accepting a drop silently removes
+  the backstops. (`schema.prisma` carries a comment saying exactly
+  this at the `IdempotencyKey` model.)
 - **Rebase onto the current `migrations/` head before merging.**
   Hand-written timestamps (20261025034800/41500/41600, all Oct 25)
   mean a developer on a stale checkout can author
@@ -139,9 +194,14 @@ migration done while its object does not exist.
 
 Notes:
 
-- **TRUST_PROXY**: accepted values are unset (warn in production), a
-  hop count ≥ 1, `'true'` (all proxies, with a spoofing warning), or a
-  comma list of proxy IPs/CIDRs. `'false'` crashes Express and `'0'`
+- **TRUST_PROXY**: accepted values are unset (warns when boot must
+  fail — production or unrecognised `NODE_ENV`), a hop count ≥ 1
+  (counts above 5 warn: trusting that many hops is effectively
+  trusting everyone), `'true'` (all proxies, with a spoofing
+  warning), or a comma list of proxy IPs/CIDRs with validated octets
+  (0–255) and CIDR ranges (0–32 IPv4, 0–128 IPv6). A whitespace-only
+  value is REJECTED as invalid (it used to be treated as unset and
+  silently skipped the warning); `'false'` crashes Express and `'0'`
   silently pools every visitor under the proxy IP while skipping the
   warning — both are rejected with a clear message. `'true'`/`1`
   trust the leftmost `X-Forwarded-For` entry: if the VPS proxy
@@ -159,18 +219,28 @@ Notes:
   reports it and the orchestrator restarts).
 - **Swagger**: `/api/docs` is served only when `SWAGGER_ENABLED`
   allows it — on by default outside production, off in production
-  unless explicitly set to `'true'`.
+  unless explicitly set to `'true'`. An unrecognised `NODE_ENV`
+  (`staging`, `prod`, a typo like `prodution`) is treated as
+  production for this gate AND for plaintext OTP logging: docs stay
+  off and OTP codes stay out of the server log unless
+  `SWAGGER_ENABLED='true'` is set explicitly (and OTP logging
+  follows the same production-like rule). Only the three known
+  values (`development`, `test`, `production`) get dev behaviours;
+  anything else — including unset for the TZ guard — is fail-safe.
 - **Environment precedence** (P-S15): the image contains NO `.env`
   (the Dockerfile copies only `dist/`, `prisma/`, `.prisma`,
-  `package*.json`). Effective precedence is `environment:` >
-  `env_file:` > image `ENV` > `.env` file (dotenv never overwrites
-  already-set process env). Editing `.env` while the Compose file
-  also sets that variable under `environment:` silently loses — the
-  stale Compose value wins. The boot log prints the effective
-  non-secret configuration (NODE_ENV, TZ, CORS origins, SMTP host,
-  FCM, storage, TRUST_PROXY) — check it on every deploy; secrets
-  (JWT, SMTP creds, the DB password inside `DATABASE_URL`) are never
-  logged.
+  `package*.json`). Prod Compose declares NO `env_file:` at all —
+  its `environment:` values are interpolated from the project `.env`
+  / shell (`${VAR:-default}`, `${VAR:?…}`). So the effective rule
+  is: a variable set directly under `environment:` wins over any
+  project-`.env` edit, and the project `.env` only matters where a
+  Compose `environment:` entry interpolates it. Editing `.env`
+  while the Compose file also sets that variable under
+  `environment:` silently loses — the stale Compose value wins. The
+  boot log prints the effective non-secret configuration (NODE_ENV,
+  TZ, CORS origins, SMTP host, FCM, storage, TRUST_PROXY) — check it
+  on every deploy; secrets (JWT, SMTP creds, the DB password inside
+  `DATABASE_URL`) are never logged.
 
 ## 7. Production Compose (P-S14)
 
@@ -185,6 +255,43 @@ and unverifiable from this repo. Every API restart is full downtime
 (single container); a restart spanning a tick relies on the startup
 catch-ups (billing sweep + reminders + nightly-if-missed, all in
 `SchedulerService.onModuleInit`).
+
+**Production Compose rules (Round 5, R2):**
+
+- **Volume:** the prod `db` volume is `pgdata_prod`, deliberately
+  distinct from dev's `pgdata`. Sharing one named volume across
+  Compose files in the same directory (same default project name)
+  let a dev-initialised volume leak into prod: `POSTGRES_PASSWORD`
+  is ignored on an existing volume, so the prod password fails auth,
+  and dev/demo data appears in prod. An existing prod install that
+  already runs on `pgdata` must move its data deliberately (stop,
+  copy the volume, re-point) — never just rename and boot empty.
+- **`DATABASE_URL` must point at the Compose `db` service** (host
+  `db`, with the `POSTGRES_USER` / `POSTGRES_DB` credentials).
+  Nothing validates this: a `localhost:5432` (or stale-host) URL
+  runs `migrate deploy` and the app against the wrong database
+  while the healthcheck gate (which only waits on the local `db`)
+  passes. The Compose header states the rule; check the boot log's
+  effective config on every deploy.
+- **Healthcheck failure does NOT restart the container.** Docker
+  marks a container unhealthy but never restarts it on health
+  failure, so a pool-wedged API (health 503) stays up indefinitely
+  unless something external acts. Run an external watchdog or
+  alerting on the health endpoint (or an orchestrator restart
+  policy) — do not assume `restart: unless-stopped` recovers it.
+- **A failed migration restart-loops until resolved.** The image
+  CMD is `migrate deploy && node dist/main`: a failed migration
+  exits non-zero, `unless-stopped` restarts it, and `deploy` fails
+  again on the failed `_prisma_migrations` row until someone runs
+  `migrate resolve` manually (see §4). Alert on repeated migrate
+  failures; do not let the loop run silently.
+- **Seeding needs `ADMIN_PASSWORD` and, for S3, the S3 set.**
+  `ADMIN_EMAIL` alone seeds nothing (the admin block requires both
+  email and password, and now warns when the password is missing);
+  `STORAGE_DRIVER=s3` without `S3_BUCKET` / `S3_REGION` /
+  `S3_ENDPOINT` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` boots fine and
+  fails only at first upload — the boot guard now fails (or warns
+  outside production-like envs) when the S3 set is incomplete.
 
 ## 8. Backfills
 

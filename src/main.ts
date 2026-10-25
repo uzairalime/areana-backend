@@ -16,14 +16,29 @@ import { PrismaTimeoutFilter } from './common/prisma-timeout.filter';
 // explicitly wrong value is a deploy misconfiguration, not local
 // dev); WARN when it is unset or an explicit development/test.
 // Local dev (NODE_ENV unset, system TZ Asia/Karachi, CORS '*') keeps
-// booting — the guards bite on deploys, not on laptops.
+// booting for the CORS/SMTP guards — the guards bite on deploys,
+// not on laptops. EXCEPTION (Round 5, D5-B8): the TZ guard fails on
+// UNSET too, matching the docs/DEPLOY.md §6 table — a deploy that
+// drops NODE_ENV must not boot in UTC on warnings alone. The
+// his-Mac case still boots: the TZ check uses the EFFECTIVE zone
+// (TZ env, else the host system zone), so a Pakistan laptop with
+// NODE_ENV unset and system zone Asia/Karachi passes.
 const NODE_ENV = process.env.NODE_ENV;
 const KNOWN_ENVS = ['development', 'test', 'production'];
 const bootMustFail =
   NODE_ENV === 'production' || (NODE_ENV !== undefined && !KNOWN_ENVS.includes(NODE_ENV));
+// TZ (process + Postgres) fails on production, unset, or
+// unrecognised — the DEPLOY §6 table rule. CORS/SMTP keep the
+// narrower bootMustFail rule (warn on unset).
+const tzMustFail = NODE_ENV !== 'development' && NODE_ENV !== 'test';
 
 function bootGuard(message: string) {
   if (bootMustFail) throw new Error(`[BOOT] ${message}`);
+  console.warn(`[BOOT WARNING] ${message}`);
+}
+
+function tzGuard(message: string) {
+  if (tzMustFail) throw new Error(`[BOOT] ${message}`);
   console.warn(`[BOOT WARNING] ${message}`);
 }
 
@@ -43,7 +58,17 @@ function parseTrustProxy(raw: string): number | boolean | string {
   const v = raw.trim();
   if (/^\d+$/.test(v)) {
     const n = Number(v);
-    if (n >= 1) return n;
+    if (n >= 1) {
+      // Round 5, D5-S33: an unbounded hop count is 'true' with no
+      // warning — trusting 999 hops trusts every spoofed header.
+      // More than 5 hops is implausible for this deployment.
+      if (n > 5) {
+        console.warn(
+          `[BOOT WARNING] TRUST_PROXY=${n} trusts ${n} proxy hops — effectively trusting every X-Forwarded-For entry. Prefer TRUST_PROXY=1.`,
+        );
+      }
+      return n;
+    }
     throw new Error(
       '[BOOT] TRUST_PROXY=0 trusts no proxy — every visitor would share the proxy IP and pool rate limits. Set TRUST_PROXY=1 (one proxy hop) instead.',
     );
@@ -54,9 +79,34 @@ function parseTrustProxy(raw: string): number | boolean | string {
     );
     return true;
   }
-  const ipOrCidr = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$|^[0-9a-fA-F:]+(\/\d{1,3})?$/;
+  // Round 5, D5-S33: the old regex accepted values Express rejects
+  // at request time (octets like 999, CIDRs like /99) — boot passed,
+  // then proxy-addr 500'd every request. Validate exactly what
+  // Express accepts: IPv4 octets 0–255 with /0–32, IPv6 groups with
+  // /0–128.
+  const isIPv4 = (p: string): boolean => {
+    const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)(?:\/(\d+))?$/.exec(p);
+    if (!m) return false;
+    const octets = m.slice(1, 5).map(Number);
+    if (octets.some((o) => o < 0 || o > 255)) return false;
+    if (m[5] !== undefined) {
+      const cidr = Number(m[5]);
+      if (cidr < 0 || cidr > 32) return false;
+    }
+    return true;
+  };
+  const isIPv6 = (p: string): boolean => {
+    const m = /^([0-9a-fA-F:]+)(?:\/(\d+))?$/.exec(p);
+    if (!m || !m[1].includes(':')) return false;
+    if (!/^[0-9a-fA-F:]+$/.test(m[1])) return false;
+    if (m[2] !== undefined) {
+      const cidr = Number(m[2]);
+      if (cidr < 0 || cidr > 128) return false;
+    }
+    return true;
+  };
   const parts = v.split(',').map((p) => p.trim()).filter(Boolean);
-  if (parts.length > 0 && parts.every((p) => ipOrCidr.test(p))) return v;
+  if (parts.length > 0 && parts.every((p) => isIPv4(p) || isIPv6(p))) return v;
   throw new Error(
     `[BOOT] TRUST_PROXY=${raw} is not valid — use a hop count (1), 'true', or a comma list of proxy IPs/CIDRs. 'false' and '0' are rejected: the first crashes Express, the second silently pools all users under one IP.`,
   );
@@ -73,10 +123,10 @@ async function bootstrap() {
   // every play date, slot window, and billing boundary. The check uses
   // the EFFECTIVE timezone (TZ env, else the host's system zone via
   // Intl) so a laptop in Pakistan with TZ unset still passes, while a
-  // container in UTC fails — even when NODE_ENV is unset or wrong.
+  // container in UTC fails — including when NODE_ENV is unset (D5-B8).
   const effectiveTz = process.env.TZ ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   if (effectiveTz !== 'Asia/Karachi') {
-    bootGuard(
+    tzGuard(
       `TZ must be Asia/Karachi (effective: ${effectiveTz}) — all date math assumes Pakistan time.`,
     );
   }
@@ -110,6 +160,17 @@ async function bootstrap() {
         '[BOOT] SMTP_HOST must be set to a real SMTP host in production (got unset/localhost) — the Mailpit default would silently swallow OTP codes.',
       );
     }
+  } else {
+    // Round 5, D5-S30: the SMTP check used to live ONLY inside the
+    // fail branch, so unset NODE_ENV + forgotten SMTP_HOST booted
+    // with localhost:1025 and no SMTP warning at all (TZ/CORS both
+    // had else-warning branches). Warn here too.
+    const smtpHost = process.env.SMTP_HOST;
+    if (!smtpHost || smtpHost === 'localhost') {
+      console.warn(
+        '[BOOT WARNING] SMTP_HOST is unset/localhost — OTP codes go to Mailpit (localhost:1025) or nowhere. Set a real SMTP host for any deploy.',
+      );
+    }
   }
 
   // Behind a reverse proxy (production VPS: nginx/Caddy), Express must
@@ -119,14 +180,43 @@ async function bootstrap() {
   const trustProxy = process.env.TRUST_PROXY;
   if (trustProxy !== undefined && trustProxy.trim() !== '') {
     app.set('trust proxy', parseTrustProxy(trustProxy));
-  } else if (NODE_ENV === 'production') {
+  } else if (trustProxy !== undefined) {
+    // Round 5, D5-S32: a whitespace-only value is a typo'd blank, not
+    // "unset" — treating it as unset silently skipped the warning and
+    // pooled every visitor under the proxy IP. Reject it like any
+    // other invalid value.
+    throw new Error(
+      '[BOOT] TRUST_PROXY is blank — set TRUST_PROXY=1 (one proxy hop) or unset it entirely.',
+    );
+  } else if (bootMustFail) {
+    // Round 5, D5-S32: the unset warning used to fire only for exact
+    // NODE_ENV === 'production', so staging/unrecognised envs got no
+    // warning at all. Warn whenever boot must fail and no valid
+    // trust-proxy value was applied.
     // Without this, every visitor shares the proxy's IP and the
     // per-IP OTP caps + throttler pool across all users (audit A2).
     // Loud on purpose: this must be fixed in the deployment, not
     // discovered from a support ticket about OTP lockouts.
     console.warn(
-      '[BOOT WARNING] TRUST_PROXY is not set in production — rate limits and per-IP OTP caps will pool behind the reverse proxy. Set TRUST_PROXY=1.',
+      '[BOOT WARNING] TRUST_PROXY is not set — rate limits and per-IP OTP caps will pool behind the reverse proxy. Set TRUST_PROXY=1.',
     );
+  }
+
+  // Round 5, D5-S42 (code half): STORAGE_DRIVER=s3 is an accepted
+  // value, but without the S3 set the app boots fine and fails only
+  // at first upload. Fail on production-like envs, warn otherwise.
+  if (config.get('storage.driver') === 's3') {
+    const s3 = config.get('storage.s3') as Record<string, string | undefined>;
+    const missing = ['bucket', 'region', 'endpoint', 'accessKey', 'secretKey'].filter(
+      (k) => !s3[k],
+    );
+    if (missing.length > 0) {
+      const msg =
+        `STORAGE_DRIVER=s3 but S3_${missing.map((k) => k.toUpperCase()).join(', S3_')} missing — uploads will fail. ` +
+        'Set the full S3 set or use STORAGE_DRIVER=local.';
+      if (bootMustFail) throw new Error(`[BOOT] ${msg}`);
+      console.warn(`[BOOT WARNING] ${msg}`);
+    }
   }
 
   // Round 4, P-S15: log the effective (non-secret) configuration at
@@ -154,7 +244,7 @@ async function bootstrap() {
     const rows = await prisma.$queryRaw<{ TimeZone: string }[]>`SHOW timezone`;
     const dbTz = rows[0]?.TimeZone;
     if (dbTz && dbTz !== 'Asia/Karachi') {
-      bootGuard(
+      tzGuard(
         `Postgres timezone is ${dbTz}, not Asia/Karachi — @db.Date play-date handling diverges from the configuration the audits verified. ` +
           `Fix with ALTER DATABASE ... SET timezone = 'Asia/Karachi' (then reconnect) or re-initialise the pgdata volume.`,
       );

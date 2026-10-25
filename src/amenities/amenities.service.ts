@@ -66,23 +66,29 @@ export class AmenitiesService {
     if (dto.sortOrder !== undefined) data.sortOrder = dto.sortOrder;
     if (dto.isActive !== undefined) data.isActive = dto.isActive;
     const renamed = data.name !== undefined && data.name !== amenity.name;
-    const updated = await this.prisma.amenity.update({ where: { id }, data });
     if (renamed) {
-      // Cascade the rename into every venue's amenity list.
+      // Round 5, D5-S52 (amenities equivalent): the rename used to
+      // run as a bare update followed by a per-venue loop with no
+      // transaction — a crash mid-rename left some venues on the old
+      // name. One transaction now, so the rename is atomic.
       const oldName = amenity.name;
       const newName = data.name as string;
-      const venues = await this.prisma.venue.findMany({
-        where: { amenities: { has: oldName } },
-        select: { id: true, amenities: true },
-      });
-      for (const v of venues) {
-        await this.prisma.venue.update({
-          where: { id: v.id },
-          data: { amenities: v.amenities.map((a) => (a === oldName ? newName : a)) },
+      return this.prisma.$transaction(async (tx) => {
+        const updated = await tx.amenity.update({ where: { id }, data });
+        const venues = await tx.venue.findMany({
+          where: { amenities: { has: oldName } },
+          select: { id: true, amenities: true },
         });
-      }
+        for (const v of venues) {
+          await tx.venue.update({
+            where: { id: v.id },
+            data: { amenities: v.amenities.map((a) => (a === oldName ? newName : a)) },
+          });
+        }
+        return updated;
+      });
     }
-    return updated;
+    return this.prisma.amenity.update({ where: { id }, data });
   }
 
   async remove(id: string) {

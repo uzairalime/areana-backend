@@ -58,7 +58,7 @@ CREATE TEMP TABLE bf_court_dups ON COMMIT DROP AS
 SELECT
   "id", "venueId", "name",
   ROW_NUMBER() OVER (
-    PARTITION BY "venueId", lower(btrim("name")) ORDER BY "createdAt" ASC
+    PARTITION BY "venueId", lower(btrim("name")) ORDER BY "createdAt" ASC, "id" ASC
   ) AS rn
 FROM "Court"
 WHERE ("venueId", lower(btrim("name"))) IN (
@@ -68,44 +68,62 @@ WHERE ("venueId", lower(btrim("name"))) IN (
 
 -- Rename every non-keeper (rn > 1) to "<trimmed name> (dup <rn>)",
 -- unless that target already exists in the venue (then skip — the
--- final report lists it for manual resolution).
-UPDATE "Court" c
-SET "name" = btrim(c."name") || ' (dup ' || d.rn || ')'
-FROM bf_court_dups d
-WHERE c."id" = d."id" AND d.rn > 1
-  AND NOT EXISTS (
-    SELECT 1 FROM "Court" x
-    WHERE x."venueId" = c."venueId"
-      AND lower(btrim(x."name")) = lower(btrim(c."name") || ' (dup ' || d.rn || ')')
-  );
+-- final report lists it for manual resolution). Renamed ids are
+-- captured in bf_court_renamed FIRST (Round 5, D5-S7): the old audit
+-- filtered on names LIKE '% (dup %)' AFTER the rename, so a skipped
+-- rename whose original name already contained "(dup …)" got a
+-- FALSE "renamed" audit row, and that consumed audit id then
+-- suppressed the TRUE audit row if the court was later really
+-- renamed (ON CONFLICT DO NOTHING). The audit below reads only
+-- from the actually-renamed set (rows the UPDATE touched with a
+-- changed value), so neither failure can recur.
+CREATE TEMP TABLE bf_court_renamed ON COMMIT DROP AS
+WITH renamed AS (
+  UPDATE "Court" c
+  SET "name" = btrim(c."name") || ' (dup ' || d.rn || ')'
+  FROM bf_court_dups d
+  WHERE c."id" = d."id" AND d.rn > 1
+    AND c."name" IS DISTINCT FROM btrim(c."name") || ' (dup ' || d.rn || ')'
+    AND NOT EXISTS (
+      SELECT 1 FROM "Court" x
+      WHERE x."venueId" = c."venueId"
+        AND lower(btrim(x."name")) = lower(btrim(c."name") || ' (dup ' || d.rn || ')')
+    )
+  RETURNING c."id" AS "id", c."name" AS new_name
+)
+SELECT r."id", d."name" AS old_name, r.new_name, d."venueId"
+FROM renamed r JOIN bf_court_dups d ON d."id" = r."id";
 
 INSERT INTO "AuditLog" ("id", "actorId", "action", "entity", "entityId", "details", "createdAt")
 SELECT
-  'bf-dedupe-court-' || d."id",
-  NULL, 'court.renamed.duplicate', 'court', d."id",
-  'Round-4 backfill: renamed duplicate court "' || d."name" || '" (venue ' || d."venueId" || ') to resolve a name collision',
+  'bf-dedupe-court-' || r."id",
+  NULL, 'court.renamed.duplicate', 'court', r."id",
+  'Round-4 backfill: renamed duplicate court "' || r.old_name || '" (venue ' || r."venueId" || ') to "' || r.new_name || '" to resolve a name collision',
   now()
-FROM bf_court_dups d
-WHERE d.rn > 1
-  AND EXISTS (SELECT 1 FROM "Court" c WHERE c."id" = d."id" AND c."name" LIKE '% (dup %)')
+FROM bf_court_renamed r
 ON CONFLICT ("id") DO NOTHING;
 
 -- STEP 2 — roles: rank duplicates. System roles group by trimmed-lower
 -- name; owner roles group by (owner, trimmed-lower name). Keeper = the
 -- row whose name is already canonical (exact lowercase, trimmed) if
--- one exists, else the earliest created.
+-- one exists, else the earliest created — with "id" as the final
+-- tie-break (Round 5, D5-S8): two case-variant roles created in the
+-- same seeding millisecond used to tie on createdAt, making the
+-- keeper (and therefore which permission set all merged users ended
+-- up with) arbitrary. The discarded permission sets are recorded in
+-- the audit details below, so the merge is reconstructable.
 CREATE TEMP TABLE bf_role_dups ON COMMIT DROP AS
 SELECT
-  "id", "ownerId", "name",
+  "id", "ownerId", "name", "permissions",
   ROW_NUMBER() OVER (
     PARTITION BY "ownerId", lower(btrim("name"))
     ORDER BY CASE WHEN "name" = lower(btrim("name")) THEN 0 ELSE 1 END,
-             "createdAt" ASC
+             "createdAt" ASC, "id" ASC
   ) AS rn,
   FIRST_VALUE("id") OVER (
     PARTITION BY "ownerId", lower(btrim("name"))
     ORDER BY CASE WHEN "name" = lower(btrim("name")) THEN 0 ELSE 1 END,
-             "createdAt" ASC
+             "createdAt" ASC, "id" ASC
   ) AS keeper_id
 FROM "Role"
 WHERE ("ownerId", lower(btrim("name"))) IN (
@@ -153,10 +171,14 @@ INSERT INTO "AuditLog" ("id", "actorId", "action", "entity", "entityId", "detail
 SELECT
   'bf-dedupe-role-' || d."id",
   NULL, 'role.merged.duplicate', 'role', d.keeper_id,
-  'Round-4 backfill: merged duplicate role "' || d."name" || '" into keeper ' || d.keeper_id || ' (users + allowed venues re-pointed)',
+  'Round-4 backfill: merged duplicate role "' || d."name" || '" (permissions ' || (d."permissions")::text || ') into keeper ' || d.keeper_id || ' (permissions ' || (k."permissions")::text || '; users + allowed venues re-pointed)',
   now()
 FROM bf_role_dups d
+JOIN bf_role_dups k ON k."id" = d.keeper_id
 WHERE d.rn > 1
+  -- Only duplicates actually deleted above (the DELETE re-verifies
+  -- emptiness; a row that survived it must not get a "merged" audit).
+  AND NOT EXISTS (SELECT 1 FROM "Role" r WHERE r."id" = d."id")
 ON CONFLICT ("id") DO NOTHING;
 
 COMMIT;

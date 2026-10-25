@@ -112,8 +112,15 @@ export class CourtsService {
   /** Price windows (peak/off-peak rates) applying on a given date. */
   async priceWindowsForDate(courtId: string, date: Date, tx?: Prisma.TransactionClient) {
     const db = tx ?? this.prisma;
+    // Round 5, D5-B9 (lookup half): overlapping windows can still be
+    // created concurrently (creation serialisation lives in the
+    // price-window create path), so the lookup MUST be deterministic
+    // — an unordered findMany priced an overlapped slot by whichever
+    // window Postgres returned first. Earliest-created wins, with id
+    // as the tie-break: the same overlap always prices the same way.
     const rows = await db.courtPriceWindow.findMany({
       where: { courtId },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
     const weekday = date.getDay();
     const dayStr = toYmd(date);
@@ -144,6 +151,8 @@ export class CourtsService {
   /**
    * The Rs/hour rate for a slot starting at `startMinutes`: the price
    * window covering the slot start, else the court's base rate.
+   * Windows arrive in createdAt order (see priceWindowsForDate), so
+   * on an overlap the earliest-created window wins deterministically.
    */
   priceRateForSlot(
     windows: { startMinutes: number; endMinutes: number; pricePerHour: unknown }[],

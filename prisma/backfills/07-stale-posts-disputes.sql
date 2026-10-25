@@ -43,19 +43,50 @@ WHERE "bookingId" IS NULL AND "status" = 'open';
 
 BEGIN;
 
+-- Snapshot both affected sets FIRST (temp tables, transaction-local),
+-- so the audit rows below list exactly what this run changed with
+-- its prior status (Round 5, D5-S14: the old script closed posts
+-- and dismissed disputes with ZERO audit rows, so the header's
+-- "can be re-opened by an admin" rollback for posts was unusable —
+-- there was no durable list of which posts were closed).
+CREATE TEMP TABLE bf_07_posts ON COMMIT DROP AS
+SELECT gp."id", gp."status" AS old_status
+FROM "GamePost" gp JOIN "Booking" b ON b."id" = gp."bookingId"
+WHERE gp."status" IN ('open', 'full') AND b."status" = 'cancelled';
+CREATE TEMP TABLE bf_07_disputes ON COMMIT DROP AS
+SELECT "id", "status" AS old_status
+FROM "Dispute"
+WHERE "bookingId" IS NULL AND "status" = 'open';
+
 -- STEP 1 — close stale posts.
 UPDATE "GamePost" gp
 SET "status" = 'closed'
-FROM "Booking" b
-WHERE gp."bookingId" = b."id"
-  AND gp."status" IN ('open', 'full')
-  AND b."status" = 'cancelled';
+WHERE gp."id" IN (SELECT "id" FROM bf_07_posts);
 
 -- STEP 2 — dismiss null-booking disputes (dismiss-only path).
 UPDATE "Dispute"
 SET "status" = 'dismissed',
     "resolution" = 'Bulk-dismissed by Round-4 backfill: no booking attached, so no-show cannot be confirmed.',
     "resolvedAt" = now()
-WHERE "bookingId" IS NULL AND "status" = 'open';
+WHERE "id" IN (SELECT "id" FROM bf_07_disputes);
+
+-- STEP 3 — audit rows (one per closed post / dismissed dispute, with
+-- the prior status, inside the same transaction).
+INSERT INTO "AuditLog" ("id", "actorId", "action", "entity", "entityId", "details", "createdAt")
+SELECT
+  'bf-stale-post-' || p."id",
+  NULL, 'game_post.closed.stale_booking', 'game_post', p."id",
+  'Round-4 backfill: closed game post (was ' || p.old_status || ') whose booking is cancelled — re-openable by an admin if the booking is ever reinstated',
+  now()
+FROM bf_07_posts p
+ON CONFLICT ("id") DO NOTHING;
+INSERT INTO "AuditLog" ("id", "actorId", "action", "entity", "entityId", "details", "createdAt")
+SELECT
+  'bf-null-dispute-' || d."id",
+  NULL, 'dispute.dismissed.no_booking', 'dispute', d."id",
+  'Round-4 backfill: bulk-dismissed open dispute with no booking attached (was ' || d.old_status || ') — no-show cannot be confirmed without a booking',
+  now()
+FROM bf_07_disputes d
+ON CONFLICT ("id") DO NOTHING;
 
 COMMIT;

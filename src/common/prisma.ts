@@ -12,12 +12,24 @@ import { PrismaClient } from '@prisma/client';
  * the long-lock paths (court delete, venue cascade claim, billing
  * sweep claim) — a pool-wide SET would not stick across pooled
  * connections, so it is set where the lock is actually held.
+ *
+ * Round 5, D5-S41: connection_limit 10 → 25. Ten connections turned
+ * ordinary load into 503s: an 11th concurrent slow query (slot
+ * search, analytics) waited out the 10s pool_timeout and died as
+ * P2028. Twenty-five still fits a small VPS Postgres (default
+ * max_connections 100) with headroom for migrations/seeds, while
+ * the unchanged 10s pool_timeout keeps overload failing fast with
+ * an honest 503 instead of hanging. No pool-wide statement_timeout
+ * is set via the URL: Prisma only honours its own pool params there,
+ * so arbitrary libpq params are not a reliable timeout mechanism —
+ * single queries stay unbounded outside the SET LOCAL paths, and
+ * the P2028 → 503 filter keeps that failure honest.
  */
 function withPoolDefaults(url: string | undefined): string | undefined {
   if (!url) return url;
   try {
     const u = new URL(url);
-    if (!u.searchParams.has('connection_limit')) u.searchParams.set('connection_limit', '10');
+    if (!u.searchParams.has('connection_limit')) u.searchParams.set('connection_limit', '25');
     if (!u.searchParams.has('pool_timeout')) u.searchParams.set('pool_timeout', '10');
     return u.toString();
   } catch {

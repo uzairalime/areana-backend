@@ -33,8 +33,9 @@ WHERE a."action" = 'venue.billing.auto_settled'
 GROUP BY a."entityId", v."name", v."status", v."billingPaused"
 ORDER BY first_settled_at;
 
--- Cancelled bookings at those venues, between the pause and the
--- settle (the bookings the operator must re-book/notify manually).
+-- Cancelled bookings at those venues (all cancelled bookings at the
+-- venue — the operator filters to the pause window by booking date;
+-- there is no cancelled-at column to scope this precisely).
 SELECT b."id" AS booking_id, b."venueId", b."userId", u."email" AS player_email,
        b."date", b."startMinutes", b."endMinutes", b."status"
 FROM "Booking" b
@@ -50,3 +51,42 @@ WHERE b."status" = 'cancelled'
     WHERE a."action" = 'venue.billing.auto_settled'
   )
 ORDER BY b."venueId", b."date";
+
+-- Venues whose Venue.updatedAt falls between their sweep pause and
+-- their auto-settle (Round 5, D5-S18: the stated proxy for "the
+-- window did something" — a venue row touched mid-window, e.g. a
+-- plan change or manual edit during the pause, that the settle
+-- then papered over without comment).
+SELECT DISTINCT a."entityId" AS venue_id, v."name" AS venue_name,
+       p."createdAt" AS paused_at, a."createdAt" AS settled_at,
+       v."updatedAt" AS venue_updated_at
+FROM "AuditLog" a
+JOIN "AuditLog" p
+  ON p."entityId" = a."entityId"
+ AND p."action" = 'venue.billing.paused'
+ AND p."createdAt" < a."createdAt"
+JOIN "Venue" v ON v."id" = a."entityId"
+WHERE a."action" = 'venue.billing.auto_settled'
+  AND v."updatedAt" > p."createdAt"
+  AND v."updatedAt" < a."createdAt"
+ORDER BY a."createdAt";
+
+-- Venues paused by the sweep with NO later auto-settle (Round 5,
+-- D5-S19): still paused today, the set an operator needs to chase
+-- (payment, write-off, or manual resume). The old report required
+-- a settle row, so these never appeared at all.
+SELECT DISTINCT p."entityId" AS venue_id, v."name" AS venue_name,
+       MAX(p."createdAt") AS latest_paused_at,
+       v."billingPaidUntil" AS paid_until_now
+FROM "AuditLog" p
+JOIN "Venue" v ON v."id" = p."entityId"
+WHERE p."action" = 'venue.billing.paused'
+  AND v."billingPaused" = true
+  AND NOT EXISTS (
+    SELECT 1 FROM "AuditLog" a2
+    WHERE a2."entityId" = p."entityId"
+      AND a2."action" = 'venue.billing.auto_settled'
+      AND a2."createdAt" > p."createdAt"
+  )
+GROUP BY p."entityId", v."name", v."billingPaidUntil"
+ORDER BY latest_paused_at;

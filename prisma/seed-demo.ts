@@ -32,14 +32,16 @@ function daysFromNow(days: number): Date {
   d.setDate(d.getDate() + days);
   return d;
 }
-function monthsFromNow(months: number): Date {
-  const d = new Date();
-  d.setMonth(d.getMonth() + months);
-  return d;
-}
 // Clamped month arithmetic (mirrors src/common/date.util addMonths):
 // setMonth alone rolls Jan 31 + 1mo to Mar 3; clamping to the target
 // month's last day keeps billing periods exactly 12 months long.
+// Round 5, D5-S24: monthsFromNow used to be the RAW unclamped
+// setMonth — an Aug-31 run rolled billingPaidUntil Jun 31 → Jul 1,
+// 2027, while the context period is Jun 30, 2026–Jun 30, 2027, so
+// the seeded ledger row matched neither context boundary (and
+// void-then-re-mark missed the original amount on a repriced plan).
+// There is no unclamped month helper left: every month offset goes
+// through addMonths, so first runs cannot drift either.
 function addMonths(d: Date, months: number): Date {
   const day = d.getDate();
   const out = new Date(d);
@@ -157,9 +159,9 @@ async function main() {
       venueName: 'Demo Active Arena',
       planId: premium.id,
       status: VenueStatus.approved,
-      billingStartAt: monthsFromNow(-5),
+      billingStartAt: addMonths(new Date(), -5),
       // First paid period runs from freeUntil (start + 3mo) for a year.
-      billingPaidUntil: monthsFromNow(10),
+      billingPaidUntil: addMonths(new Date(), 10),
     },
     {
       label: 'Payment due (Basic, in grace)',
@@ -173,7 +175,7 @@ async function main() {
       venueName: 'Demo Overdue Arena',
       planId: basic.id,
       status: VenueStatus.approved,
-      billingStartAt: monthsFromNow(-4),
+      billingStartAt: addMonths(new Date(), -4),
       billingPaused: true,
     },
     {
@@ -204,7 +206,18 @@ async function main() {
     const s = scenarios[i];
     const ownerEmail = `demo.owner${i + 1}@demo.areana.pk`;
     let owner = await prisma.user.findUnique({ where: { email: ownerEmail } });
-    if (!owner) {
+    if (owner) {
+      // Round 5, D5-S26: a real player who registered a demo email
+      // via OTP before the seed ran used to be silently adopted as
+      // a demo owner — venues attached to a player-role user, panel
+      // login 403ing, while the script printed the owner login.
+      // Never adopt: abort loudly instead.
+      if (owner.roleId !== ownerRole.id || owner.status !== 'active') {
+        throw new Error(
+          `Refusing to adopt ${ownerEmail} as a demo owner: existing account holds role ${owner.roleId} / status ${owner.status} (expected the system owner role, active). Re-point or delete that account, then re-run the seed.`,
+        );
+      }
+    } else {
       owner = await prisma.user.create({
         data: {
           email: ownerEmail,
@@ -311,6 +324,15 @@ async function main() {
   for (const s of signups) {
     const exists = await prisma.user.findUnique({ where: { email: s.email } });
     if (exists) {
+      // Round 5, D5-S26 (same shape as scenario owners): a real
+      // user holding a demo.signup email must never get the demo
+      // avatar backfilled onto their account — skip them entirely.
+      if (exists.roleId !== ownerRole.id) {
+        console.warn(
+          `Skipping demo signup ${s.email}: existing account does not hold the owner role — refusing to adopt it.`,
+        );
+        continue;
+      }
       // Backfill the portrait for signups seeded before avatarUrl existed.
       if (!exists.avatarUrl) {
         await prisma.user.update({
@@ -399,11 +421,23 @@ async function main() {
   }
 
   // A second pending arena (Karachi) so the approvals grid shows variety.
-  const coastalOwner = await prisma.user.findUnique({
+  // Round 5, D5-S23: the whole Coastal block used to be gated on
+  // `if (!coastalOwner)` — owner and venue created inside one
+  // branch — so a crash after the owner insert but before the venue
+  // insert skipped the venue FOREVER on every re-run. Split into
+  // the same owner-then-venue lookups as the scenarios, so a partial
+  // run is repaired by re-running.
+  let coastalOwner = await prisma.user.findUnique({
     where: { email: 'demo.owner8@demo.areana.pk' },
   });
-  if (!coastalOwner) {
-    const owner8 = await prisma.user.create({
+  if (coastalOwner) {
+    if (coastalOwner.roleId !== ownerRole.id || coastalOwner.status !== 'active') {
+      throw new Error(
+        `Refusing to adopt demo.owner8@demo.areana.pk as a demo owner: existing account holds role ${coastalOwner.roleId} / status ${coastalOwner.status} (expected the system owner role, active).`,
+      );
+    }
+  } else {
+    coastalOwner = await prisma.user.create({
       data: {
         email: 'demo.owner8@demo.areana.pk',
         name: 'Demo Owner 8',
@@ -413,10 +447,15 @@ async function main() {
         status: 'active',
       },
     });
+  }
+  let venue8 = await prisma.venue.findFirst({
+    where: { ownerId: coastalOwner.id, name: 'Demo Coastal Arena' },
+  });
+  if (!venue8) {
     const coastalGallery = demoPhotos('coastal', ['Football', 'Cricket']);
-    const venue8 = await prisma.venue.create({
+    venue8 = await prisma.venue.create({
       data: {
-        ownerId: owner8.id,
+        ownerId: coastalOwner.id,
         name: 'Demo Coastal Arena',
         address: '14 Sea View Road, Clifton Block 4',
         city: 'Karachi',
@@ -431,16 +470,19 @@ async function main() {
         planId: null,
       },
     });
-    if (arenaRoles.length > 0) {
-      await prisma.venueAllowedRole.createMany({
-        data: arenaRoles.map((r) => ({ venueId: venue8.id, roleId: r.id })),
-        skipDuplicates: true,
-      });
-    }
-    for (const c of COURTS) {
-      await prisma.court.create({ data: { venueId: venue8.id, ...c } });
-    }
     console.log('✓ Pending approval (Karachi): Demo Coastal Arena (owner demo.owner8@demo.areana.pk)');
+  }
+  if (arenaRoles.length > 0) {
+    await prisma.venueAllowedRole.createMany({
+      data: arenaRoles.map((r) => ({ venueId: venue8.id, roleId: r.id })),
+      skipDuplicates: true,
+    });
+  }
+  for (const c of COURTS) {
+    const exists = await prisma.court.findFirst({
+      where: { venueId: venue8.id, name: c.name },
+    });
+    if (!exists) await prisma.court.create({ data: { venueId: venue8.id, ...c } });
   }
 
   // ------------------------------------------------------------------
@@ -469,10 +511,21 @@ async function main() {
     ];
     const players = [];
     for (const p of demoPlayers) {
-      const player = await prisma.user.upsert({
-        where: { email: p.email },
-        update: {},
-        create: { ...p, roleId: playerRole.id, status: 'active' },
+      // Round 5, D5-S26 (same shape as scenario owners): never
+      // silently adopt a real user holding a demo.player email —
+      // disputes would attach to a real account. Abort loudly.
+      const existingPlayer = await prisma.user.findUnique({ where: { email: p.email } });
+      if (existingPlayer) {
+        if (existingPlayer.roleId !== playerRole.id) {
+          throw new Error(
+            `Refusing to adopt ${p.email} as a demo player: existing account holds role ${existingPlayer.roleId} (expected the system player role).`,
+          );
+        }
+        players.push(existingPlayer);
+        continue;
+      }
+      const player = await prisma.user.create({
+        data: { ...p, roleId: playerRole.id, status: 'active' },
       });
       players.push(player);
     }
@@ -578,39 +631,49 @@ async function main() {
         console.log(`Skipping dispute demo ${i + 1}: ${spec.venueName} (or a court) not found.`);
         continue;
       }
-      const booking = await prisma.booking.create({
-        data: {
-          userId: players[spec.player].id,
-          venueId: venue.id,
-          courtId: court.id,
-          date: daysFromNow(-spec.bookingDaysAgo),
-          startMinutes: spec.startMinutes,
-          endMinutes: spec.startMinutes + 60,
-          totalPrice: court.pricePerHour,
-          status: spec.bookingStatus,
-          checkInCode,
-          checkedInAt:
-            spec.bookingStatus === BookingStatus.completed
-              ? hoursAgo(spec.createdHoursAgo + 3)
-              : null,
-          createdAt: hoursAgo(spec.createdHoursAgo + 3),
-        },
-      });
-      await prisma.dispute.create({
-        data: {
-          bookingId: booking.id,
-          raisedById: players[spec.player].id,
-          reason: spec.reason,
-          status: spec.disputeStatus,
-          resolution: spec.disputeStatus === 'open' ? null : (spec.resolution ?? null),
-          resolvedById:
-            spec.disputeStatus === 'open' ? null : (superAdminUser?.id ?? null),
-          resolvedAt:
-            spec.disputeStatus === 'open'
-              ? null
-              : hoursAgo(spec.resolvedHoursAgo ?? spec.createdHoursAgo - 24),
-          createdAt: hoursAgo(spec.createdHoursAgo),
-        },
+      const booking = await prisma.$transaction(async (tx) => {
+        // Round 5, D5-S22: booking and dispute used to be separate
+        // awaits with the skip keyed on the booking — a crash after
+        // the booking insert but before the dispute insert meant
+        // every re-run saw the booking and skipped the dispute
+        // FOREVER, while output still ended "Demo seed complete".
+        // One transaction now: either both rows exist or neither
+        // does, so the booking-keyed skip can never lose a dispute.
+        const b = await tx.booking.create({
+          data: {
+            userId: players[spec.player].id,
+            venueId: venue.id,
+            courtId: court.id,
+            date: daysFromNow(-spec.bookingDaysAgo),
+            startMinutes: spec.startMinutes,
+            endMinutes: spec.startMinutes + 60,
+            totalPrice: court.pricePerHour,
+            status: spec.bookingStatus,
+            checkInCode,
+            checkedInAt:
+              spec.bookingStatus === BookingStatus.completed
+                ? hoursAgo(spec.createdHoursAgo + 3)
+                : null,
+            createdAt: hoursAgo(spec.createdHoursAgo + 3),
+          },
+        });
+        await tx.dispute.create({
+          data: {
+            bookingId: b.id,
+            raisedById: players[spec.player].id,
+            reason: spec.reason,
+            status: spec.disputeStatus,
+            resolution: spec.disputeStatus === 'open' ? null : (spec.resolution ?? null),
+            resolvedById:
+              spec.disputeStatus === 'open' ? null : (superAdminUser?.id ?? null),
+            resolvedAt:
+              spec.disputeStatus === 'open'
+                ? null
+                : hoursAgo(spec.resolvedHoursAgo ?? spec.createdHoursAgo - 24),
+            createdAt: hoursAgo(spec.createdHoursAgo),
+          },
+        });
+        return b;
       });
       console.log(
         `✓ Dispute (${spec.disputeStatus}): ${players[spec.player].name} @ ${spec.venueName}`,
