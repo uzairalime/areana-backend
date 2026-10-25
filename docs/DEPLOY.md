@@ -7,7 +7,7 @@ recovered with `--rolled-back`, never blind `--applied`.**
 
 ## 1. Fresh database (first install)
 
-`prisma/migrations/` holds only hand-written folders — 10 of them, and
+`prisma/migrations/` holds only hand-written folders — 12 of them, and
 it is NOT a full baseline: `migrate deploy` on an empty database
 creates only those objects and the API then crashes on first query
 (every other table missing).
@@ -24,6 +24,8 @@ creates only those objects and the API then crashes on first query
 | `20261025140000_round4_r5b_broadcast_counts` | Columns `Broadcast.delivered`, `Broadcast.failed` | YES — declared in `schema.prisma` |
 | `20261025143000_round5_r1_refresh_replaced_by` | Column `RefreshSession.replacedById` | YES — declared in `schema.prisma` |
 | `20261025170000_round5_r3_schema` | Columns `Broadcast.countsReliable`, `BookingParticipant.userId`, `Venue.freeUntilOverridePrev`; partial unique indexes `BookingParticipant_booking_phone_key` (`bookingId`, `phone` WHERE `phone` IS NOT NULL) and `RescheduleRequest_booking_pending_key` (`bookingId` WHERE `status = 'pending'`); CHECK `VenuePayment_void_note_not_null` (`method <> 'void' OR note IS NOT NULL`, NOT VALID) | PARTIAL — the 3 columns YES (declared in `schema.prisma`); the 2 indexes + CHECK NO (raw SQL, no Prisma declaration) |
+| `20261025180000_round5_r5_review_reply_history` | Column `Review.ownerReplyHistory` | YES — declared in `schema.prisma` |
+| `20261025190000_reaudit_schema_drift` | Columns `Venue.createdById`, `Venue.frozenPlanId`; `Dispute.bookingId` + `AuditLog.actorId` nullable with `ON DELETE SET NULL` FKs (re-created) | YES — declared in `schema.prisma` |
 
 **Fresh-install path (until a real baseline migration is committed):**
 
@@ -39,6 +41,8 @@ npx prisma migrate resolve --applied 20261025123000_round4_r2_court_weekly_hours
 npx prisma migrate resolve --applied 20261025123200_round4_r2_waitlist_slot_minutes
 npx prisma migrate resolve --applied 20261025140000_round4_r5b_broadcast_counts
 npx prisma migrate resolve --applied 20261025143000_round5_r1_refresh_replaced_by
+npx prisma migrate resolve --applied 20261025180000_round5_r5_review_reply_history
+npx prisma migrate resolve --applied 20261025190000_reaudit_schema_drift
 # 3. For the objects `db push` did NOT create (the 4 partial/unique
 #    indexes above, plus the 2 indexes + CHECK in
 #    20261025170000_round5_r3_schema): do NOT resolve them — let
