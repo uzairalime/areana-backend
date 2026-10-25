@@ -21,4 +21,10 @@ export class ReviewsController {
   listByVenue(@Param('id') id: string, @Query() query: CursorQueryDto) {
     return this.reviews.listByVenue(id, query.cursor, query.limit);
   }
+
+  @Public()
+  @Get('courts/:courtId/reviews')
+  listByCourt(@Param('courtId') courtId: string, @Query() query: CursorQueryDto) {
+    return this.reviews.listByCourt(courtId, query.cursor, query.limit);
+  }
 }

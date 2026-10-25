@@ -84,6 +84,27 @@ export class ReviewsService {
     return cursorPage(rows, limit, undefined, total);
   }
 
+  /**
+   * A court's own reviews: reviews carry no court column (one review
+   * per completed booking), but every review's booking names its court,
+   * so the court list filters through the booking — same shape and
+   * paging as the venue list, no migration needed.
+   */
+  async listByCourt(courtId: string, cursor?: string, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 20);
+    const where = { booking: { courtId } };
+    const [total, rows] = await Promise.all([
+      this.prisma.review.count({ where }),
+      this.prisma.review.findMany({
+        where: { ...where, ...keysetWhere(cursor, 'createdAt', 'desc') },
+        include: { user: { select: { name: true } } },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit + 1,
+      }),
+    ]);
+    return cursorPage(rows, limit, undefined, total);
+  }
+
   /** Called by the owner module (ownership is verified there). */
   async replyToReview(reviewId: string, reply: string) {
     const review = await this.prisma.review.findUnique({
