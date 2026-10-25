@@ -30,9 +30,10 @@
  *   a NOTE: as a deploy gate, exit 0 there would green-light a
  *   `migrate deploy` that immediately fails with "relation already
  *   exists". Resolve first (docs/DEPLOY.md §3), then re-run.
- * - All 9 hand-written migration folders are covered, including the
- *   4 column-adding Round-4/5 migrations (checked against
- *   information_schema.columns) and the Round-5 refresh migration.
+ * - All 10 hand-written migration folders are covered, including the
+ *   column-adding Round-4/5 migrations (checked against
+ *   information_schema.columns) and the Round-5 refresh + R3 schema
+ *   migrations.
  */
 const fs = require('fs');
 const path = require('path');
@@ -165,17 +166,29 @@ async function main() {
     // object WITHOUT a row is the db-push case (§3) — and is
     // BLOCKING here: as a deploy gate it must not exit 0, or the
     // next `migrate deploy` fails with "relation already exists".
+    // Round 5, D5-S2: index verification reads the PREDICATE and
+    // expression via pg_get_expr directly (pg_index.indpred /
+    // indprs), not just the index name — a hand-applied index with
+    // the right name but the wrong predicate must NOT pass.
     const indexRows = await prisma.$queryRaw`
-      SELECT indexname AS name, indexdef AS def FROM pg_indexes
-      WHERE indexname IN ('Role_system_name_key', 'Role_system_name_ci_key',
-        'Court_venue_name_ci_key', 'VenuePayment_void_note_key')`;
-    const indexDefs = new Map(indexRows.map((r) => [r.name, normDef(r.def)]));
+      SELECT c.relname AS name,
+             pg_get_expr(i.indexprs, i.indrelid) AS expr,
+             pg_get_expr(i.indpred, i.indrelid) AS pred
+      FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+      WHERE c.relname IN ('Role_system_name_key', 'Role_system_name_ci_key',
+        'Court_venue_name_ci_key', 'VenuePayment_void_note_key',
+        'BookingParticipant_booking_phone_key', 'RescheduleRequest_booking_pending_key')`;
+    const indexDefs = new Map(
+      indexRows.map((r) => [r.name, normDef(`${r.expr ?? ''} ${r.pred ?? ''}`)]),
+    );
     const columnRows = await prisma.$queryRaw`
       SELECT table_name AS t, column_name AS c FROM information_schema.columns
       WHERE (table_name = 'Court' AND column_name = 'weeklyHoursVersion')
          OR (table_name = 'SlotWaitlist' AND column_name = 'slotMinutes')
-         OR (table_name = 'Broadcast' AND column_name IN ('delivered', 'failed'))
-         OR (table_name = 'RefreshSession' AND column_name = 'replacedById')`;
+         OR (table_name = 'Broadcast' AND column_name IN ('delivered', 'failed', 'countsReliable'))
+         OR (table_name = 'RefreshSession' AND column_name = 'replacedById')
+         OR (table_name = 'BookingParticipant' AND column_name = 'userId')
+         OR (table_name = 'Venue' AND column_name = 'freeUntilOverridePrev')`;
     const columns = new Set(columnRows.map((r) => `${r.t}.${r.c}`));
     const tableRows = await prisma.$queryRaw`
       SELECT tablename AS name FROM pg_tables WHERE tablename = 'IdempotencyKey'`;
@@ -199,16 +212,16 @@ async function main() {
     // - table: tablename must exist in pg_tables.
     const expected = {
       '20261025034800_system_role_name_unique': [
-        { kind: 'index', name: 'Role_system_name_key', need: ['(name)', 'whereowneridisnull'] },
+        { kind: 'index', name: 'Role_system_name_key', need: ['name', 'owneridisnull'] },
       ],
       '20261025123100_round4_r2_system_role_name_ci': [
-        { kind: 'index', name: 'Role_system_name_ci_key', need: ['lower(name)', 'whereowneridisnull'] },
+        { kind: 'index', name: 'Role_system_name_ci_key', need: ['lower(name)', 'owneridisnull'] },
       ],
       '20261025041500_court_venue_name_unique': [
         { kind: 'index', name: 'Court_venue_name_ci_key', need: ['venueid', 'lower(name)'] },
       ],
       '20261025070700_void_note_unique': [
-        { kind: 'index', name: 'VenuePayment_void_note_key', need: ['(note)', "wheremethod='void'"] },
+        { kind: 'index', name: 'VenuePayment_void_note_key', need: ['note', "method='void'"] },
       ],
       '20261025041600_idempotency_key': [{ kind: 'table', name: 'IdempotencyKey' }],
       '20261025123000_round4_r2_court_weekly_hours_version': [
@@ -224,17 +237,30 @@ async function main() {
       '20261025143000_round5_r1_refresh_replaced_by': [
         { kind: 'column', name: 'RefreshSession.replacedById' },
       ],
+      // Round 5, D5-B3: the Round-5 R3 schema bundle — columns via
+      // information_schema, partial indexes via pg_get_expr (the
+      // CHECK constraint VenuePayment_void_note_not_null has no
+      // pg_indexes row; it is verified by the migration's own
+      // NOT VALID addition and the pre-check in its header).
+      '20261025170000_round5_r3_schema': [
+        { kind: 'column', name: 'Broadcast.countsReliable' },
+        { kind: 'column', name: 'BookingParticipant.userId' },
+        { kind: 'column', name: 'Venue.freeUntilOverridePrev' },
+        { kind: 'index', name: 'BookingParticipant_booking_phone_key', need: ['bookingid', 'phone', 'phoneisnotnull'] },
+        { kind: 'index', name: 'RescheduleRequest_booking_pending_key', need: ['bookingid', "status='pending'"] },
+      ],
     };
     const objectPresent = (check) => {
       if (check.kind === 'table') return tables.has(check.name);
       if (check.kind === 'column') return columns.has(check.name);
       const def = indexDefs.get(check.name);
       if (!def) return false;
-      // Predicate/expression verification: a hand-applied index with
-      // the right name but the wrong predicate (e.g. a full unique
-      // on VenuePayment.note with no WHERE method='void') must NOT
-      // pass — the migration's IF NOT EXISTS would skip it and the
-      // wrong backstop would stand.
+      // Predicate/expression verification (pg_get_expr, D5-S2): a
+      // hand-applied index with the right name but the wrong
+      // predicate (e.g. a full unique on VenuePayment.note with no
+      // WHERE method='void') must NOT pass — the migration's
+      // IF NOT EXISTS would skip it and the wrong backstop would
+      // stand.
       return check.need.every((n) => def.includes(n));
     };
     const objectWrongPredicate = (check) => {

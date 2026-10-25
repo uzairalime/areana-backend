@@ -7,7 +7,7 @@ recovered with `--rolled-back`, never blind `--applied`.**
 
 ## 1. Fresh database (first install)
 
-`prisma/migrations/` holds only hand-written folders — 9 of them, and
+`prisma/migrations/` holds only hand-written folders — 10 of them, and
 it is NOT a full baseline: `migrate deploy` on an empty database
 creates only those objects and the API then crashes on first query
 (every other table missing).
@@ -23,6 +23,7 @@ creates only those objects and the API then crashes on first query
 | `20261025123200_round4_r2_waitlist_slot_minutes` | Column `SlotWaitlist.slotMinutes` | YES — declared in `schema.prisma` |
 | `20261025140000_round4_r5b_broadcast_counts` | Columns `Broadcast.delivered`, `Broadcast.failed` | YES — declared in `schema.prisma` |
 | `20261025143000_round5_r1_refresh_replaced_by` | Column `RefreshSession.replacedById` | YES — declared in `schema.prisma` |
+| `20261025170000_round5_r3_schema` | Columns `Broadcast.countsReliable`, `BookingParticipant.userId`, `Venue.freeUntilOverridePrev`; partial unique indexes `BookingParticipant_booking_phone_key` (`bookingId`, `phone` WHERE `phone` IS NOT NULL) and `RescheduleRequest_booking_pending_key` (`bookingId` WHERE `status = 'pending'`); CHECK `VenuePayment_void_note_not_null` (`method <> 'void' OR note IS NOT NULL`, NOT VALID) | PARTIAL — the 3 columns YES (declared in `schema.prisma`); the 2 indexes + CHECK NO (raw SQL, no Prisma declaration) |
 
 **Fresh-install path (until a real baseline migration is committed):**
 
@@ -39,7 +40,14 @@ npx prisma migrate resolve --applied 20261025123200_round4_r2_waitlist_slot_minu
 npx prisma migrate resolve --applied 20261025140000_round4_r5b_broadcast_counts
 npx prisma migrate resolve --applied 20261025143000_round5_r1_refresh_replaced_by
 # 3. For the objects `db push` did NOT create (the 4 partial/unique
-#    indexes above): do NOT resolve them — let deploy create them:
+#    indexes above, plus the 2 indexes + CHECK in
+#    20261025170000_round5_r3_schema): do NOT resolve them — let
+#    deploy create them. NOTE: 20261025170000 is MIXED (its columns
+#    ARE created by db push, its indexes/CHECK are not) — do NOT
+#    resolve it either: its column adds are IF NOT EXISTS-safe and
+#    its index creates are IF NOT EXISTS-safe, so a plain deploy
+#    creates the missing pieces without duplicating the columns.
+#    Resolving it would void the two partial indexes + CHECK.
 npx prisma migrate deploy
 # 4. Future deploys are plain `npx prisma migrate deploy`.
 ```
@@ -117,12 +125,15 @@ A database built by `db push` already HAS the `IdempotencyKey` table
           pg_get_expr(i.indexprs, i.indrelid) AS expression
    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
    WHERE c.relname IN ('Role_system_name_key', 'Role_system_name_ci_key',
-     'Court_venue_name_ci_key', 'VenuePayment_void_note_key');
+     'Court_venue_name_ci_key', 'VenuePayment_void_note_key',
+     'BookingParticipant_booking_phone_key', 'RescheduleRequest_booking_pending_key');
    -- Expected predicates:
    --   Role_system_name_key:        WHERE "ownerId" IS NULL
    --   Role_system_name_ci_key:     WHERE "ownerId" IS NULL (on lower(name))
    --   Court_venue_name_ci_key:    no predicate (unique on venueId, lower(name))
    --   VenuePayment_void_note_key: WHERE "method" = 'void'
+   --   BookingParticipant_booking_phone_key: WHERE "phone" IS NOT NULL (on bookingId, phone)
+   --   RescheduleRequest_booking_pending_key: WHERE "status" = 'pending' (on bookingId)
    ```
    `scripts/predeploy-check.js` runs this definition check
    automatically (it compares the normalised `indexdef`).
@@ -299,3 +310,25 @@ catch-ups (billing sweep + reminders + nightly-if-missed, all in
 deliberately-not-bulk-fixed list. In short: 01 (quarantine bad courts)
 before 02 (cancel inverted bookings); 03 (dedupe) before deploy;
 08/10/11 are reports, not writes.
+
+## 9. Errata — applied migration headers that must NOT be edited
+
+**Never edit an applied `migration.sql` to fix these** (see §5:
+`_prisma_migrations` checksums break every later deploy). The
+corrections live here, not in the migration files:
+
+- **`20261025123000_round4_r2_court_weekly_hours_version`** — its
+  header mislabels its pre-check: the `SELECT name … GROUP BY name`
+  query is an EXACT-match check, not "case-insensitive" as labelled,
+  and the header lists sibling dedupe checks that are irrelevant to
+  this migration (it only adds the `Court.weeklyHoursVersion`
+  column and can never fail on duplicates). Read the true
+  case-insensitive check from §2 above, not from that header.
+  (Same note applies to `20261025123200`'s header, which repeats
+  the pattern.)
+- **`20261025140000_round4_r5b_broadcast_counts`** — its header
+  says "nullable-with-default columns only", but the SQL is
+  `ADD COLUMN … INTEGER NOT NULL DEFAULT 0`, matching
+  `schema.prisma` (`delivered` / `failed Int @default(0)`,
+  non-nullable). Trust the SQL, not the header: history rows carry
+  `0`, not NULL, for both counts.

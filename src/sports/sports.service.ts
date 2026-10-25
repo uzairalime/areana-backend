@@ -118,7 +118,29 @@ export class SportsService {
         `"${sport.name}" is used by ${venueUse} venue(s) and ${courtUse} court(s) — deactivate it instead of deleting it`,
       );
     }
-    await this.prisma.sport.delete({ where: { id } });
+    // Round 5, D5-S52 (remove half; the rename half already runs in
+    // one transaction): the count above used to be followed by a bare
+    // delete, so a venue/court created with this name in between left
+    // a dangling name that normalizeSport then rejects for new venues.
+    // Re-count inside a transaction holding the sport row lock; the
+    // lock serializes against concurrent catalog-name writes that
+    // take the same row. (The amenities equivalent lives in
+    // src/amenities/amenities.service.ts, outside this round's file
+    // set — its remove has the identical count-then-delete shape and
+    // still needs the same fix from its owner.)
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Sport" WHERE id = ${id} FOR UPDATE`;
+      const [venueNow, courtNow] = await Promise.all([
+        tx.venue.count({ where: { sports: { has: sport.name } } }),
+        tx.court.count({ where: { sport: sport.name } }),
+      ]);
+      if (venueNow + courtNow > 0) {
+        throw new ConflictException(
+          `"${sport.name}" is used by ${venueNow} venue(s) and ${courtNow} court(s) — deactivate it instead of deleting it`,
+        );
+      }
+      await tx.sport.delete({ where: { id } });
+    });
     return { deleted: true };
   }
 

@@ -37,7 +37,7 @@ export class CreateCourtDto {
   @ApiPropertyOptional({ example: '7v7' }) @IsOptional() @IsString() size?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() surface?: string;
   @ApiPropertyOptional() @IsOptional() indoor?: boolean;
-  @ApiProperty({ example: 2500 }) @IsNumber() @Min(0) pricePerHour: number;
+  @ApiProperty({ example: 2500 }) @IsNumber() @Min(0) @Max(99999999.99) pricePerHour: number;
   @ApiPropertyOptional({ example: 360 }) @IsOptional() @IsInt() openMinutes?: number;
   @ApiPropertyOptional({ example: 1380 }) @IsOptional() @IsInt() closeMinutes?: number;
   @ApiPropertyOptional({ example: 60 }) @IsOptional() @IsInt() @Min(15) slotMinutes?: number;
@@ -48,7 +48,7 @@ export class UpdateCourtDto {
   @ApiPropertyOptional() @IsOptional() @IsString() size?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() surface?: string;
   @ApiPropertyOptional() @IsOptional() indoor?: boolean;
-  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) pricePerHour?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) @Max(99999999.99) pricePerHour?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() openMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() closeMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(15) slotMinutes?: number;
@@ -156,7 +156,7 @@ export class SetWeeklyHoursDto {
   acknowledgeConflicts?: boolean;
   @ApiPropertyOptional({
     description:
-      'Optimistic-concurrency guard (Round 4, O-S1): the weeklyHoursVersion the editor loaded. When given and stale, the save is rejected with 409 instead of silently overwriting a newer template. Omit to save unconditionally (old clients).',
+      'Optimistic-concurrency guard (Round 4, O-S1; Round 5, D5-S47): the weeklyHoursVersion the editor loaded. When given and stale, the save is rejected with 409 instead of silently overwriting a newer template. When omitted, the save is rejected with 409 if the court HAS a weekly template (any CourtWeeklyWindow rows) or its version is > 0; omission saves unconditionally ONLY for template-less version-0 courts, so old clients keep working on headline-only courts without ever silently overwriting a real template.',
   })
   @IsOptional()
   @IsInt()

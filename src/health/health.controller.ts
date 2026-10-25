@@ -25,19 +25,20 @@ export class HealthController {
     // is now a real 503.
     //
     // Round 5, D5-S40: 200 also hid three more broken states, all
-    // now reflected honestly:
-    // - wrong DB timezone: 503 (the boot guard only runs at boot, so
-    //   a drifted cluster stayed 200 forever after);
-    // - failed / pending migrations: 503 (a failed _prisma_migrations
-    //   row, or a migration folder with no finished row — the
-    //   db-push case stays 503 until resolved, which is the honest
-    //   state: schema provenance is unrecorded);
-    // - push outage: reported as a `push` field that never claims
-    //   healthy when pushes are down (enabled but unconfigured).
-    //   Push alone does NOT flip the status code: FCM init failure
-    //   hard-fails boot, so a running app with FCM enabled is
-    //   configured by construction, and log-only push in dev is not
-    //   an outage. `degraded: true` is the signal for that case.
+    // now reflected honestly in the `degraded` reasons array, which
+    // flips the status to 503 whenever it is non-empty:
+    // - (a) FCM enabled but unconfigured at runtime: 503. (FCM init
+    //   failure hard-fails boot, so a running app with FCM enabled
+    //   is configured by construction — this reason is the
+    //   defence-in-depth signal if that ever stops being true.)
+    // - (b) wrong DB timezone: 503 (the boot guard only runs at
+    //   boot, so a drifted cluster stayed 200 forever after);
+    // - (c) migration/drift: 503. Besides the _prisma_migrations
+    //   folder check, an information_schema check proves the newest
+    //   columns actually exist (Court.weeklyHoursVersion,
+    //   Broadcast.countsReliable, Broadcast.delivered) — a
+    //   db-push DB passes this (push creates the columns) while a
+    //   half-migrated DB fails it even when SELECT 1 succeeds.
     let db = 'up';
     let dbTimezone: string | null = null;
     let tzOk = true;
@@ -94,13 +95,34 @@ export class HealthController {
         }
       }
     }
+    // Round 5, D5-S40 (c): drift check against information_schema —
+    // the newest columns must exist, whatever the migration rows say.
+    const drift: string[] = [];
+    if (db === 'up') {
+      try {
+        const cols = await this.prisma.$queryRaw<{ column_name: string }[]>`
+          SELECT column_name FROM information_schema.columns
+          WHERE (table_name = 'Court' AND column_name = 'weeklyHoursVersion')
+             OR (table_name = 'Broadcast' AND column_name IN ('countsReliable', 'delivered'))`;
+        const found = new Set(cols.map((c) => c.column_name));
+        const missing = ['weeklyHoursVersion', 'countsReliable', 'delivered'].filter(
+          (c) => !found.has(c),
+        );
+        if (missing.length > 0) drift.push(`drift: missing columns ${missing.join(', ')}`);
+      } catch {
+        drift.push('drift: column check failed');
+      }
+    }
     const fcm = this.notifications.fcmStatus();
     const pushHealthy = !fcm.enabled || fcm.configured;
-    const ok =
-      db === 'up' &&
-      tzOk &&
-      migrations.failed.length === 0 &&
-      migrations.pending.length === 0;
+    const degraded: string[] = [];
+    if (db !== 'up') degraded.push('db-down');
+    if (!tzOk) degraded.push(`db-timezone-mismatch: ${dbTimezone}`);
+    if (!pushHealthy) degraded.push('fcm-enabled-but-unconfigured');
+    if (migrations.failed.length > 0) degraded.push('migrations-failed');
+    if (migrations.pending.length > 0) degraded.push('migrations-pending');
+    degraded.push(...drift);
+    const ok = degraded.length === 0;
     if (!ok) {
       res.status(HttpStatus.SERVICE_UNAVAILABLE);
     }
@@ -110,10 +132,10 @@ export class HealthController {
       dbTimezone,
       fcm,
       // Never claims healthy when pushes are down: enabled-but-
-      // unconfigured is healthy=false even though it does not flip
-      // the status code (see above).
+      // unconfigured is healthy=false and now also flips the status
+      // code via `degraded` (see above).
       push: { ...fcm, healthy: pushHealthy },
-      degraded: !pushHealthy,
+      degraded,
       migrations,
     };
   }

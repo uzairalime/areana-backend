@@ -492,6 +492,19 @@ export class AdminService {
       include: { role: { select: { name: true } } },
     });
     if (!target) throw new NotFoundException('User not found');
+    // Round 5, D5-S55: a self-deleted account (deletedAt set, email
+    // rewritten to an undeliverable .invalid address, password
+    // cleared) must never be reactivated into a dead-end "active"
+    // account whose owner can never receive an OTP. Reactivation of
+    // such an account needs an explicit restore flow that re-collects
+    // a real email — not a status flip. (The only other reactivation
+    // path, owner createStaff's ex-staff revival, got the same
+    // deletedAt guard in owner.service.ts.)
+    if (target.deletedAt) {
+      throw new BadRequestException(
+        'This account was deleted by its owner and cannot be reactivated by a status change',
+      );
+    }
     if (status === UserStatus.pending) {
       // Pending is a signup state, not a management state — moving an
       // account back there locks it out and (for players) hides it from
@@ -879,7 +892,28 @@ export class AdminService {
     if (!role) throw new NotFoundException('Role not found');
     if (role.isSystem) throw new ForbiddenException('System roles cannot be deleted');
     if (role._count.users > 0) throw new BadRequestException('Role still has users assigned');
-    await this.prisma.role.delete({ where: { id } });
+    // Round 5, D5-S50: the count above used to be followed by a bare
+    // delete — a staffer assigned to the role in between hit a raw
+    // Prisma P2003 500. Delete inside a transaction holding the role
+    // row lock (a concurrent assignment's FK insert takes a FOR KEY
+    // SHARE lock on the role row and blocks behind it), re-count
+    // inside, and still map a raced P2003 to a clean 409-style
+    // refusal as a backstop.
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Role" WHERE id = ${id} FOR UPDATE`;
+        const inUse = await tx.user.count({ where: { roleId: id } });
+        if (inUse > 0) {
+          throw new BadRequestException('Role still has users assigned');
+        }
+        await tx.role.delete({ where: { id } });
+      });
+    } catch (e) {
+      if ((e as { code?: string })?.code === 'P2003') {
+        throw new ConflictException('Role still has users assigned');
+      }
+      throw e;
+    }
     await this.audit(actorId, 'role.delete', 'role', id);
     return { deleted: true };
   }
@@ -2354,8 +2388,12 @@ export class AdminService {
     }
     // Round 5, O5-B3: service-level negative-price guard on the admin
     // create path too (the DTO already has @Min(0); defense in depth).
+    // Round 5, O5-S15: cap at the Decimal(10, 2) column max.
     if (dto.pricePerHour < 0) {
       throw new BadRequestException('pricePerHour must be at least 0');
+    }
+    if (dto.pricePerHour > 99999999.99) {
+      throw new BadRequestException('pricePerHour must be at most 99,999,999.99');
     }
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
@@ -2454,8 +2492,12 @@ export class AdminService {
     // Round 5, O5-B3: service-level negative-price guard on the admin
     // update path too (the admin DTO already has @Min(0); this is
     // defense in depth, matching the owner path).
+    // Round 5, O5-S15: cap at the Decimal(10, 2) column max.
     if (dto.pricePerHour !== undefined && dto.pricePerHour < 0) {
       throw new BadRequestException('pricePerHour must be at least 0');
+    }
+    if (dto.pricePerHour !== undefined && dto.pricePerHour > 99999999.99) {
+      throw new BadRequestException('pricePerHour must be at most 99,999,999.99');
     }
     const court = await this.prisma.court.findUnique({
       where: { id: courtId },
@@ -2508,14 +2550,18 @@ export class AdminService {
     // even though nothing about the hours moved — grandfathered
     // courts stay editable until their hours are touched.
     if (newOpen !== court.openMinutes || newClose !== court.closeMinutes) {
-      // Shrinking hours must not strand confirmed upcoming bookings.
-      const stranded = await this.prisma.booking.count({
-        where: {
-          courtId,
-          status: BookingStatus.confirmed,
-          date: { gte: startOfToday() },
-          OR: [{ startMinutes: { lt: newOpen } }, { endMinutes: { gt: newClose } }],
-        },
+      // Round 5, D5-S46: a headline-hours change bumps
+      // weeklyHoursVersion, exactly like the owner path — otherwise
+      // a stale weekly-hours editor could silently overwrite it.
+      data.weeklyHoursVersion = { increment: 1 };
+      // Round 5, O5-S5: the shrink guard is now the SHARED
+      // implementation (courts.countStrandedBookings). The old admin
+      // version counted confirmed only against raw headline hours,
+      // stranding pending bookings and template-governed bookings
+      // the owner path refused.
+      const stranded = await this.courtsSvc.countStrandedBookings(courtId, {
+        openMinutes: newOpen,
+        closeMinutes: newClose,
       });
       if (stranded > 0) {
         throw new ConflictException(
@@ -2748,7 +2794,26 @@ export class AdminService {
       // themselves (cascades take participants, reschedules, reviews,
       // and game posts).
       await tx.dispute.deleteMany({ where: { booking: { courtId } } });
-      await tx.booking.deleteMany({ where: { courtId } });
+      // Round 5, D5-S41 (court-delete part only): the booking delete
+      // used to be ONE unchunked deleteMany under the 30s statement
+      // cap — a very old court with enough history exceeded 30s and
+      // failed every retry identically. Delete in id batches of 200,
+      // so each statement stays well under the cap no matter how
+      // much history the court carries (each batch is its own
+      // statement under the same SET LOCAL cap).
+      for (;;) {
+        const batch = await tx.booking.findMany({
+          where: { courtId },
+          select: { id: true },
+          orderBy: { id: 'asc' },
+          take: 200,
+        });
+        if (batch.length === 0) break;
+        await tx.booking.deleteMany({
+          where: { id: { in: batch.map((b) => b.id) } },
+        });
+        if (batch.length < 200) break;
+      }
       await tx.slotWaitlist.deleteMany({ where: { courtId } });
       await tx.court.delete({ where: { id: courtId } });
       return waiters.map((w) => w.userId);
@@ -4070,6 +4135,12 @@ export class AdminService {
     const review = await this.prisma.review.findUnique({ where: { id } });
     if (!review) throw new NotFoundException('Review not found');
     await this.prisma.$transaction(async (tx) => {
+      // Round 5, D5-S53: take the SAME venue row lock review-create
+      // takes before the rating aggregate — without it, a concurrent
+      // create and delete both computed aggregates from their own
+      // snapshots and the last writer won, leaving rating /
+      // ratingCount stale until the next review landed.
+      await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${review.venueId} FOR UPDATE`;
       await tx.review.delete({ where: { id } });
       const agg = await tx.review.aggregate({
         where: { venueId: review.venueId },

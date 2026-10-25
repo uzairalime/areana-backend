@@ -54,6 +54,25 @@ const ROLES = [
 ];
 
 async function main() {
+  // Round 5, D5-T8: a P2002 on any single seed item means "already
+  // seeded" (a concurrent/partial run created it) — log and continue
+  // with the next item, never abort the whole seed on one duplicate.
+  const alreadySeeded = (label: string, e: unknown): boolean => {
+    if ((e as { code?: string })?.code === 'P2002') {
+      console.log(`Already seeded, skipping: ${label}`);
+      return true;
+    }
+    return false;
+  };
+  // Round 5, D5-S28: snapshot which system roles existed BEFORE this
+  // run, so recreating a missing one while others exist can warn
+  // that it may resurrect a renamed/deleted role (fresh installs,
+  // where nothing exists yet, get no warning).
+  const preExistingRoles = await prisma.role.findMany({
+    where: { name: { in: ROLES.map((r) => r.name) }, ownerId: null },
+    select: { name: true },
+  });
+  const preExistingNames = new Set(preExistingRoles.map((r) => r.name));
   for (const r of ROLES) {
     // Role.name is no longer globally unique (owner-created roles share
     // names across owners) — system roles are matched by name + ownerId null.
@@ -68,7 +87,39 @@ async function main() {
       where: { name: r.name, ownerId: null },
     });
     if (!existing) {
-      await prisma.role.create({ data: r });
+      if (preExistingNames.size > 0) {
+        console.warn(
+          `WARNING: recreating system role '${r.name}' while other system roles already exist — ` +
+            'this may resurrect a role an admin renamed or deleted. ' +
+            'If that was intentional, ignore this warning; if not, delete the recreated role in the panel.',
+        );
+      }
+      try {
+        await prisma.role.create({ data: r });
+      } catch (e) {
+        if (!alreadySeeded(`role ${r.name}`, e)) throw e;
+      }
+    } else {
+      // Round 5, D5-S28 key-merge: ADD any seed keys missing from
+      // the stored role's permissions, NEVER remove keys (an admin
+      // removing a dangerous key must survive re-seeds, per M-B5).
+      // Future releases that add a key to a system role therefore
+      // reach existing installs without a hand-edit in the panel.
+      const stored = Array.isArray(existing.permissions)
+        ? (existing.permissions as unknown[]).filter(
+            (k): k is string => typeof k === 'string',
+          )
+        : [];
+      const added = r.permissions.filter((k) => !stored.includes(k));
+      if (added.length > 0) {
+        await prisma.role.update({
+          where: { id: existing.id },
+          data: { permissions: [...stored, ...added] },
+        });
+        console.log(
+          `Role '${r.name}': added missing seed permission key(s): ${added.join(', ')} (existing keys untouched)`,
+        );
+      }
     }
   }
   console.log('Roles seeded');
@@ -161,7 +212,11 @@ async function main() {
         isDefault = false;
       }
     }
-    await prisma.plan.create({ data: { ...planData, isDefault } });
+    try {
+      await prisma.plan.create({ data: { ...planData, isDefault } });
+    } catch (e) {
+      if (!alreadySeeded(`plan ${planData.name}`, e)) throw e;
+    }
   }
   console.log('Plans seeded');
 
@@ -187,7 +242,11 @@ async function main() {
   // worse than a resurrected one); partial deletions stay deleted.
   if ((await prisma.sport.count()) === 0) {
     for (const [i, name] of DEFAULT_SPORTS.entries()) {
-      await prisma.sport.create({ data: { name, sortOrder: i } });
+      try {
+        await prisma.sport.create({ data: { name, sortOrder: i } });
+      } catch (e) {
+        if (!alreadySeeded(`sport ${name}`, e)) throw e;
+      }
     }
   }
   console.log('Sports seeded');
@@ -210,7 +269,11 @@ async function main() {
       'Prayer Area',
     ];
     for (const [i, name] of defaults.entries()) {
-      await prisma.amenity.create({ data: { name, sortOrder: i } });
+      try {
+        await prisma.amenity.create({ data: { name, sortOrder: i } });
+      } catch (e) {
+        if (!alreadySeeded(`amenity ${name}`, e)) throw e;
+      }
     }
   }
   console.log('Amenities seeded');

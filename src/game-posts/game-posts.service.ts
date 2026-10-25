@@ -18,12 +18,14 @@ import {
 } from '../common/date.util';
 import { CreateGamePostDto, GamePostQueryDto, UpdateGamePostDto } from './dto';
 import { NotificationsService } from '../notifications/notifications.service';
+import { PlansService } from '../plans/plans.service';
 
 @Injectable()
 export class GamePostsService {
   constructor(
     private prisma: PrismaService,
     private notifications: NotificationsService,
+    private plans: PlansService,
   ) {}
 
   /**
@@ -93,9 +95,59 @@ export class GamePostsService {
         moderationStatus: 'none',
         owner: { status: UserStatus.active },
       },
-      select: { id: true },
+      select: {
+        id: true,
+        billingStartAt: true,
+        billingPaidUntil: true,
+        freeUntilOverride: true,
+        billingPeriodStart: true,
+        billingPeriodEnd: true,
+        billingPeriodPrice: true,
+        planId: true,
+      },
     });
-    if (!v) throw new NotFoundException('This game is no longer available');
+    // Round 5, P5-S54: billingPaused alone is not enough — a venue
+    // whose grace ended since the last nightly sweep is overdue by
+    // computation and must read as invisible here, exactly as booking
+    // creation already treats it.
+    if (!v || (await this.plans.billingSummary(v as any)).status === 'overdue') {
+      throw new NotFoundException('This game is no longer available');
+    }
+  }
+
+  /**
+   * Live-overdue check inside a transaction: the venue row is read
+   * through the caller's tx client (materialized predicate + billing
+   * fields), while the computed summary itself reads plan/settings
+   * through PlansService, as the search/discovery paths do.
+   */
+  private async assertVenueVisibleInTx(
+    tx: Prisma.TransactionClient,
+    venueId: string,
+  ) {
+    const v = await tx.venue.findFirst({
+      where: {
+        id: venueId,
+        status: VenueStatus.approved,
+        archivedAt: null,
+        billingPaused: false,
+        moderationStatus: 'none',
+        owner: { status: UserStatus.active },
+      },
+      select: {
+        id: true,
+        billingStartAt: true,
+        billingPaidUntil: true,
+        freeUntilOverride: true,
+        billingPeriodStart: true,
+        billingPeriodEnd: true,
+        billingPeriodPrice: true,
+        planId: true,
+      },
+    });
+    if (!v || (await this.plans.billingSummary(v as any)).status === 'overdue') {
+      throw new NotFoundException('This game is no longer available');
+    }
   }
 
   /** Price view for one post, freshly read (used by notifications). */
@@ -153,31 +205,81 @@ export class GamePostsService {
 
     const page = query.page ?? 1;
     const limit = pageLimit(query.limit, 20);
-    const total = await this.prisma.gamePost.count({ where });
-    const posts = await this.prisma.gamePost.findMany({
+    // Round 5, P5-S54: the computed live-overdue check cannot live
+    // inside venueVisibleWhere (a Prisma where-clause), so the board
+    // is filtered in two phases — candidates under the materialized
+    // predicate, then overdue venues dropped by billingSummary
+    // before paging, so totals and pages stay exact instead of a
+    // post-filtered page coming up short. Curated posts with no
+    // venue are never overdue-filtered.
+    const candidates = await this.prisma.gamePost.findMany({
       where,
-      skip: (page - 1) * limit,
-      take: limit,
-      include: {
-        creator: { select: { name: true } },
-        venue: { select: { id: true, name: true, address: true, city: true } },
-        booking: {
-          select: {
-            totalPrice: true,
-            discountAmount: true,
-            court: { select: { name: true, size: true } },
-          },
-        },
-        participants: {
-          where: { status: 'joined' },
-          orderBy: { joinedAt: 'asc' },
-          take: 4,
-          select: { name: true },
-        },
-        _count: { select: { participants: { where: { status: 'joined' } } } },
-      },
+      select: { id: true, venueId: true },
       orderBy: [{ isCurated: 'desc' }, { date: 'asc' }, { startMinutes: 'asc' }],
     });
+    const venueIds = [
+      ...new Set(
+        candidates
+          .map((c) => c.venueId)
+          .filter((v): v is string => !!v),
+      ),
+    ];
+    const overdueVenues = new Set<string>();
+    if (venueIds.length > 0) {
+      const venues = await this.prisma.venue.findMany({
+        where: { id: { in: venueIds } },
+        select: {
+          id: true,
+          billingStartAt: true,
+          billingPaidUntil: true,
+          freeUntilOverride: true,
+          billingPeriodStart: true,
+          billingPeriodEnd: true,
+          billingPeriodPrice: true,
+          planId: true,
+        },
+      });
+      for (const v of venues) {
+        if ((await this.plans.billingSummary(v as any)).status === 'overdue') {
+          overdueVenues.add(v.id);
+        }
+      }
+    }
+    const visible = candidates.filter(
+      (c) => !c.venueId || !overdueVenues.has(c.venueId),
+    );
+    const total = visible.length;
+    const pageIds = visible
+      .slice((page - 1) * limit, page * limit)
+      .map((c) => c.id);
+    const unordered =
+      pageIds.length > 0
+        ? await this.prisma.gamePost.findMany({
+            where: { id: { in: pageIds } },
+            include: {
+              creator: { select: { name: true } },
+              venue: { select: { id: true, name: true, address: true, city: true } },
+              booking: {
+                select: {
+                  totalPrice: true,
+                  discountAmount: true,
+                  court: { select: { name: true, size: true } },
+                },
+              },
+              participants: {
+                where: { status: 'joined' },
+                orderBy: { joinedAt: 'asc' },
+                take: 4,
+                select: { name: true },
+              },
+              _count: { select: { participants: { where: { status: 'joined' } } } },
+            },
+          })
+        : [];
+    const byId = new Map(unordered.map((p) => [p.id, p]));
+    const posts = pageIds
+      .map((id) => byId.get(id))
+      .filter((p): p is (typeof unordered)[number] => !!p);
     if (!userId || posts.length === 0) {
       const items = posts.map((post) => {
         const { booking: _booking, participants: preview, ...rest } = post;
@@ -350,6 +452,10 @@ export class GamePostsService {
       if (slotStartAt(booking) <= now) {
         throw new BadRequestException('This booking has already started');
       }
+      // Round 5, P5-S54: the booking may predate the venue going
+      // overdue — a post created now at an overdue-unswept venue
+      // would otherwise sit on the board until the sweep.
+      await this.assertVenueVisible(booking.venueId);
       const existing = await this.prisma.gamePost.findUnique({
         where: { bookingId: booking.id },
       });
@@ -405,6 +511,8 @@ export class GamePostsService {
       // unmoderated + owner active. The old check (approved + owner)
       // let admins create curated games at paused venues — posts that
       // never appear on the board and can never be joined.
+      // Round 5, P5-S54: the computed live-overdue leg is included —
+      // assertVenueVisible refuses overdue-unswept venues too.
       const venue = await this.prisma.venue.findFirst({
         where: {
           id: dto.venueId,
@@ -414,10 +522,12 @@ export class GamePostsService {
           moderationStatus: 'none',
           owner: { status: UserStatus.active },
         },
+        select: { id: true, city: true },
       });
       if (!venue) {
         throw new BadRequestException('That venue is not bookable right now');
       }
+      await this.assertVenueVisible(dto.venueId);
       city = venue.city;
     }
     return this.prisma.gamePost.create({
@@ -510,18 +620,10 @@ export class GamePostsService {
         throw new BadRequestException('This game is no longer open');
       }
       if (post.venueId) {
-        const v = await tx.venue.findFirst({
-          where: {
-            id: post.venueId,
-            status: VenueStatus.approved,
-            archivedAt: null,
-            billingPaused: false,
-            moderationStatus: 'none',
-            owner: { status: UserStatus.active },
-          },
-          select: { id: true },
-        });
-        if (!v) throw new NotFoundException('This game is no longer available');
+        // Round 5, P5-S54: the join venue check now includes the
+        // computed live-overdue leg, not just the materialized
+        // billingPaused flag.
+        await this.assertVenueVisibleInTx(tx, post.venueId);
       }
       const now = new Date();
       // Round 5, P5-S46: started = start instant, not play date.
@@ -599,12 +701,24 @@ export class GamePostsService {
       const post = await tx.gamePost.findUnique({
         where: { id: postId },
         include: {
+          booking: { select: { status: true } },
           _count: { select: { participants: { where: { status: 'joined' } } } },
         },
       });
       if (!post) throw new NotFoundException('Game not found');
       if (post.creatorId !== hostId) {
         throw new ForbiddenException('Only the host can accept players');
+      }
+      // Round 5, P5-S55: accept re-checks, inside the transaction,
+      // the two things join already checks — the linked booking must
+      // not be cancelled (an orphan post must not accept joiners
+      // into a dead game) and the venue must still be visible
+      // (materialized predicate + live-overdue leg).
+      if (post.booking && post.booking.status === 'cancelled') {
+        throw new BadRequestException('This game is no longer available');
+      }
+      if (post.venueId) {
+        await this.assertVenueVisibleInTx(tx, post.venueId);
       }
       const nowA = new Date();
       // Round 5, P5-S46: started = start instant, not play date.

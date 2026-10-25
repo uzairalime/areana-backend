@@ -102,7 +102,22 @@ export class AmenitiesService {
         `"${amenity.name}" is used by ${venueUse} venue(s) — deactivate it instead of deleting it`,
       );
     }
-    await this.prisma.amenity.delete({ where: { id } });
+    // Round 5, D5-S52 (remove half; mirrors the sports fix): re-count
+    // inside a transaction holding the amenity row lock, so a venue
+    // created with this name between the count and the delete cannot
+    // leave a dangling name that normalizeAmenities then rejects.
+    await this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Amenity" WHERE id = ${id} FOR UPDATE`;
+      const venueNow = await tx.venue.count({
+        where: { amenities: { has: amenity.name } },
+      });
+      if (venueNow > 0) {
+        throw new ConflictException(
+          `"${amenity.name}" is used by ${venueNow} venue(s) — deactivate it instead of deleting it`,
+        );
+      }
+      await tx.amenity.delete({ where: { id } });
+    });
     return { deleted: true };
   }
 

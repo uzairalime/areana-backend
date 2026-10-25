@@ -1,0 +1,9 @@
+# Round 5, D5-T13: never ship secrets, build artefacts, or local
+# state into the image — the Dockerfile COPYs the build context, so
+# anything not ignored here lands in the image layers.
+.env
+.env.*
+node_modules
+dist
+.git
+uploads

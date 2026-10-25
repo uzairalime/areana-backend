@@ -110,6 +110,12 @@ export class BookingsController {
     if (!Number.isInteger(parsedCount) || parsedCount < 1 || parsedCount > 80) {
       throw new BadRequestException('slotCount must be a whole number between 1 and 80');
     }
+    // Round 5, P5-T19: exactly one of date/startMinutes must not
+    // silently fall back to the base-rate branch — a peak-hour game
+    // previewed at the base rate disagrees with the booking charge.
+    if ((dateStr && startMinutesRaw === undefined) || (!dateStr && startMinutesRaw !== undefined)) {
+      throw new BadRequestException('date and startMinutes must be supplied together');
+    }
     const n = parsedCount;
     let amount: number;
     if (dateStr && startMinutesRaw !== undefined) {
@@ -133,8 +139,12 @@ export class BookingsController {
       amount = Math.round(amount * 100) / 100;
     } else {
       // Back-compat: callers without a slot context still get the base
-      // rate preview (the panel passes date + startMinutes).
+      // rate preview (the panel passes date + startMinutes). Round 5,
+      // D5-T15: apply the same Math.round(amount*100)/100 gross
+      // rounding booking creation applies, so a preview discount on
+      // an odd hourly rate never differs by a paisa from the charge.
       amount = Number(court.pricePerHour) * ((court.slotMinutes * n) / 60);
+      amount = Math.round(amount * 100) / 100;
     }
     return this.promos.validatePromo(code, user.id, amount, court.venueId);
   }

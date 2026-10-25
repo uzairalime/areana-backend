@@ -509,6 +509,32 @@ export class SchedulerService implements OnModuleInit {
   // status-conditioned claims below stop cross-process overlap too.
   private nightlyRunning = false;
 
+  /**
+   * Cross-instance watermark claim, shared by the cron nightly and
+   * the startup catch-up: the updateMany predicate pins the exact
+   * value read, so only one instance's claim lands (count 1); the
+   * loser skips. A crash mid-nightly leaves the unparseable claim
+   * value, which the next boot treats as stale (NaN age) and
+   * re-claims — the nightly self-heals instead of wedging.
+   */
+  private async claimNightlyWatermark(): Promise<boolean> {
+    const row = await this.prisma.setting.findUnique({ where: { key: 'nightlyLastRun' } });
+    const claim = `nightly-claim:${Date.now()}:${process.pid}`;
+    if (row) {
+      const res = await this.prisma.setting.updateMany({
+        where: { key: 'nightlyLastRun', value: row.value },
+        data: { value: claim },
+      });
+      return res.count === 1;
+    }
+    try {
+      await this.prisma.setting.create({ data: { key: 'nightlyLastRun', value: claim } });
+      return true;
+    } catch {
+      return false; // another instance created the row first
+    }
+  }
+
   /** Nightly: complete past bookings, pay out referral rewards, recompute badges. */
   @Cron('0 2 * * *', PKT)
   async nightly() {
@@ -518,6 +544,17 @@ export class SchedulerService implements OnModuleInit {
     }
     this.nightlyRunning = true;
     try {
+      // Round 5, D5-S39: the cron path used to rely on the
+      // per-process flag only — two instances at 02:00 both ran the
+      // nightly fully. Claim the watermark atomically BEFORE
+      // running (the startup catch-up already did this; the cron
+      // path now does too). A catch-up caller already holds a
+      // claim; re-claiming here pins its own claim value, so it
+      // still succeeds for the same instance.
+      if (!(await this.claimNightlyWatermark())) {
+        this.logger.log('Nightly claimed by another instance — skipping');
+        return;
+      }
       await this.runNightly();
     } finally {
       this.nightlyRunning = false;

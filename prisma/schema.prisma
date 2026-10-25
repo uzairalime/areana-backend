@@ -188,6 +188,10 @@ model Venue {
   billingStartAt    DateTime?
   billingPaidUntil  DateTime?
   freeUntilOverride DateTime?
+  /// Round 5, R5-S4: the override value before the most recent
+  /// extend-free, so a void rewind can restore the pre-extension state
+  /// instead of collapsing the whole extension to the period start.
+  freeUntilOverridePrev DateTime?
   /// Materialized by the nightly billing sweep: an overdue venue is
   /// paused on public surfaces exactly like a suspended owner's venue.
   billingPaused     Boolean   @default(false)
@@ -430,6 +434,10 @@ model BookingParticipant {
   booking   Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   name      String
   phone     String?
+  /// Round 5, D5-S54: signed-in joiner identity (null for guest joins).
+  /// Phone dupes are guarded by a partial unique index (see migration
+  /// 20261025170000_round5_r3_schema); blank phones are stored as null.
+  userId    String?
   joinedAt  DateTime @default(now())
 
   @@index([bookingId])
@@ -821,6 +829,11 @@ model Broadcast {
   /// send; history shows attempted vs delivered, never a lie.
   delivered Int      @default(0)
   failed    Int      @default(0)
+  /// Round 5, D5-S49: false for rows created before delivered/failed
+  /// counts existed (set by migration 20261025170000_round5_r3_schema);
+  /// true for every row written since. History must surface this so a
+  /// legacy 0/0 row is never read as a zero-delivery broadcast.
+  countsReliable Boolean @default(true)
   sentById  String?
   createdAt DateTime @default(now())
 
@@ -854,9 +867,11 @@ model Sport {
 /// name, court venue+lower(name)) intentionally have NO Prisma
 /// declaration — the shadow-DB diff cannot match them and may propose
 /// dropping them. Never accept a generated DROP INDEX for
-/// "Role_system_name_key", "Role_system_name_ci_key", or
-/// "Court_venue_name_key"; run `migrate dev` on a scratch DB first
-/// and inspect the generated SQL (docs/DEPLOY.md).
+/// "Role_system_name_key", "Role_system_name_ci_key",
+/// "Court_venue_name_ci_key" (Round 5, D5-B1: the real index name —
+/// the old "Court_venue_name_key" spelling never existed), or
+/// "VenuePayment_void_note_key" (Round 5, D5-S4); run `migrate dev` on
+/// a scratch DB first and inspect the generated SQL (docs/DEPLOY.md).
 model IdempotencyKey {
   id        String   @id @default(cuid())
   scope     String // e.g. "POST /admin/venues/abc123/billing/mark-paid" (method + concrete path, no query)

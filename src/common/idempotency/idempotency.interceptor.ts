@@ -95,12 +95,21 @@ function sameInstant(a: unknown, b: unknown): boolean {
   return norm(a) === norm(b);
 }
 
+/**
+ * Replay-check outcome. `true` = stored response still holds, replay
+ * it. `false` = stale, re-execute as a fresh action. `'replay'` =
+ * stale, but re-executing would DESTROY newer state, so replay the
+ * stored response instead of executing (Round 5, R5-S1: a stale
+ * restart key must never wipe a newer extension — replaying the old
+ * restart response is the safe refusal, and the caller can use a
+ * fresh key for a genuinely new restart).
+ */
 type ReplayCheck = (
   prisma: PrismaService,
   params: Record<string, string>,
   body: Record<string, unknown> | undefined,
   stored: Record<string, unknown>,
-) => Promise<boolean>;
+) => Promise<boolean | 'replay'>;
 
 const venueId = (params: Record<string, string>) => params.id;
 
@@ -124,14 +133,21 @@ const REPLAY_CHECKS: Array<{
   {
     method: 'POST',
     pattern: /^\/admin\/venues\/[^/]+\/unsuspend$/,
-    check: async (prisma, params, _body, _stored) => {
+    check: async (prisma, params, _body, stored) => {
       const v = await prisma.venue.findUnique({
         where: { id: venueId(params) },
         select: { status: true },
       });
-      // Unsuspend lands on approved or pending; a re-suspend since
-      // then means the stored "reinstated" response is stale.
-      return !!v && v.status !== 'suspended';
+      // Round 5, R5-T1: unsuspend lands on approved or pending ONLY.
+      // The old "not suspended" test replayed the "reinstated to
+      // pending" response for a venue that had since been REJECTED.
+      // Compare against the stored response's own status, and only
+      // accept the statuses unsuspend can actually produce.
+      return (
+        !!v &&
+        (v.status === 'approved' || v.status === 'pending') &&
+        v.status === stored.status
+      );
     },
   },
   {
@@ -152,9 +168,20 @@ const REPLAY_CHECKS: Array<{
       if (typeof stored.id !== 'string') return false;
       const r = await prisma.role.findUnique({
         where: { id: stored.id },
-        select: { id: true },
+        select: { id: true, name: true, ownerId: true, permissions: true },
       });
-      return !!r;
+      // Round 5, R5-T4: existence alone replayed a STALE copy after
+      // the role was edited (original permissions shown for an
+      // edited role). Compare name, scope (ownerId) and permissions
+      // against the current row; any drift re-executes instead of
+      // replaying verbatim (the re-execution then hits the name
+      // uniqueness guard with an honest error, never stale data).
+      if (!r) return false;
+      return (
+        r.name === stored.name &&
+        r.ownerId === stored.ownerId &&
+        canonical(r.permissions) === canonical(stored.permissions)
+      );
     },
   },
   {
@@ -163,7 +190,7 @@ const REPLAY_CHECKS: Array<{
     check: async (prisma, params, body, stored) => {
       const v = await prisma.venue.findUnique({
         where: { id: venueId(params) },
-        select: { planId: true, billingStartAt: true },
+        select: { planId: true, billingStartAt: true, freeUntilOverride: true },
       });
       if (!v || !body || v.planId !== body.planId) return false;
       // A restart re-anchors the clock: the stored response is only
@@ -172,6 +199,17 @@ const REPLAY_CHECKS: Array<{
         const storedVenue = stored.venue as
           | Record<string, unknown>
           | undefined;
+        // Round 5, R5-S1: the restart check also compares
+        // freeUntilOverride. A newer restart + extension must NOT
+        // be wiped by re-executing a stale restart key: when the
+        // override moved since the stored restart (an extension
+        // was granted on top of it), replay the stored response
+        // instead of re-executing — re-execution would null the
+        // override and destroy the newer extension. Only a clock
+        // re-anchor with NO extension since is a safe fresh restart.
+        if (!sameInstant(v.freeUntilOverride, storedVenue?.freeUntilOverride)) {
+          return 'replay';
+        }
         return sameInstant(v.billingStartAt, storedVenue?.billingStartAt);
       }
       return true;
@@ -267,7 +305,7 @@ export class IdempotencyInterceptor implements NestInterceptor {
       const rule = REPLAY_CHECKS.find(
         (r) => r.method === req.method && r.pattern.test(path),
       );
-      let fresh = true;
+      let fresh: boolean | 'replay' = true;
       if (rule) {
         try {
           fresh = await rule.check(
@@ -287,7 +325,10 @@ export class IdempotencyInterceptor implements NestInterceptor {
       }
       // No rule for this route: replay verbatim (pre-existing
       // behaviour for any future keyed route without a check).
-      if (!rule || fresh) return of(existing.response);
+      // 'replay' (R5-S1) also replays: stale, but re-executing
+      // would destroy newer state, so the stored response is the
+      // safe refusal. Only `false` re-executes.
+      if (!rule || fresh !== false) return of(existing.response);
     }
 
     return next.handle().pipe(
@@ -301,7 +342,11 @@ export class IdempotencyInterceptor implements NestInterceptor {
             const stored = JSON.parse(JSON.stringify(body ?? null));
             await this.prisma.idempotencyKey.upsert({
               where: { scope_actorId_key: { scope, actorId, key } },
-              update: { response: stored, createdAt: new Date() },
+              // Round 5, D5-T4: the TTL must NOT slide on
+              // re-execution — createdAt is set ONLY on create, so
+              // a key retried daily still ages out after 24h from
+              // its first execution instead of living forever.
+              update: { response: stored },
               create: { scope, actorId, key, response: stored },
             });
             await this.prisma.idempotencyKey.deleteMany({

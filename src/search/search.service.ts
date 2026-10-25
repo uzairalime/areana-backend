@@ -133,12 +133,17 @@ export class SearchService {
         results.push({ venue: v, courts });
       }
     }
-    // Best availability first.
-    results.sort(
-      (a, b) =>
+    // Best availability first, with a deterministic tie-break on
+    // venue id (Round 5, P5-T15): venues tied on free-slot count
+    // straddling the 50th place used to flip in and out of results
+    // between identical searches, since the scan order was unspecified.
+    results.sort((a, b) => {
+      const freeDiff =
         b.courts.reduce((s: number, c: any) => s + c.availableSlots.length, 0) -
-        a.courts.reduce((s: number, c: any) => s + c.availableSlots.length, 0),
-    );
+        a.courts.reduce((s: number, c: any) => s + c.availableSlots.length, 0);
+      if (freeDiff !== 0) return freeDiff;
+      return a.venue.id.localeCompare(b.venue.id);
+    });
     // Cap the payload at the 50 best-covered venues (scan widened above
     // so growing cities don't silently truncate before sorting).
     return { date: q.date, results: results.slice(0, 50) };

@@ -33,22 +33,31 @@ WHERE a."action" = 'venue.billing.auto_settled'
 GROUP BY a."entityId", v."name", v."status", v."billingPaused"
 ORDER BY first_settled_at;
 
--- Cancelled bookings at those venues (all cancelled bookings at the
--- venue — the operator filters to the pause window by booking date;
--- there is no cancelled-at column to scope this precisely).
+-- Cancelled bookings at those venues, filtered to the pause → settle
+-- window (Round 5, D5-S18). Booking has no cancelledAt column, so
+-- updatedAt is used as a PROXY for cancellation time: a booking
+-- whose last write falls between its venue's pause audit row and its
+-- settle audit row is a plausible pause victim. Stated plainly, this
+-- proxy is imperfect — a booking cancelled long before the pause and
+-- edited inside the window (or a pause victim edited after the
+-- settle) lands on the wrong side of the filter — so treat the list
+-- as candidates for operator re-notification, not as proof.
 SELECT b."id" AS booking_id, b."venueId", b."userId", u."email" AS player_email,
-       b."date", b."startMinutes", b."endMinutes", b."status"
+       b."date", b."startMinutes", b."endMinutes", b."status",
+       b."updatedAt" AS last_updated_at
 FROM "Booking" b
 LEFT JOIN "User" u ON u."id" = b."userId"
 WHERE b."status" = 'cancelled'
-  AND b."venueId" IN (
-    SELECT DISTINCT a."entityId"
-    FROM "AuditLog" a
+  AND EXISTS (
+    SELECT 1 FROM "AuditLog" a
     JOIN "AuditLog" p
       ON p."entityId" = a."entityId"
       AND p."action" = 'venue.billing.paused'
       AND p."createdAt" < a."createdAt"
     WHERE a."action" = 'venue.billing.auto_settled'
+      AND a."entityId" = b."venueId"
+      AND b."updatedAt" > p."createdAt"
+      AND b."updatedAt" < a."createdAt"
   )
 ORDER BY b."venueId", b."date";
 
@@ -72,21 +81,51 @@ WHERE a."action" = 'venue.billing.auto_settled'
 ORDER BY a."createdAt";
 
 -- Venues paused by the sweep with NO later auto-settle (Round 5,
--- D5-S19): still paused today, the set an operator needs to chase
--- (payment, write-off, or manual resume). The old report required
--- a settle row, so these never appeared at all.
+-- D5-S19) — REGARDLESS of current billingPaused / status: a venue
+-- paused over Rs 0 debt and later manually resumed (mark-paid /
+-- extend, no auto_settled row), or still paused / suspended /
+-- non-approved (which "wait out" the cycle), carries the same harm
+-- and was invisible to the old report, which required a settle row.
+-- Current state is shown, not filtered on, so the operator can tell
+-- a still-paused venue from an already-resumed one.
 SELECT DISTINCT p."entityId" AS venue_id, v."name" AS venue_name,
+       v."status" AS venue_status, v."billingPaused" AS currently_paused,
        MAX(p."createdAt") AS latest_paused_at,
        v."billingPaidUntil" AS paid_until_now
 FROM "AuditLog" p
 JOIN "Venue" v ON v."id" = p."entityId"
 WHERE p."action" = 'venue.billing.paused'
-  AND v."billingPaused" = true
   AND NOT EXISTS (
     SELECT 1 FROM "AuditLog" a2
     WHERE a2."entityId" = p."entityId"
       AND a2."action" = 'venue.billing.auto_settled'
       AND a2."createdAt" > p."createdAt"
   )
-GROUP BY p."entityId", v."name", v."billingPaidUntil"
+GROUP BY p."entityId", v."name", v."status", v."billingPaused", v."billingPaidUntil"
 ORDER BY latest_paused_at;
+
+-- Cancelled bookings at those never-settled paused venues (same
+-- updatedAt proxy as above, but open-ended: any cancellation whose
+-- last write falls after the venue's latest pause with no settle
+-- after it). The harm is identical to the settled set — bookings
+-- cancelled by a pause that was never auto-healed — so these
+-- players need the same re-booking conversation.
+SELECT b."id" AS booking_id, b."venueId", b."userId", u."email" AS player_email,
+       b."date", b."startMinutes", b."endMinutes", b."status",
+       b."updatedAt" AS last_updated_at
+FROM "Booking" b
+LEFT JOIN "User" u ON u."id" = b."userId"
+WHERE b."status" = 'cancelled'
+  AND EXISTS (
+    SELECT 1 FROM "AuditLog" p
+    WHERE p."entityId" = b."venueId"
+      AND p."action" = 'venue.billing.paused'
+      AND b."updatedAt" > p."createdAt"
+      AND NOT EXISTS (
+        SELECT 1 FROM "AuditLog" a2
+        WHERE a2."entityId" = b."venueId"
+          AND a2."action" = 'venue.billing.auto_settled'
+          AND a2."createdAt" > p."createdAt"
+      )
+  )
+ORDER BY b."venueId", b."date";

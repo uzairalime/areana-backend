@@ -12,6 +12,7 @@ import { CourtsService } from '../courts/courts.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PromosService } from '../promos/promos.service';
 import {
+  addMonths,
   isSameDay,
   minutesSinceMidnight,
   parseDateOnly,
@@ -106,7 +107,13 @@ export class BookingsService {
       }
     }
 
-    const booking = await this.prisma.$transaction(async (tx) => {
+    // Round 5, D5-T6: share/check-in codes are @unique, so a collision
+    // used to roll the whole booking back as a raw 500. The tx body
+    // runs through runTx with fresh codes per attempt (max 3); only
+    // a collision on shareCode/checkInCode retries — any other P2002
+    // (e.g. the slot unique) rethrows immediately.
+    const runTx = (shareCode: string, checkInCode: string) =>
+      this.prisma.$transaction(async (tx) => {
       // Serialize creation per court (venue row first, then court —
       // the same order the archive path uses, so the two can never
       // deadlock). The locks make the re-checks below see every
@@ -150,8 +157,34 @@ export class BookingsService {
           ) * (fresh.slotMinutes / 60);
       }
       txGross = Math.round(txGross * 100) / 100;
+      // Round 5, R5-S9: the duration must match what was displayed,
+      // regardless of price — a free court shrunk 60→30 min (gross 0
+      // = 0) or a compensating rate change must not store a shorter
+      // booking than the player picked.
+      if (txEndMinutes !== endMinutes) {
+        throw new BadRequestException('Slot length changed — please pick again');
+      }
       if (txGross !== gross) {
         throw new BadRequestException('Price changed — please confirm the new price and try again');
+      }
+      // Round 5, P5-S47: re-run the advance-notice / past window
+      // inside the transaction, against the tx-fresh venue settings.
+      // The pre-check can go stale under lock contention (a slot at
+      // the notice horizon committing after the boundary, or a
+      // next-minute slot committing after its start). Walk-ins keep
+      // their skip; recurring series keep the max-advance exemption.
+      if (!input.skipWindowCheck) {
+        const txVenue = await tx.venue.findUnique({
+          where: { id: court.venueId },
+          select: { minAdvanceMinutes: true, maxAdvanceDays: true },
+        });
+        if (!txVenue) throw new NotFoundException('Venue not found');
+        this.validateWindow(
+          { ...court, venue: txVenue },
+          date,
+          startMinutes,
+          input.skipMaxAdvance,
+        );
       }
       // Hours re-validation inside the tx: the pre-check's windows can
       // go stale between pre-check and insert (owner shrinks hours, or
@@ -170,6 +203,35 @@ export class BookingsService {
         throw e;
       }
       await this.assertNoOverlap(court.id, date, startMinutes, txEndMinutes, tx);
+      // Round 5, P5-S48 / R5-S7: re-read the promo terms from the
+      // locked promo row and recompute the discount. An owner edit
+      // between validation and commit aborts with the same
+      // "price changed" shape as the court-price guard above, instead
+      // of storing the stale discount with a fresh redemption.
+      let txDiscount = discount;
+      if (promo && input.userId) {
+        txDiscount = await this.promos.recomputeDiscount(promo.id, txGross, tx);
+        if (txDiscount !== discount) {
+          throw new BadRequestException('Price changed — please confirm the new price and try again');
+        }
+      }
+      // Round 5, R5-S8: a client-supplied expectedTotal is the price
+      // the player confirmed. If the price moved since that preview
+      // (e.g. a blind retry after a "price changed" 400), abort with
+      // a payload carrying the new gross/total so the client can
+      // re-confirm — never book silently at the new price.
+      if (input.expectedTotal !== undefined && input.expectedTotal !== null) {
+        const net = Math.max(0, txGross - txDiscount);
+        if (Math.round(input.expectedTotal * 100) / 100 !== net) {
+          throw new BadRequestException({
+            message: 'Price changed — please confirm the new price and try again',
+            code: 'PRICE_CHANGED',
+            expectedTotal: input.expectedTotal,
+            newGross: txGross,
+            newTotal: net,
+          });
+        }
+      }
       const b = await tx.booking.create({
         data: {
           userId: input.userId,
@@ -185,8 +247,8 @@ export class BookingsService {
           discountAmount: discount,
           promoCodeId: promo?.id,
           status: court.venue.autoAccept ? BookingStatus.confirmed : BookingStatus.pending,
-          shareCode: shortCode(8),
-          checkInCode: shortCode(10),
+          shareCode,
+          checkInCode,
           recurrenceId: input.recurrenceId,
         },
         include: {
@@ -195,10 +257,33 @@ export class BookingsService {
         },
       });
       if (promo && input.userId) {
-        await this.promos.applyPromo(promo.id, input.userId, b.id, tx);
+        await this.promos.applyPromo(promo.id, input.userId, b.id, tx, {
+          amount: txGross,
+          discount,
+        });
       }
       return b;
-    });
+      });
+    let booking: Awaited<ReturnType<typeof runTx>> | undefined;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        booking = await runTx(shortCode(8), shortCode(10));
+        break;
+      } catch (e) {
+        const target =
+          e instanceof Prisma.PrismaClientKnownRequestError
+            ? (e.meta?.target as unknown)
+            : null;
+        const targets = Array.isArray(target) ? target : target ? [target] : [];
+        const isCodeCollision =
+          e instanceof Prisma.PrismaClientKnownRequestError &&
+          e.code === 'P2002' &&
+          targets.some((t) => t === 'shareCode' || t === 'checkInCode');
+        if (attempt < 2 && isCodeCollision) continue;
+        throw e;
+      }
+    }
+    if (!booking) throw new BadRequestException('Could not create booking — please try again');
 
     // Notify the arena owner (email) — only for player-made requests, not walk-ins.
     // Auto-accept venues used to notify nobody: the old condition
@@ -609,8 +694,20 @@ export class BookingsService {
     if (!booking) throw new NotFoundException('Booking not found');
     let shareCode = booking.shareCode;
     if (!shareCode) {
-      shareCode = shortCode(8);
-      await this.prisma.booking.update({ where: { id: bookingId }, data: { shareCode } });
+      // Round 5, D5-T6: retry the backfill on a shareCode collision
+      // (up to 3 attempts) instead of surfacing a raw P2002 500.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        shareCode = shortCode(8);
+        try {
+          await this.prisma.booking.update({ where: { id: bookingId }, data: { shareCode } });
+          break;
+        } catch (e) {
+          const isCollision =
+            e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002';
+          if (attempt < 2 && isCollision) continue;
+          throw e;
+        }
+      }
     }
     return { shareCode, joinUrl: `/join/${shareCode}` };
   }
@@ -631,9 +728,12 @@ export class BookingsService {
     // Joins until START (Round 4 decision, enforced identically in
     // getShared, the join page path via this lookup, and joinShared):
     // a link for a game that already started takes no new joiners,
-    // even if the game is still being played.
+    // even if the game is still being played. Round 5, P5-T18: the
+    // started case uses ONE status/message on both paths — the
+    // 400 "already started" form (joinShared's form), not getShared's
+    // old 404, so callers see the same started signal either way.
     if (this.slotStarted(booking)) {
-      throw new NotFoundException('Booking link is invalid or expired');
+      throw new BadRequestException('This game has already started');
     }
     const { checkInCode: _c, ...safe } = booking as any;
     return safe;
@@ -700,13 +800,38 @@ export class BookingsService {
       orderBy: { startMinutes: 'asc' },
     });
     for (const e of entries) {
-      const size = e.slotMinutes ?? court.slotMinutes;
-      if (size <= 0) continue;
-      // The waited slot must overlap the freed range — a waiter on
-      // 09:00–10:00 is not pinged for a freed 10:00–11:00, and a
-      // waiter on the old 60-minute grid is still pinged when their
-      // hour frees under the new 30-minute grid.
-      if (!(e.startMinutes < booking.endMinutes && e.startMinutes + size > booking.startMinutes)) {
+      // Round 5, D5-S48: entries created before slot sizes were
+      // stored (slotMinutes NULL) must not mis-fire after a re-grid.
+      // The current-grid fallback shrank the waited slot, so a freed
+      // adjacent slot never pinged them. For NULL entries, use a
+      // conservative overlap window instead: the freed range pings
+      // them if it overlaps [start − courtSlotMinutes,
+      // start + courtSlotMinutes] — i.e. any adjacent freed slot on
+      // the current grid pings the legacy waiter, rather than only a
+      // freed slot exactly covering their (unknown) old slot. This
+      // may over-ping by one adjacent slot, which is the safe
+      // direction: a missed ping strands the waiter forever, while
+      // an extra ping just offers a neighbouring slot.
+      let waitedStart: number;
+      let waitedEnd: number;
+      if (e.slotMinutes == null) {
+        waitedStart = e.startMinutes - court.slotMinutes;
+        waitedEnd = e.startMinutes + court.slotMinutes;
+      } else {
+        if (e.slotMinutes <= 0) continue;
+        waitedStart = e.startMinutes;
+        waitedEnd = e.startMinutes + e.slotMinutes;
+      }
+      // The null case uses INCLUSIVE boundaries on purpose: a freed
+      // slot adjacent to the window (e.g. 09:30–10:00 against a
+      // 09:00 waiter's [08:30, 09:30] window) touches at exactly one
+      // endpoint and must still ping — that is the D5-S48 scenario
+      // (half of a 60-minute wait freed as a 30-minute slot).
+      const overlaps =
+        e.slotMinutes == null
+          ? waitedStart <= booking.endMinutes && waitedEnd >= booking.startMinutes
+          : waitedStart < booking.endMinutes && waitedEnd > booking.startMinutes;
+      if (!overlaps) {
         continue;
       }
       // Claim BEFORE notifying: the old read-then-ping-then-mark let
@@ -746,22 +871,40 @@ export class BookingsService {
       throw new BadRequestException('This game has already started');
     }
     // One join per phone number — stops accidental (or spammed) duplicates.
-    if (dto.phone) {
+    // Round 5, P5-T17: trim both fields; reject an empty name; a
+    // blank phone normalizes to null (required for the partial unique
+    // index — empty strings would collide across joiners).
+    const name = (dto.name ?? '').trim();
+    if (!name) {
+      throw new BadRequestException('Name must not be empty');
+    }
+    const phone = (dto.phone ?? '').trim() || null;
+    if (phone) {
       const dupe = await this.prisma.bookingParticipant.findFirst({
-        where: { bookingId: booking.id, phone: dto.phone },
+        where: { bookingId: booking.id, phone },
       });
       if (dupe) {
         throw new ConflictException('This number has already joined this game');
       }
     }
-    let name = dto.name;
+    let displayName = name;
     if (userId) {
       const user = await this.prisma.user.findUnique({ where: { id: userId } });
-      if (user?.name) name = user.name;
+      if (user?.name) displayName = user.name;
     }
-    return this.prisma.bookingParticipant.create({
-      data: { bookingId: booking.id, name, phone: dto.phone },
-    });
+    try {
+      return await this.prisma.bookingParticipant.create({
+        data: { bookingId: booking.id, name: displayName, phone, userId: userId ?? null },
+      });
+    } catch (e) {
+      // The partial unique index is the race backstop for the dupe
+      // check above: two simultaneous joins with the same phone land
+      // one row and one clean 409, never a raw P2002.
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        throw new ConflictException('This number has already joined this game');
+      }
+      throw e;
+    }
   }
 
   // ------------------------------------------------------- reschedule requests
@@ -810,6 +953,17 @@ export class BookingsService {
     if (court.slotMinutes <= 0) {
       throw new BadRequestException('Court slot length is invalid');
     }
+    // Round 5, P5-S49: the requested slot must satisfy the venue's
+    // min/max-advance windows, exactly as a fresh booking must — a
+    // move to a slot 30 minutes out, or 6 months out, is refused
+    // here instead of landing on the owner as a fait accompli. (The
+    // accept-time re-check belongs to the owner accept path.)
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: court.venueId },
+      select: { minAdvanceMinutes: true, maxAdvanceDays: true },
+    });
+    if (!venue) throw new NotFoundException('Venue not found');
+    this.validateWindow({ ...court, venue }, date, startMinutes);
     const windows = await this.courts.windowsForDate(court, date);
     let window = windows.find(
       (w) => startMinutes >= w.startMinutes && endMinutes <= w.endMinutes,
@@ -829,14 +983,27 @@ export class BookingsService {
       throw new BadRequestException('Requested slot is outside court hours');
     }
 
-    return this.prisma.rescheduleRequest.create({
-      data: {
-        bookingId,
-        requestedDate: date,
-        requestedStartMinutes: startMinutes,
-        requestedEndMinutes: endMinutes,
-      },
-    });
+    // Round 5, P5-S50: the partial unique index on
+    // RescheduleRequest(bookingId) WHERE status='pending' is the
+    // race backstop for the pending check above — a concurrent
+    // double-submit lands one row and one clean 409, never two
+    // pending requests. The wording matches the existing
+    // duplicate-pending error exactly.
+    try {
+      return await this.prisma.rescheduleRequest.create({
+        data: {
+          bookingId,
+          requestedDate: date,
+          requestedStartMinutes: startMinutes,
+          requestedEndMinutes: endMinutes,
+        },
+      });
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        throw new ConflictException('A reschedule request is already pending');
+      }
+      throw e;
+    }
   }
 
   /**
@@ -855,6 +1022,27 @@ export class BookingsService {
     });
     if (claimed.count === 0) {
       throw new BadRequestException('No pending reschedule request to withdraw');
+    }
+    // Round 5, P5-T21 (withdraw side): the venue owner must hear
+    // about the withdrawal — previously they opened the request to
+    // find it silently gone. The accept path's distinct error for an
+    // already-decided request must contain "withdrawn by player"
+    // (owner accept path, other worker's file — reported for them to
+    // match); no reschedule-accept branch lives in this service.
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: booking.venueId },
+      select: { name: true, ownerId: true },
+    });
+    if (venue) {
+      const hh = String(Math.floor(booking.startMinutes / 60)).padStart(2, '0');
+      const mm = String(booking.startMinutes % 60).padStart(2, '0');
+      await this.notifications
+        .pushToUser(venue.ownerId, {
+          title: 'Reschedule request withdrawn',
+          body: `The player withdrew their reschedule request at ${venue.name} (${booking.date.toISOString().slice(0, 10)} ${hh}:${mm}).`,
+          data: { type: 'reschedule_withdrawn', venueId: booking.venueId },
+        })
+        .catch(() => {});
     }
     return { withdrawn: true };
   }
@@ -1030,6 +1218,13 @@ export class BookingsService {
         billingPaused: true,
         moderationStatus: true,
         owner: { select: { status: true } },
+        billingStartAt: true,
+        billingPaidUntil: true,
+        freeUntilOverride: true,
+        billingPeriodStart: true,
+        billingPeriodEnd: true,
+        billingPeriodPrice: true,
+        planId: true,
       },
     });
     if (
@@ -1038,10 +1233,78 @@ export class BookingsService {
       venue.archivedAt ||
       venue.billingPaused ||
       venue.moderationStatus !== 'none' ||
-      venue.owner.status !== 'active'
+      venue.owner.status !== 'active' ||
+      // Round 5, P5-S54: billingPaused alone is not enough — a venue
+      // whose grace ended since the last nightly sweep is overdue by
+      // computation but still billingPaused=false, and must refuse
+      // check-ins like it already refuses new bookings.
+      (await this.isVenueBillingOverdue(venue))
     ) {
       throw new BadRequestException('This arena is not currently accepting check-ins');
     }
+  }
+
+  /**
+   * Computed live-overdue check, mirroring CourtsService's private
+   * isBillingOverdue (which this service cannot call — it is private
+   * and courts/* is owned by another worker): free trial, then paid
+   * coverage, then the frozen/current period price, then the grace
+   * window. A Rs 0 period is never overdue.
+   */
+  private async isVenueBillingOverdue(venue: {
+    billingStartAt: Date | null;
+    billingPaidUntil: Date | null;
+    freeUntilOverride: Date | null;
+    billingPeriodStart: Date | null;
+    billingPeriodEnd: Date | null;
+    billingPeriodPrice: unknown;
+    planId: string | null;
+  }): Promise<boolean> {
+    if (!venue.billingStartAt) return false;
+    const plan = venue.planId
+      ? await this.prisma.plan.findUnique({ where: { id: venue.planId } })
+      : await this.prisma.plan.findFirst({ where: { isDefault: true } });
+    if (!plan) return false;
+    const freeUntil =
+      venue.freeUntilOverride ?? addMonths(venue.billingStartAt, plan.freeMonths);
+    const now = new Date();
+    if (now < freeUntil) return false;
+    if (venue.billingPaidUntil && venue.billingPaidUntil > now) return false;
+    let periodStart: Date;
+    let periodEnd: Date;
+    if (venue.billingPeriodStart && venue.billingPeriodEnd) {
+      periodStart = venue.billingPeriodStart;
+      periodEnd = venue.billingPeriodEnd;
+      while (venue.billingPaidUntil && venue.billingPaidUntil >= periodEnd) {
+        periodStart = periodEnd;
+        periodEnd = addMonths(periodStart, 12);
+      }
+    } else {
+      periodStart = freeUntil;
+      periodEnd = addMonths(freeUntil, 12);
+      while (venue.billingPaidUntil && venue.billingPaidUntil >= periodEnd) {
+        periodStart = periodEnd;
+        periodEnd = addMonths(periodStart, 12);
+      }
+      while (now < periodStart && periodStart > freeUntil) {
+        periodEnd = periodStart;
+        periodStart = addMonths(periodStart, -12);
+      }
+    }
+    const frozenPrice =
+      venue.billingPeriodStart &&
+      venue.billingPeriodEnd &&
+      periodStart.getTime() === venue.billingPeriodStart.getTime() &&
+      venue.billingPeriodPrice != null
+        ? Number(venue.billingPeriodPrice)
+        : null;
+    const price = frozenPrice ?? plan.priceYearly;
+    if (Number(price) === 0) return false;
+    const setting = await this.prisma.setting.findUnique({
+      where: { key: 'billingGraceDays' },
+    });
+    const grace = setting ? parseInt(setting.value, 10) || 14 : 14;
+    return now > new Date(periodStart.getTime() + grace * 24 * 3600_000);
   }
 
   async checkInByCode(checkInCode: string, venueId: string) {
@@ -1286,11 +1549,26 @@ export class BookingsService {
           ownerStatus: venue.owner.status,
         }
       : null;
+    // Round 5, R5-B5 (null-snapshot leg): if the venue row is gone
+    // there is no sanction predicate to re-check — the old code
+    // skipped the stop check entirely and claimed anyway. Treat a
+    // null snapshot as stopped: cancel nothing, report stoppedEarly.
+    // Round 5, R5-S6: the drain no longer discards its count — it
+    // returns { cancelled, stoppedEarly } so callers (and the panel
+    // round) can surface a partial cascade instead of reporting
+    // success for a half-cancelled venue.
+    let stoppedEarly = false;
+    if (!sanctionAtStart) {
+      return { cancelled: 0, stoppedEarly: true };
+    }
     let cancelled = 0;
     for (const b of upcoming) {
       if (sanctionAtStart) {
         const current = await this.readSanction(venueId);
-        if (!current || !this.sameSanction(current, sanctionAtStart)) break;
+        if (!current || !this.sameSanction(current, sanctionAtStart)) {
+          stoppedEarly = true;
+          break;
+        }
       }
       // Claim + database wake in ONE transaction (Round 4, R-S4):
       // the old claim-then-finalize split left a crash window where
@@ -1311,11 +1589,18 @@ export class BookingsService {
           await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
           const current = await this.readSanctionInTx(tx, venueId);
           if (!current || !this.sameSanction(current, sanctionAtStart)) {
-            return null;
+            return { stopped: true } as const;
           }
         }
         return this.claimCascadeInTx(tx, b);
       });
+      // A 'stopped' sentinel (sanction changed inside the tx) stops
+      // the whole cascade — it is NOT the same as a null claim, which
+      // just means another path already decided this booking.
+      if ((claimed as { stopped?: boolean } | null)?.stopped) {
+        stoppedEarly = true;
+        break;
+      }
       if (!claimed) continue;
       cancelled++;
       // One booking's failing wake must never abort the whole cascade:
@@ -1324,7 +1609,7 @@ export class BookingsService {
       // reported success. Log the failure and continue — the booking
       // itself is already cancelled; only its wake is partial.
       try {
-        await this.finalizeCascadeNotices(b, venue?.name, venueId, reason, claimed.squad);
+        await this.finalizeCascadeNotices(b, venue?.name, venueId, reason, (claimed as { squad: string[] }).squad);
       } catch (err) {
         this.logger.error(
           `Cascade finalize failed for booking ${b.id}: ${(err as Error).message}`,
@@ -1348,7 +1633,10 @@ export class BookingsService {
     for (let pass = 0; pass < 5; pass++) {
       if (sanctionAtStart) {
         const current = await this.readSanction(venueId);
-        if (!current || !this.sameSanction(current, sanctionAtStart)) break;
+        if (!current || !this.sameSanction(current, sanctionAtStart)) {
+          stoppedEarly = true;
+          break;
+        }
       }
       const { stopped, done } = await this.prisma.$transaction(async (tx) => {
         // Round 4, P-S12/P-S13: the claim holds the venue lock while
@@ -1394,7 +1682,10 @@ export class BookingsService {
         }
         return { stopped: false, done };
       });
-      if (stopped) break;
+      if (stopped) {
+        stoppedEarly = true;
+        break;
+      }
       if (done.length === 0) break;
       cancelled += done.length;
       for (const { booking: b, squad } of done) {
@@ -1407,7 +1698,7 @@ export class BookingsService {
         }
       }
     }
-    return cancelled;
+    return { cancelled, stoppedEarly };
   }
 
   /** The full "venue is still sanctioned" predicate for the cascade stop rule. */

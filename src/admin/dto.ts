@@ -153,7 +153,7 @@ export class OnboardCourtDto {
   @ApiPropertyOptional() @IsOptional() @IsString() size?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() surface?: string;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() indoor?: boolean;
-  @ApiProperty() @IsNumber() @Min(0) pricePerHour: number;
+  @ApiProperty() @IsNumber() @Min(0) @Max(99999999.99) pricePerHour: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(0) openMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(0) closeMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(15) slotMinutes?: number;
@@ -216,7 +216,7 @@ export class AdminCreateCourtDto {
   @ApiPropertyOptional() @IsOptional() @IsString() size?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() surface?: string;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() indoor?: boolean;
-  @ApiProperty({ example: 2500 }) @IsNumber() @Min(0) pricePerHour: number;
+  @ApiProperty({ example: 2500 }) @IsNumber() @Min(0) @Max(99999999.99) pricePerHour: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() openMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() closeMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(15) slotMinutes?: number;
@@ -228,7 +228,7 @@ export class AdminUpdateCourtDto {
   @ApiPropertyOptional() @IsOptional() @IsString() size?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() surface?: string;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() indoor?: boolean;
-  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) pricePerHour?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) @Max(99999999.99) pricePerHour?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() openMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() closeMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(15) slotMinutes?: number;

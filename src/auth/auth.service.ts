@@ -9,11 +9,11 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import { Prisma, User, UserStatus } from '@prisma/client';
+import { Prisma, Role, User, UserStatus } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { createHash } from 'crypto';
 import { PrismaService } from '../common/prisma';
-import { MailService } from './mail.service';
+import { MailDeliveryDelayedError, MailService } from './mail.service';
 import { ReferralsService } from '../promos/referrals.service';
 import {
   OwnerRegisterDto,
@@ -36,6 +36,14 @@ const OTP_IP_MAX_PER_HOUR = 30;
 // replayed old token is treated as theft (revoke-all) as before.
 // Logout revocations never carry a successor, so they never qualify.
 const ROTATION_GRACE_MS = 120_000;
+// Round 5, P5-S53 (session/JWT boundary): the session row is created
+// BEFORE the JWT is signed, so the session expires a few milliseconds
+// before the JWT does — a refresh landing exactly on the boundary
+// used to 401 on a token that was still valid. The JWT is the
+// authoritative expiry (an expired JWT never reaches the session
+// check), so a small grace here only absorbs that creation-to-sign
+// skew, it never extends a dead token's life.
+const SESSION_EXPIRY_GRACE_MS = 5_000;
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -101,19 +109,69 @@ export class AuthService {
     // an old code five times used to lock the current code the user
     // never mistyped.
     const code = String(Math.floor(100000 + Math.random() * 900000));
-    await this.mail.sendOtp(email, code);
-    await this.prisma.otpCode.updateMany({
-      where: { email, consumedAt: null },
-      data: { consumedAt: new Date() },
-    });
-    await this.prisma.otpCode.create({
-      data: {
-        email,
-        codeHash: await bcrypt.hash(code, 10),
-        expiresAt: new Date(Date.now() + OTP_TTL_MS),
-        ip: ip ?? undefined,
-      },
-    });
+    // Round 5, D5-S34: a slow SMTP server can accept DATA then stall
+    // past the socket timeout — nodemailer aborts, but the mail may
+    // already be queued, so the player receives a code no row backs.
+    // That is NOT a generic failure: surface a dedicated 503 stating
+    // the previous code still works (nothing was invalidated below,
+    // because the persist step never ran) and that a resend is safe.
+    try {
+      await this.mail.sendOtp(email, code);
+    } catch (e) {
+      if (e instanceof MailDeliveryDelayedError) {
+        throw new HttpException(
+          'Mail delivery was delayed and could not be confirmed — your previous code still works, or request a new one shortly.',
+          HttpStatus.SERVICE_UNAVAILABLE,
+        );
+      }
+      throw e;
+    }
+    // Round 5, P5-S52 + D5-S35: invalidate predecessors INSIDE the
+    // same transaction as the create. The old sequence (invalidate,
+    // then create, as separate statements) let two concurrent
+    // requests interleave — B invalidates before A creates — and
+    // leave two live codes, only the newest verifiable. The
+    // transaction also re-checks both hourly caps, so concurrent
+    // requests cannot overshoot the persisted cap either: a loser
+    // aborts before invalidating anything, so its emailed code is
+    // unpersisted but the previous code stays live (see the D5-S34
+    // message above for the same shape). Send stays outside the
+    // transaction (it cannot roll back); only the persist is atomic.
+    const codeHash = await bcrypt.hash(code, 10);
+    await this.prisma.$transaction(async (tx) => {
+        const recent = await tx.otpCode.count({
+          where: { email, createdAt: { gte: new Date(Date.now() - 3600_000) } },
+        });
+        if (recent >= OTP_MAX_PER_HOUR) {
+          throw new HttpException(
+            'Too many codes requested. Your previous code still works — try again later.',
+            HttpStatus.TOO_MANY_REQUESTS,
+          );
+        }
+        if (ip) {
+          const recentIp = await tx.otpCode.count({
+            where: { ip, createdAt: { gte: new Date(Date.now() - 3600_000) } },
+          });
+          if (recentIp >= OTP_IP_MAX_PER_HOUR) {
+            throw new HttpException(
+              'Too many codes requested. Your previous code still works — try again later.',
+              HttpStatus.TOO_MANY_REQUESTS,
+            );
+          }
+        }
+        await tx.otpCode.updateMany({
+          where: { email, consumedAt: null },
+          data: { consumedAt: new Date() },
+        });
+        await tx.otpCode.create({
+          data: {
+            email,
+            codeHash,
+            expiresAt: new Date(Date.now() + OTP_TTL_MS),
+            ip: ip ?? undefined,
+          },
+        });
+      });
     return { message: 'Login code sent to your email' };
   }
 
@@ -217,11 +275,13 @@ export class AuthService {
       : null;
     const now = new Date();
     const presentedHash = hashToken(dto.refreshToken);
+    const sessionNotExpired = (s: { expiresAt: Date }) =>
+      s.expiresAt.getTime() + SESSION_EXPIRY_GRACE_MS > now.getTime();
     const isLive =
       !!session &&
       session.userId === user.id &&
       !session.revokedAt &&
-      session.expiresAt > now &&
+      sessionNotExpired(session) &&
       session.tokenHash === presentedHash;
     if (isLive) {
       return this.rotateTokens(user, session.id);
@@ -249,16 +309,28 @@ export class AuthService {
         successor &&
         successor.userId === user.id &&
         !successor.revokedAt &&
-        successor.expiresAt > now
+        sessionNotExpired(successor)
       ) {
         return this.rotateTokens(user, successor.id);
       }
     }
-    // Anything else (an old rotated token outside grace, a logged-out
-    // one, an expired one, a hash mismatch) is treated as reuse —
-    // kill every session, as before. (P5-S53's expired/logged-out
-    // distinction is out of scope for this round and unchanged.)
-    if (session) {
+    // Round 5, P5-S53: revoke-all fires ONLY on a genuine reuse
+    // signal — the presented token's hash does not match the stored
+    // hash for its session (a token that is not the session's current
+    // token being replayed). An expired session, a logged-out session
+    // (revoked, no successor), or an old rotated token replayed
+    // outside the grace window gets a plain 401 and revokes nothing:
+    // those are stale tokens, not theft evidence, and the old
+    // revoke-everything path logged innocent users out of every
+    // device for exactly those cases. ('pending' is excluded: a
+    // session whose hash was never stored after signing has no
+    // current token to mismatch against.)
+    if (
+      session &&
+      session.userId === user.id &&
+      session.tokenHash !== presentedHash &&
+      session.tokenHash !== 'pending'
+    ) {
       await this.prisma.refreshSession.updateMany({
         where: { userId: user.id, revokedAt: null },
         data: { revokedAt: new Date() },
@@ -373,6 +445,26 @@ export class AuthService {
     return safe;
   }
 
+  // Round 5, D5-S36: the login response must carry the SAME
+  // filtered permissions jwt.strategy applies per request — disabled
+  // roles zeroed, cross-owner arena roles zeroed unless the holder
+  // staffs one of that owner's venues. Returning raw
+  // role.permissions here used to show panel buttons that every
+  // subsequent request 403'd on.
+  private async filteredPermissions(
+    user: User,
+    role: Pick<Role, 'isActive' | 'permissions' | 'ownerId'>,
+  ): Promise<string[]> {
+    let permissions = role.isActive ? role.permissions : [];
+    if (role.ownerId && role.ownerId !== user.id) {
+      const staffsOwnersVenue = await this.prisma.venueStaff.findFirst({
+        where: { userId: user.id, venue: { ownerId: role.ownerId } },
+      });
+      if (!staffsOwnersVenue) permissions = [];
+    }
+    return permissions;
+  }
+
   private async issueTokens(user: User) {
     const role = await this.prisma.role.findUniqueOrThrow({ where: { id: user.roleId } });
     const refreshTtl: number = this.config.get('jwt.refreshTtl');
@@ -392,7 +484,7 @@ export class AuthService {
         email: user.email,
         name: user.name,
         role: role.name,
-        permissions: role.permissions,
+        permissions: await this.filteredPermissions(user, role),
       },
     };
   }
@@ -453,7 +545,7 @@ export class AuthService {
         email: user.email,
         name: user.name,
         role: role.name,
-        permissions: role.permissions,
+        permissions: await this.filteredPermissions(user, role),
       },
     };
   }

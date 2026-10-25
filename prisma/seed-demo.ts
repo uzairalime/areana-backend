@@ -68,6 +68,24 @@ function demoPhotos(seed: string, sports: string[]): { images: string[]; photos:
   return { images, photos };
 }
 
+// Round 5, D5-T8: a P2002 on a single seed item means "already
+// seeded" (a concurrent/partial run created it) — log and continue,
+// never abort the whole demo seed on one duplicate.
+async function createOrAlreadySeeded<T>(
+  label: string,
+  fn: () => Promise<T>,
+): Promise<T | null> {
+  try {
+    return await fn();
+  } catch (e) {
+    if ((e as { code?: string })?.code === 'P2002') {
+      console.log(`Already seeded, skipping: ${label}`);
+      return null;
+    }
+    throw e;
+  }
+}
+
 const COURTS = [
   {
     name: 'Turf A',
@@ -102,13 +120,35 @@ async function main() {
   const ownerRole = await prisma.role.findFirst({ where: { name: 'owner', ownerId: null } });
   if (!ownerRole) throw new Error('Owner role missing — run `npm run db:seed` first.');
   const plans = await prisma.plan.findMany({ where: { isCustom: false } });
-  const basic = plans.find((p) => p.name === 'Basic');
-  const normal = plans.find((p) => p.name === 'Normal');
-  const premium = plans.find((p) => p.name === 'Premium');
+  // Round 5, D5-S29: a name lookup that misses falls back to
+  // defaultPlan() semantics (the isDefault plan) instead of
+  // dead-ending — an admin renaming Normal → "Standard" used to
+  // abort the whole demo seed, and re-running db:seed then
+  // recreated a second "Normal" tier. The fallback is logged so a
+  // renamed plan is visible, not silent.
+  const pickPlan = (name: string) => {
+    const byName = plans.find((p) => p.name === name);
+    if (byName) return byName;
+    const fallback = plans.find((p) => p.isDefault) ?? null;
+    if (fallback) {
+      console.warn(
+        `Demo seed: plan '${name}' not found by name — falling back to the default plan '${fallback.name}'.`,
+      );
+    }
+    return fallback;
+  };
+  const basic = pickPlan('Basic');
+  const normal = pickPlan('Normal');
+  const premium = pickPlan('Premium');
   if (!basic || !normal || !premium) {
     throw new Error('Launch plans missing — run `npm run db:seed` first.');
   }
-  const arenaRoles = await prisma.role.findMany({ where: { scope: 'arena', ownerId: null } });
+  // Round 5, D5-T10: the player role is arena-scoped in seed.ts, so
+  // the old unfiltered query attached it to demo venues via
+  // VenueAllowedRole. Players must never be an allowed arena role.
+  const arenaRoles = await prisma.role.findMany({
+    where: { scope: 'arena', ownerId: null, name: { not: 'player' } },
+  });
 
   // Round 4, M-S8: the Founding plan used to live inside the core
   // block, so deleting the demo venues (plan-delete guard permits it
@@ -119,21 +159,29 @@ async function main() {
     where: { name: 'Founding Partner (Demo)', isCustom: true },
   });
   if (!founding) {
-    founding = await prisma.plan.create({
-      data: {
-        name: 'Founding Partner (Demo)',
-        priceYearly: 12000,
-        freeMonths: 6,
-        features: [
-          'peak_pricing',
-          'advanced_availability',
-          'staff_accounts',
-          'customers_insight',
-          'featured_placement',
-        ],
-        isCustom: true,
-      },
-    });
+    const created = await createOrAlreadySeeded('Founding Partner (Demo) plan', () =>
+      prisma.plan.create({
+        data: {
+          name: 'Founding Partner (Demo)',
+          priceYearly: 12000,
+          freeMonths: 6,
+          features: [
+            'peak_pricing',
+            'advanced_availability',
+            'staff_accounts',
+            'customers_insight',
+            'featured_placement',
+          ],
+          isCustom: true,
+        },
+      }),
+    );
+    founding =
+      created ??
+      (await prisma.plan.findFirst({
+        where: { name: 'Founding Partner (Demo)', isCustom: true },
+      }));
+    if (!founding) throw new Error('Founding Partner (Demo) plan could not be created.');
   }
 
   const passwordHash = await bcrypt.hash('Demo@1234', 10);
@@ -254,13 +302,51 @@ async function main() {
           billingPaused: s.billingPaused ?? false,
         },
       });
-    } else if (!venue.images || venue.images.length === 0) {
-      // Backfill the gallery for arenas seeded before photos existed,
-      // so they satisfy the readiness gate on their next edit.
-      await prisma.venue.update({
-        where: { id: venue.id },
-        data: { images: gallery.images, photos: gallery.photos },
-      });
+    } else {
+      // Round 5, D5-T9: backfill the gallery ONLY when BOTH images
+      // and photos are empty — a deliberate clear of one (e.g. an
+      // operator emptying photos to re-tag) must not be restored
+      // from the seed gallery.
+      const imagesEmpty = !venue.images || venue.images.length === 0;
+      const photosEmpty =
+        !venue.photos ||
+        (Array.isArray(venue.photos) && venue.photos.length === 0);
+      if (imagesEmpty && photosEmpty) {
+        // Backfill the gallery for arenas seeded before photos existed,
+        // so they satisfy the readiness gate on their next edit.
+        await prisma.venue.update({
+          where: { id: venue.id },
+          data: { images: gallery.images, photos: gallery.photos },
+        });
+      }
+      // Round 5, D5-S25: an existing venue is NOT silently repaired
+      // to its scenario — a billing sweep may have paused it, or an
+      // admin may have re-planned it, and the old code still printed
+      // ✓. Log the drift (stored vs scenario) instead of a silent ✓
+      // for the fields the seed owns; dates are relative to "today"
+      // on every run, so only plan/status/pause/paid-presence are
+      // compared (exact billing dates would false-positive daily).
+      const drifts: string[] = [];
+      if (venue.planId !== s.planId) {
+        drifts.push(`planId stored=${venue.planId ?? 'null'} scenario=${s.planId ?? 'null'}`);
+      }
+      if (venue.status !== s.status) {
+        drifts.push(`status stored=${venue.status} scenario=${s.status}`);
+      }
+      if (venue.billingPaused !== (s.billingPaused ?? false)) {
+        drifts.push(`billingPaused stored=${venue.billingPaused} scenario=${s.billingPaused ?? false}`);
+      }
+      if ((venue.billingPaidUntil !== null) !== (s.billingPaidUntil !== undefined)) {
+        drifts.push(
+          `billingPaidUntil stored=${venue.billingPaidUntil ? 'set' : 'null'} scenario=${s.billingPaidUntil ? 'set' : 'null'}`,
+        );
+      }
+      if (drifts.length > 0) {
+        console.warn(
+          `DRIFT (existing venue, NOT repaired): ${s.venueName} — ${drifts.join('; ')}. ` +
+            'Re-run the seed only after fixing this in the panel, or accept the drift deliberately.',
+        );
+      }
     }
     if (arenaRoles.length > 0) {
       await prisma.venueAllowedRole.createMany({
@@ -272,7 +358,10 @@ async function main() {
       const exists = await prisma.court.findFirst({
         where: { venueId: venue.id, name: c.name },
       });
-      if (!exists) await prisma.court.create({ data: { venueId: venue.id, ...c } });
+      if (!exists)
+        await createOrAlreadySeeded(`court ${c.name} at ${s.venueName}`, () =>
+          prisma.court.create({ data: { venueId: venue.id, ...c } }),
+        );
     }
     // Round 4, M-S6: the Active arena used to claim a paid period
     // (billingPaidUntil) with ZERO ledger rows, so mark-paid could
@@ -414,9 +503,11 @@ async function main() {
       where: { venueId: venue.id, name: sub.court.name },
     });
     if (exists) continue;
-    await prisma.court.create({
-      data: { venueId: venue.id, ...sub.court, status: 'pending' },
-    });
+    await createOrAlreadySeeded(`court submission ${sub.court.name}`, () =>
+      prisma.court.create({
+        data: { venueId: venue.id, ...sub.court, status: 'pending' },
+      }),
+    );
     console.log(`✓ Court submission awaiting approval: ${sub.court.name} at ${sub.venueName}`);
   }
 
@@ -482,7 +573,10 @@ async function main() {
     const exists = await prisma.court.findFirst({
       where: { venueId: venue8.id, name: c.name },
     });
-    if (!exists) await prisma.court.create({ data: { venueId: venue8.id, ...c } });
+    if (!exists)
+      await createOrAlreadySeeded(`court ${c.name} at Demo Coastal Arena`, () =>
+        prisma.court.create({ data: { venueId: venue8.id, ...c } }),
+      );
   }
 
   // ------------------------------------------------------------------
@@ -769,17 +863,19 @@ async function main() {
     const suggester = spec.byPlayer
       ? await prisma.user.findUnique({ where: { email: spec.byPlayer } })
       : null;
-    await prisma.venueSuggestion.create({
-      data: {
-        name: spec.name,
-        city: spec.city,
-        phone: spec.phone ?? null,
-        note: spec.note,
-        status: spec.status,
-        suggestedById: suggester?.id ?? null,
-        createdAt: daysFromNow(-spec.daysAgo),
-      },
-    });
+    await createOrAlreadySeeded(`suggestion ${spec.name}`, () =>
+      prisma.venueSuggestion.create({
+        data: {
+          name: spec.name,
+          city: spec.city,
+          phone: spec.phone ?? null,
+          note: spec.note,
+          status: spec.status,
+          suggestedById: suggester?.id ?? null,
+          createdAt: daysFromNow(-spec.daysAgo),
+        },
+      }),
+    );
     console.log(`✓ Suggestion (${spec.status}): ${spec.name} — ${spec.city}`);
   }
 

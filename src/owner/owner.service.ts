@@ -406,15 +406,27 @@ export class OwnerService {
     if (venue.ownerId !== user.id) {
       throw new ForbiddenException('Only the venue owner can submit a venue');
     }
-    // Only a draft or a rejected venue can (re-)enter the queue: a live
-    // venue must not delist itself by accident, and a suspended or
-    // archived venue must not self-reinstate through this path.
+    // Only a draft, a rejected, or a pending venue can (re-)enter the
+    // queue: a live venue must not delist itself by accident, and a
+    // suspended or archived venue must not self-reinstate through
+    // this path. Round 5, O5-S4: a readiness-dropped venue sits in
+    // `pending` (approved → pending, never via a queue row — the
+    // approvals queue is just a query over status = pending, and
+    // submit writes nothing but status + rejectionReason, so a
+    // resubmit from pending cannot duplicate any queue row) and its
+    // owner previously had no way back in after fixing the gap.
+    // Resubmitting an already-pending first submission is a harmless
+    // no-op that still re-runs the readiness check below.
     if (venue.archivedAt) {
       throw new BadRequestException('This arena is archived — restore it before submitting');
     }
-    if (venue.status !== VenueStatus.draft && venue.status !== VenueStatus.rejected) {
+    if (
+      venue.status !== VenueStatus.draft &&
+      venue.status !== VenueStatus.rejected &&
+      venue.status !== VenueStatus.pending
+    ) {
       throw new BadRequestException(
-        `This arena is ${venue.status} — only a draft or rejected arena can be submitted`,
+        `This arena is ${venue.status} — only a draft, rejected, or pending arena can be submitted`,
       );
     }
     // Readiness counts bookable courts only: a pending court is not
@@ -732,6 +744,12 @@ export class OwnerService {
     if (dto.slotMinutes !== undefined && dto.slotMinutes < 15) {
       throw new BadRequestException('slotMinutes must be at least 15');
     }
+    // Round 5, O5-S15: cap at the Decimal(10, 2) column max, matching
+    // the promo form — the DTO @Max is the edge guard, this is the
+    // service-level backstop for any other caller.
+    if (dto.pricePerHour < 0 || dto.pricePerHour > 99999999.99) {
+      throw new BadRequestException('pricePerHour must be between 0 and 99,999,999.99');
+    }
     const venue = await this.assertVenue(user, venueId);
     // Courts for a dead venue would pile into the approvals queue and
     // could be approved into nothing bookable.
@@ -794,8 +812,14 @@ export class OwnerService {
     // accepted negative prices (the panel's own < 0 check masked it
     // for panel users only). Service-level check as well as the DTO
     // guard, so a negative rate can never reach a booking's pricing.
+    // Round 5, O5-S15: the same check caps at the Decimal(10, 2)
+    // column max (Rs 99,999,999.99, matching the promo form) instead
+    // of letting Postgres overflow with a raw DB error.
     if (dto.pricePerHour !== undefined && dto.pricePerHour < 0) {
       throw new BadRequestException('pricePerHour must be at least 0');
+    }
+    if (dto.pricePerHour !== undefined && dto.pricePerHour > 99999999.99) {
+      throw new BadRequestException('pricePerHour must be at most 99,999,999.99');
     }
     const court = await this.prisma.court.findUnique({ where: { id: courtId } });
     if (!court) throw new NotFoundException('Court not found');
@@ -847,36 +871,25 @@ export class OwnerService {
       );
       data.closeMinutes = newClose;
     }
-    // Shrink guard (Round 4, O-S4): pending AND confirmed upcoming
-    // bookings (the old guard counted confirmed only, so a pending
-    // booking could be stranded), measured against the EFFECTIVE
-    // windows for each booking's date — template if present, headline
-    // otherwise — not the headline alone. A save that does not
-    // actually change the hours never fires (grandfathered courts
-    // whose bookings predate a template stay editable).
+    // Round 5, D5-S46: a headline-hours change bumps
+    // weeklyHoursVersion, so a stale weekly-hours editor can no
+    // longer silently overwrite it (and vice versa: setWeeklyHours
+    // recomputes these same headline fields). Without the bump the
+    // version guard never fired across the two editors.
+    // Shrink guard (Round 4, O-S4; shared implementation since Round
+    // 5, O5-S5): pending AND confirmed upcoming bookings (the old
+    // guard counted confirmed only, so a pending booking could be
+    // stranded), measured against the EFFECTIVE windows for each
+    // booking's date — template if present, headline otherwise — not
+    // the headline alone. A save that does not actually change the
+    // hours never fires (grandfathered courts whose bookings predate
+    // a template stay editable).
     if (newOpen !== court.openMinutes || newClose !== court.closeMinutes) {
-      const upcoming = await this.prisma.booking.findMany({
-        where: {
-          courtId,
-          date: { gte: startOfToday() },
-          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
-        },
-        select: { date: true, startMinutes: true, endMinutes: true },
+      data.weeklyHoursVersion = { increment: 1 };
+      const stranded = await this.courtsSvc.countStrandedBookings(courtId, {
+        openMinutes: newOpen,
+        closeMinutes: newClose,
       });
-      let stranded = 0;
-      for (const b of upcoming) {
-        const windows = await this.courtsSvc.windowsForDate(
-          { id: courtId, openMinutes: newOpen, closeMinutes: newClose },
-          b.date,
-        );
-        if (
-          !windows.some(
-            (w) => b.startMinutes >= w.startMinutes && b.endMinutes <= w.endMinutes,
-          )
-        ) {
-          stranded++;
-        }
-      }
       if (stranded > 0) {
         throw new ConflictException(
           `${stranded} upcoming booking(s) fall outside the new hours — move or cancel them first`,
@@ -1101,14 +1114,69 @@ export class OwnerService {
         `Block overlaps ${clashing.length > 0 ? `${clashing.length} booking(s): ${bookingList}` : ''}${clashing.length > 0 && clashingBlocks.length > 0 ? '; ' : ''}${clashingBlocks.length > 0 ? `${clashingBlocks.length} existing block(s): ${blockList}` : ''} — move or cancel them first`,
       );
     }
-    return this.prisma.slotBlock.create({
-      data: {
-        courtId: dto.courtId,
-        date,
-        startMinutes: dto.startMinutes,
-        endMinutes: dto.endMinutes,
-        reason: dto.reason,
-      },
+    // Round 5, D5-T7: the clash check above is a pre-check, and the
+    // create used to be a bare insert — two concurrent creates for
+    // the same range both passed and both landed. The claim runs
+    // under the court row lock (the same lock booking creation
+    // takes), and re-runs the clash check inside the transaction, so
+    // the second creator sees the first creator's block and 409s.
+    // No unique index is added (a range-overlap index cannot be
+    // expressed as one, and no new migrations are allowed here).
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${dto.courtId} FOR UPDATE`;
+      const [dayB, prevB, nextB, blockedTx] = await Promise.all([
+        tx.booking.findMany({
+          where: {
+            courtId: dto.courtId,
+            date,
+            status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          },
+        }),
+        tx.booking.findMany({
+          where: {
+            courtId: dto.courtId,
+            date: prevDate,
+            status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+            endMinutes: { gt: 1440 },
+          },
+        }),
+        tx.booking.findMany({
+          where: {
+            courtId: dto.courtId,
+            date: nextDate,
+            status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+            startMinutes: { lt: 360 },
+          },
+        }),
+        this.courtsSvc.blockedRangesForDate(dto.courtId, date, tx),
+      ]);
+      const raced =
+        dayB.some((b) => dto.startMinutes < b.endMinutes && dto.endMinutes > b.startMinutes) ||
+        prevB.some(
+          (b) =>
+            dto.startMinutes < b.endMinutes - 1440 && dto.endMinutes > b.startMinutes - 1440,
+        ) ||
+        nextB.some(
+          (b) =>
+            dto.startMinutes < b.endMinutes + 1440 && dto.endMinutes > b.startMinutes + 1440,
+        ) ||
+        blockedTx.some(
+          (r) => dto.startMinutes < r.endMinutes && dto.endMinutes > r.startMinutes,
+        );
+      if (raced) {
+        throw new ConflictException(
+          'Block overlaps a booking or block created just now — move or cancel them first',
+        );
+      }
+      return tx.slotBlock.create({
+        data: {
+          courtId: dto.courtId,
+          date,
+          startMinutes: dto.startMinutes,
+          endMinutes: dto.endMinutes,
+          reason: dto.reason,
+        },
+      });
     });
   }
 
@@ -1215,10 +1283,13 @@ export class OwnerService {
     if (startsOn && endsOn && endsOn < startsOn) {
       throw new BadRequestException('endsOn must not be before startsOn');
     }
-    const existing = await this.prisma.courtPriceWindow.findMany({
-      where: { courtId },
-    });
-    const clash = existing.some((w) => {
+    const overlaps = (w: {
+      weekdays: number[];
+      startMinutes: number;
+      endMinutes: number;
+      startsOn: Date | null;
+      endsOn: Date | null;
+    }) => {
       const sameDay = w.weekdays.some((d) => dto.weekdays.includes(d));
       const sameTime =
         dto.startMinutes < w.endMinutes && dto.endMinutes > w.startMinutes;
@@ -1228,22 +1299,43 @@ export class OwnerService {
       const bEnd = w.endsOn ? toYmd(w.endsOn) : '9999-12-31';
       const sameDates = aStart <= bEnd && bStart <= aEnd;
       return sameDay && sameTime && sameDates;
+    };
+    const existing = await this.prisma.courtPriceWindow.findMany({
+      where: { courtId },
     });
-    if (clash) {
+    if (existing.some(overlaps)) {
       throw new BadRequestException(
         'Price windows cannot overlap — a slot can only have one special rate',
       );
     }
-    return this.prisma.courtPriceWindow.create({
-      data: {
-        courtId,
-        weekdays: dto.weekdays,
-        startMinutes: dto.startMinutes,
-        endMinutes: dto.endMinutes,
-        pricePerHour: dto.pricePerHour,
-        startsOn,
-        endsOn,
-      },
+    // Round 5, D5-B9 (creation half): the overlap check above is a
+    // pre-check, and the create used to be a bare insert — two
+    // concurrent creates for the same weekday/time both passed, both
+    // landed, and priceRateForSlot then priced the overlapped slot by
+    // whichever window Postgres returned first. The claim runs under
+    // the court row lock and re-runs the overlap check inside the
+    // transaction, so the second creator 400s. (The lookup half —
+    // deterministic orderBy in priceWindowsForDate — was already in
+    // place, so any legacy overlap still prices deterministically.)
+    return this.prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${courtId} FOR UPDATE`;
+      const fresh = await tx.courtPriceWindow.findMany({ where: { courtId } });
+      if (fresh.some(overlaps)) {
+        throw new BadRequestException(
+          'Price windows cannot overlap — a slot can only have one special rate',
+        );
+      }
+      return tx.courtPriceWindow.create({
+        data: {
+          courtId,
+          weekdays: dto.weekdays,
+          startMinutes: dto.startMinutes,
+          endMinutes: dto.endMinutes,
+          pricePerHour: dto.pricePerHour,
+          startsOn,
+          endsOn,
+        },
+      });
     });
   }
 
@@ -1303,20 +1395,42 @@ export class OwnerService {
     // zero open windows wiped the template exactly the same way —
     // omitted weekdays are closed for the conflict scan, but the save
     // still deletes every row and, with no rows left, falls back to
-    // headline hours. The rule is now: ANY non-empty days array with
-    // zero open windows is rejected. The one exception is the EMPTY
-    // array, which is the deliberate clear-template operation (revert
-    // to headline hours) preserved from Round 4: the panel always
-    // sends all 7 weekdays, so no panel flow sends [], and an API
-    // client sending [] is explicitly clearing, not closing. The
-    // panel must never present "clear template" as "closed".
+    // headline hours. The rule is now the UNION rule (the task's
+    // first option, chosen over "require exactly 7 entries" so a
+    // partial-week edit that keeps some day open still saves):
+    // reject whenever the supplied days cover ZERO open windows,
+    // treating omitted weekdays as closed for this check — which
+    // includes the EMPTY array. There is deliberately no
+    // clear-template path through this endpoint anymore: sending []
+    // used to wipe a live template and silently reopen the court at
+    // headline hours, indistinguishable from "closed all week". A
+    // court that must not sell is deactivated instead.
     if (
-      dto.days.length > 0 &&
+      dto.days.length === 0 ||
       dto.days.every((d) => d.windows.length === 0)
     ) {
       throw new BadRequestException(
         'A court closed all week must be deactivated instead — closing every day would reopen it at its headline hours',
       );
+    }
+    // Round 5, D5-S47: a missing expectedVersion is rejected when the
+    // court HAS a template (any CourtWeeklyWindow rows) OR its
+    // version is > 0 — a stale version-less client must never
+    // overwrite a real template. Omission is allowed ONLY for
+    // template-less version-0 courts (old clients on headline-only
+    // courts keep working). The
+    // in-transaction write below is conditional on version = 0 for
+    // this path too, so a template landing between this check and
+    // the write still 409s instead of racing through.
+    if (dto.expectedVersion === undefined) {
+      const hasTemplate = await this.prisma.courtWeeklyWindow.count({
+        where: { courtId },
+      });
+      if (hasTemplate > 0 || court.weeklyHoursVersion > 0) {
+        throw new ConflictException(
+          'Weekly hours changed since you loaded them — reload and try again',
+        );
+      }
     }
     // Split shifts (more than one window in a day) are a plan feature.
     if (dto.days.some((d) => d.windows.length > 1)) {
@@ -1432,9 +1546,12 @@ export class OwnerService {
         await tx.courtWeeklyWindow.createMany({ data: flat });
       }
       if (updated) return updated;
-      // No expectedVersion (old clients): unconditional bump, as before.
-      return tx.court.update({
-        where: { id: courtId },
+      // No expectedVersion: allowed ONLY for template-less version-0
+      // courts (D5-S47 check above), so the write is conditional on
+      // version = 0 — a concurrent template save landing first
+      // claims zero rows and the whole transaction rolls back 409.
+      const claimedZero = await tx.court.updateMany({
+        where: { id: courtId, weeklyHoursVersion: 0 },
         data: {
           ...(flat.length > 0
             ? {
@@ -1444,6 +1561,15 @@ export class OwnerService {
             : {}),
           weeklyHoursVersion: { increment: 1 },
         },
+      });
+      if (claimedZero.count === 0) {
+        throw new ConflictException(
+          'Weekly hours changed since you loaded them — reload and try again',
+        );
+      }
+      return tx.court.findUniqueOrThrow({
+        where: { id: courtId },
+        select: { weeklyHoursVersion: true },
       });
     });
     return { saved: true, conflicts, version: savedCourt.weeklyHoursVersion };
@@ -1533,6 +1659,12 @@ export class OwnerService {
   async createClosure(user: AuthUser, venueId: string, dto: CreateClosureDto) {
     await this.assertVenue(user, venueId);
     const date = parseDateOnly(dto.date);
+    // Round 5, O5-T10: only the panel's DatePicker min used to stop
+    // past closures — any API client could close a day that already
+    // happened. Same backstop as createBlock.
+    if (date < startOfToday()) {
+      throw new BadRequestException('Cannot close a past date');
+    }
     const courts = await this.prisma.court.findMany({
       where: {
         venueId,
@@ -1598,6 +1730,38 @@ export class OwnerService {
       });
       for (const b of rows) {
         conflicts.push({ ...this.conflictView(b), courtName: court.name });
+      }
+      // Round 5, O5-S9: the scan above only saw the closure date, but
+      // the booking model stores early-morning games on the MORNING
+      // date — a Sat 00:30 game on a Fri 18:00–02:00 court is a
+      // Sat-dated booking. Closing Friday night used to create blocks
+      // physically covering Sat 00:30 while never listing that booking
+      // as a conflict, so the owner believed the night fully closed
+      // while the game stayed active. Scan next-date bookings with
+      // startMinutes < 360 falling inside the closed night's spill
+      // window (window end past 1440, shifted to next-date minutes),
+      // exactly as createBlock scans its next-date spill bookings.
+      const spillEnds = windows
+        .filter((w) => w.endMinutes > 1440)
+        .map((w) => w.endMinutes - 1440);
+      if (spillEnds.length > 0) {
+        const nextDate = new Date(date);
+        nextDate.setDate(nextDate.getDate() + 1);
+        const nextRows = await this.prisma.booking.findMany({
+          where: {
+            courtId: court.id,
+            date: nextDate,
+            status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+            startMinutes: { lt: 360 },
+          },
+          include: { user: { select: { name: true } } },
+          orderBy: { startMinutes: 'asc' },
+        });
+        for (const b of nextRows) {
+          if (spillEnds.some((spillEnd) => b.startMinutes < spillEnd)) {
+            conflicts.push({ ...this.conflictView(b), courtName: court.name });
+          }
+        }
       }
     }
     return { created, conflicts };
@@ -1764,6 +1928,38 @@ export class OwnerService {
   }
 
   /**
+   * The venue's booking window (Round 5, P5-S47/P5-S49), mirroring
+   * BookingsService.validateWindow, which is private to that service
+   * and cannot be called from here. Instants, not calendar dates:
+   * setHours rolls startMinutes past 1440 across midnight, so a
+   * spill-start slot gets its true instant.
+   */
+  private assertAdvanceWindow(
+    venue: { minAdvanceMinutes: number; maxAdvanceDays: number },
+    date: Date,
+    startMinutes: number,
+  ) {
+    const now = new Date();
+    const bookingAt = new Date(date);
+    bookingAt.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
+    const minAt = new Date(now.getTime() + venue.minAdvanceMinutes * 60_000);
+    if (bookingAt < minAt) {
+      throw new BadRequestException(
+        `Bookings need at least ${venue.minAdvanceMinutes} minutes notice`,
+      );
+    }
+    const maxBookableAt = new Date(
+      now.getTime() + venue.maxAdvanceDays * 24 * 3600_000,
+    );
+    if (bookingAt > maxBookableAt) {
+      throw new BadRequestException(
+        `Bookings open only ${venue.maxAdvanceDays} days ahead`,
+      );
+    }
+    if (bookingAt <= now) throw new BadRequestException('Cannot book a slot in the past');
+  }
+
+  /**
    * Re-validates a pending reschedule request at accept time. The world
    * may have changed since the player asked: the booking may have left
    * the confirmed state, the venue may have been sanctioned / paused /
@@ -1798,6 +1994,14 @@ export class OwnerService {
     if (slotAt <= new Date()) {
       throw new BadRequestException('Requested slot is no longer in the future');
     }
+    // Round 5, P5-S49 (accept time): a reschedule used to ignore the
+    // venue's min/max-advance windows entirely — a move to a slot 30
+    // minutes out, or 6 months out, passed at request AND accept even
+    // though fresh creation would refuse both. Same instants as
+    // bookings.validateWindow (min-advance horizon, max-advance
+    // horizon, past), applied to the requested slot here and re-run
+    // inside the accept transaction (P5-S47) below.
+    this.assertAdvanceWindow(court.venue, req.requestedDate, startMinutes);
     // Alignment + the requested day's open windows (weekly template
     // or the court's default hours).
     const reqWindows = await this.courtsSvc.windowsForDate(court, req.requestedDate);
@@ -1933,7 +2137,17 @@ export class OwnerService {
       include: { booking: true },
     });
     if (!req) throw new NotFoundException('Request not found');
-    if (req.status !== 'pending') throw new BadRequestException('Request already decided');
+    // Round 5, P5-T21 (accept side): a withdrawn request must not
+    // surface as the generic "already decided" — the owner opening
+    // the request just as the player withdraws could not tell
+    // withdrawal from a rival decision. (The withdraw notification
+    // itself belongs to another worker.)
+    if (req.status !== 'pending') {
+      if (req.status === 'withdrawn') {
+        throw new BadRequestException('This request was withdrawn by player');
+      }
+      throw new BadRequestException('Request already decided');
+    }
     const venue = await this.assertVenue(user, req.booking.venueId);
 
     // Any accept-time validation failure auto-rejects the request with
@@ -2043,6 +2257,61 @@ export class OwnerService {
         // or suspended since validation — a move into it must fail
         // rather than confirm onto a dead court.
         await this.courtsSvc.assertBookableInTx(tx, court.id);
+        // Round 5, R5-S10 + P5-S47: the commit used to re-run booking
+        // clashes only, despite the comment claiming "the same
+        // checks" — an owner block added (or hours shrunk, or the
+        // advance window crossed) between validation and commit still
+        // confirmed into blocked/out-of-hours/too-soon time, while
+        // booking creation's tx re-checks both. Re-run them here
+        // under the court lock, with tx-fresh court/venue rows.
+        // Window fit, with the same previous-evening spill handling
+        // as validation (a Sat 00:30 move is the tail of Fri's
+        // overnight window, not a Sat window).
+        const txCourt = await tx.court.findUniqueOrThrow({
+          where: { id: court.id },
+          select: { slotMinutes: true, openMinutes: true, closeMinutes: true },
+        });
+        const txWindows = await this.courtsSvc.windowsForDateInTx(
+          tx,
+          { id: court.id, openMinutes: txCourt.openMinutes, closeMinutes: txCourt.closeMinutes },
+          req.requestedDate,
+        );
+        let txWindow = txWindows.find(
+          (w) => startMinutes >= w.startMinutes && endMinutes <= w.endMinutes,
+        );
+        if (!txWindow && startMinutes < 360) {
+          const prevDate = new Date(req.requestedDate);
+          prevDate.setDate(prevDate.getDate() - 1);
+          const prevWindows = await this.courtsSvc.windowsForDateInTx(
+            tx,
+            { id: court.id, openMinutes: txCourt.openMinutes, closeMinutes: txCourt.closeMinutes },
+            prevDate,
+          );
+          const spill = prevWindows
+            .filter((w) => w.endMinutes > 1440)
+            .map((w) => ({ startMinutes: w.startMinutes - 1440, endMinutes: w.endMinutes - 1440 }));
+          txWindow = spill.find(
+            (w) => startMinutes >= w.startMinutes && endMinutes <= w.endMinutes,
+          );
+        }
+        if (!txWindow || (startMinutes - txWindow.startMinutes) % txCourt.slotMinutes !== 0) {
+          throw new BadRequestException('Requested slot is outside court hours');
+        }
+        const txBlocked = await this.courtsSvc.blockedRangesForDate(
+          req.booking.courtId,
+          req.requestedDate,
+          tx,
+        );
+        if (
+          txBlocked.some((r) => startMinutes < r.endMinutes && endMinutes > r.startMinutes)
+        ) {
+          throw new ConflictException('Requested slot is blocked by the arena');
+        }
+        const txVenue = await tx.venue.findUniqueOrThrow({
+          where: { id: req.booking.venueId },
+          select: { minAdvanceMinutes: true, maxAdvanceDays: true },
+        });
+        this.assertAdvanceWindow(txVenue, req.requestedDate, startMinutes);
         const clash = await tx.booking.findFirst({
           where: {
             id: { not: req.bookingId },
@@ -2125,6 +2394,18 @@ export class OwnerService {
         return tx.booking.findUniqueOrThrow({ where: { id: req.bookingId } });
       });
     } catch (err) {
+      // A commit-time request claim miss can also be a withdrawal
+      // landing between validation and commit (P5-T21): surface the
+      // distinct withdrawn error instead of the generic decided one.
+      if (err instanceof BadRequestException && err.message === 'Request already decided') {
+        const current = await this.prisma.rescheduleRequest.findUnique({
+          where: { id: requestId },
+          select: { status: true },
+        });
+        if (current?.status === 'withdrawn') {
+          throw new BadRequestException('This request was withdrawn by player');
+        }
+      }
       // A commit-time booking claim miss means the booking left the
       // confirmed state (cancelled, expired, or checked in) after
       // validation: auto-reject the request like a validation failure,
@@ -2272,9 +2553,14 @@ export class OwnerService {
 
   async staffList(user: AuthUser, venueId: string) {
     await this.assertVenue(user, venueId);
+    // Round 5, O5-S14: include user.status so a suspended staffer is
+    // distinguishable from an active one (the panel previously showed
+    // name/email/role only, while "3 of 3 seats used" gave no hint
+    // which member was suspended). Seat enforcement counting stays
+    // as-is — suspended staff still consume seats until removed.
     return this.prisma.venueStaff.findMany({
       where: { venueId },
-      include: { user: { select: { id: true, name: true, email: true, role: { select: { name: true } } } } },
+      include: { user: { select: { id: true, name: true, email: true, status: true, role: { select: { name: true } } } } },
     });
   }
 
@@ -2480,15 +2766,56 @@ export class OwnerService {
         `${role._count.users} team member(s) still hold this role — reassign them first`,
       );
     }
-    await this.prisma.role.delete({ where: { id: roleId } });
+    // Round 5, D5-S50: the count above used to be followed by a bare
+    // delete — a staffer assigned to the role in between hit a raw
+    // Prisma P2003 500. Delete inside a transaction holding the role
+    // row lock (a concurrent assignment's FK insert takes a FOR KEY
+    // SHARE lock on the role row and blocks behind it), re-count
+    // inside, and still map a raced P2003 to the clean 409-style
+    // refusal as a backstop.
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Role" WHERE id = ${roleId} FOR UPDATE`;
+        const inUse = await tx.user.count({ where: { roleId } });
+        if (inUse > 0) {
+          throw new BadRequestException(
+            `${inUse} team member(s) still hold this role — reassign them first`,
+          );
+        }
+        await tx.role.delete({ where: { id: roleId } });
+      });
+    } catch (e) {
+      if ((e as { code?: string })?.code === 'P2003') {
+        throw new ConflictException('Role still has users assigned');
+      }
+      throw e;
+    }
     return { deleted: true };
   }
 
   // ------------------------------------------------------------ own promos
-  /** Promos this owner manages (venue-scoped), across all his venues. */
+  /**
+   * Promos this caller manages (venue-scoped). Owners see their own
+   * venues' promos; staff see the promos of venues they manage
+   * (read-only list — create/update/delete stay owner-only via
+   * assertMyPromo). Round 5, O5-S6: the old ownerId-only filter gave
+   * every staffer zero rows while the panel copy told them they
+   * could see promos.
+   */
   async listMyPromos(user: AuthUser) {
+    const links = await this.prisma.venueStaff.findMany({
+      where: { userId: user.id },
+      select: { venueId: true },
+    });
     return this.prisma.promoCode.findMany({
-      where: { venue: { ownerId: user.id } },
+      where: {
+        venue: {
+          OR: [
+            { ownerId: user.id },
+            ...(links.length > 0 ? [{ id: { in: links.map((l) => l.venueId) } }] : []),
+          ],
+        },
+      },
       include: { venue: { select: { id: true, name: true } } },
       orderBy: { createdAt: 'desc' },
     });
@@ -2640,8 +2967,17 @@ export class OwnerService {
   }
 
   async deleteMyPromo(user: AuthUser, promoId: string) {
-    const promo = await this.assertMyPromo(user, promoId);
-    if (promo.usedCount > 0) {
+    await this.assertMyPromo(user, promoId);
+    // Round 5, D5-S51: the guard used to read the usedCount counter,
+    // but the FK it can actually violate is PromoRedemption (no
+    // onDelete action; bookings are safe via SetNull). If usedCount
+    // ever drifts below the true redemption count, deleting an
+    // "unused" promo threw a raw P2003. Guard on the real redemption
+    // rows instead.
+    const redemptions = await this.prisma.promoRedemption.count({
+      where: { promoCodeId: promoId },
+    });
+    if (redemptions > 0) {
       throw new BadRequestException(
         'This promo has been used — deactivate it instead of deleting',
       );
@@ -2728,6 +3064,11 @@ export class OwnerService {
       });
       if (
         exists.status === 'suspended' &&
+        // Round 5, D5-S55 (hardening, same rule as setUserStatus):
+        // a self-deleted account (deletedAt set) must never be
+        // revived through re-hire into a dead-end active account
+        // with an undeliverable .invalid email and no password.
+        !exists.deletedAt &&
         exists.role.scope === 'arena' &&
         exists.role.name !== 'owner' &&
         exists.role.name !== 'player' &&
@@ -2958,6 +3299,14 @@ export class OwnerService {
           orderBy: { createdAt: 'desc' },
           take: 10,
           include: { plan: { select: { name: true } } },
+        }),
+        // Round 5, O5-T4: the 10 rows above used to ship with no
+        // total, so "Payment history · latest 10" could not tell a
+        // complete history from a truncated one (at exactly 10 rows
+        // an 11th older payment was invisible). The panel round
+        // renders "latest 10 of N" from this total.
+        paymentsTotal: await this.prisma.venuePayment.count({
+          where: { venueId: v.id },
         }),
       });
     }

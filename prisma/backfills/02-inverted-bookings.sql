@@ -39,9 +39,14 @@
 --             get their strike REVERSED (User.noShowCount -1 per
 --             booking, floored at 0 — markNoShow increments exactly
 --             once per booking, so one reversal per booking is exact)
---             and are cancelled like the rest; inverted bookings
---             already in completed are cancelled too, which removes
---             their phantom revenue from confirmed+completed sums.
+--             and are cancelled like the rest. Inverted bookings
+--             already in completed are REPORTED ONLY, never cancelled
+--             (Round 5, R3 decision): a played game cannot be
+--             un-played — cancelling a completed booking would
+--             rewrite history (revenue, reviews, strikes already
+--             settled around it) for a slot that, however it was
+--             stored, was treated as played. The leftover report
+--             (STEP 8b) lists them for operator review instead.
 --             Suspension state is deliberately NOT auto-reversed: a
 --             suspension may have other causes, so the audit row
 --             flags it for operator review instead.
@@ -59,6 +64,19 @@
 --         while this script runs.
 -- RUN:    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f 02-inverted-bookings.sql
 -- ============================================================================
+
+-- Round 5, D5-T3 guard — ABORTS before anything is written if any
+-- ACTIVE slotMinutes <= 0 court remains (i.e. backfill 01 has not
+-- been run, or a new bad court appeared since). The code guards
+-- already refuse new bookings on such courts, so this is an
+-- ordering enforcement, not a data repair: run 01 first, then 02.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM "Court" WHERE "slotMinutes" <= 0 AND "isActive" = true) THEN
+    RAISE EXCEPTION 'Backfill 02 aborted: % active court(s) with slotMinutes <= 0 remain — run prisma/backfills/01-bad-slotminutes-courts.sql first (backfill 01), then re-run this script.',
+      (SELECT COUNT(*) FROM "Court" WHERE "slotMinutes" <= 0 AND "isActive" = true);
+  END IF;
+END $$;
 
 -- STEP 0 — dry run (read-only).
 SELECT "id", "userId", "venueId", "courtId", "date", "startMinutes",
@@ -91,13 +109,15 @@ WHERE "endMinutes" <= "startMinutes"
 -- equals the snapshot (D5-S6): a booking legitimately completed
 -- between STEP 1 and here keeps its completion. Cancelled ids land
 -- in bf_cancelled, and every later step gates on it — never on the
--- raw snapshot.
+-- raw snapshot. Completed rows are EXCLUDED here (R3 decision,
+-- see (f) above): they are reported in STEP 8b, never cancelled.
 CREATE TEMP TABLE bf_cancelled ON COMMIT DROP AS
 WITH cancelled AS (
   UPDATE "Booking" b
   SET "status" = 'cancelled'
   FROM bf_inverted t
   WHERE b."id" = t."id" AND b."status" = t.prior_status
+    AND t.prior_status IN ('pending', 'confirmed', 'no_show')
   RETURNING b."id"
 )
 SELECT c."id" FROM cancelled c;
@@ -168,7 +188,6 @@ SELECT
   'Booking cancelled — invalid slot',
   CASE t.prior_status
     WHEN 'no_show' THEN 'A booking at your arena was cancelled because its slot was stored incorrectly (end before start) and could never be played. The no-show strike recorded for it has been reversed. Please re-book the slot.'
-    WHEN 'completed' THEN 'A booking at your arena was cancelled because its slot was stored incorrectly (end before start) and could never be played. No no-show strike was recorded. Please re-book the slot.'
     ELSE 'A booking at your arena was cancelled because its slot was stored incorrectly (end before start) and could never be played. No no-show strike was recorded. Please re-book the slot.'
   END,
   now()
@@ -178,7 +197,8 @@ WHERE t."userId" IS NOT NULL
 ON CONFLICT ("id") DO NOTHING;
 
 -- STEP 7 — audit trail (one system row per cancelled booking, with
--- the prior status so no_show/completed handling is reconstructable).
+-- the prior status so no_show handling is reconstructable; completed
+-- rows are not cancelled and appear only in the STEP 8b report).
 INSERT INTO "AuditLog" ("id", "actorId", "action", "entity", "entityId", "details", "createdAt")
 SELECT
   'bf-inverted-audit-' || t."id",
@@ -188,7 +208,6 @@ SELECT
   t."id",
   'Round-4 backfill: cancelled stored inverted booking (' || t."startMinutes" || '–' || t."endMinutes" || ' on ' || t."date"::text || ', was ' || t.prior_status || '), promo refunded, game post closed' ||
   CASE WHEN t.prior_status = 'no_show' THEN ' (prior strike reversed; suspension NOT auto-reversed)'
-       WHEN t.prior_status = 'completed' THEN ' (no strike had been recorded)'
        ELSE ' (no strike recorded)' END,
   now()
 FROM bf_inverted t
@@ -203,6 +222,21 @@ SELECT 'skipped-status-changed' AS issue, t."id", t.prior_status,
        b."status" AS current_status
 FROM bf_inverted t
 JOIN "Booking" b ON b."id" = t."id"
-WHERE t."id" NOT IN (SELECT "id" FROM bf_cancelled);
+WHERE t."id" NOT IN (SELECT "id" FROM bf_cancelled)
+  AND t.prior_status <> 'completed';
+
+-- STEP 8b — leftover report (read-only): completed inverted bookings
+-- are deliberately NOT cancelled (R3 decision — a played game cannot
+-- be un-played). These stay completed with their revenue/reviews
+-- intact; the operator reviews them individually (e.g. whether the
+-- slot was in fact played under a corrected grid) and takes no bulk
+-- action from this script.
+SELECT 'leftover-completed-inverted' AS issue, t."id", t."userId",
+       t."venueId", t."courtId", t."date", t."startMinutes",
+       t."endMinutes", u."noShowCount"
+FROM bf_inverted t
+LEFT JOIN "User" u ON u."id" = t."userId"
+WHERE t.prior_status = 'completed'
+ORDER BY t."date", t."venueId";
 
 COMMIT;

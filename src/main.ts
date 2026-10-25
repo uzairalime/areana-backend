@@ -224,21 +224,46 @@ async function bootstrap() {
   // edited `.env` file is visible in the deploy log instead of
   // discovered from a support ticket. Secrets (JWT, SMTP creds, DB
   // password inside DATABASE_URL) are never logged.
+  // Round 5, D5-T12: the log also carries SMTP-auth-configured
+  // (boolean only), the DATABASE_URL host/database (non-secret
+  // parts only — never user/password/query), the S3 bucket/endpoint
+  // when the driver is s3, THROTTLE_LIMIT, and MAIL_FROM, so a
+  // mis-wired deploy is diagnosable from this one line.
+  const dbUrlParts = (() => {
+    try {
+      const u = new URL(process.env.DATABASE_URL ?? '');
+      return `${u.hostname}/${u.pathname.replace(/^\/+/, '')}`;
+    } catch {
+      return '(unparseable)';
+    }
+  })();
+  const s3 = config.get('storage.s3') as Record<string, string | undefined>;
   console.log(
     `[BOOT] config: NODE_ENV=${NODE_ENV ?? 'unset'} TZ=${effectiveTz} ` +
       `CORS=${corsOrigin.length > 0 ? corsOrigin.join(',') : '(none)'} ` +
       `SMTP=${config.get('smtp.host')}:${config.get('smtp.port')} ` +
+      `SMTP_AUTH=${config.get('smtp.user') && config.get('smtp.pass') ? 'yes' : 'no'} ` +
+      `MAIL_FROM=${config.get('smtp.from')} ` +
+      `DATABASE=${dbUrlParts} ` +
       `FCM=${config.get('fcm.enabled') ? 'enabled' : 'disabled'} ` +
-      `storage=${config.get('storage.driver')} TRUST_PROXY=${trustProxy ?? 'unset'}`,
+      `storage=${config.get('storage.driver')}` +
+      (config.get('storage.driver') === 's3'
+        ? ` S3_BUCKET=${s3.bucket ?? '(unset)'} S3_ENDPOINT=${s3.endpoint ?? '(unset)'}`
+        : '') +
+      ` THROTTLE_LIMIT=${process.env.THROTTLE_LIMIT ?? '300'} ` +
+      `TRUST_PROXY=${trustProxy ?? 'unset'}`,
   );
 
   // Round 4, P-S11: Postgres bakes its timezone at initdb — changing
   // the TZ env on an existing pgdata volume does NOT change the
   // cluster's setting, and the app never checked. Assert the DB
-  // session timezone at boot. (A DB that is down at boot already
-  // fails earlier, at Prisma $connect in onModuleInit; this check's
-  // warn path covers a DB that drops between connect and here, and
-  // /api/health reports the outage to the orchestrator.)
+  // session timezone at boot.
+  // PgBouncer caveat: this samples a single pooled connection, so it
+  // validates the cluster/database default timezone, not a
+  // per-session SET timezone — under transaction pooling a session
+  // override on some other connection would not be seen here. That
+  // is acceptable because this app never SETs timezone per session;
+  // the database default is what every pooled connection inherits.
   try {
     const prisma = app.get(PrismaService);
     const rows = await prisma.$queryRaw<{ TimeZone: string }[]>`SHOW timezone`;
@@ -250,7 +275,14 @@ async function bootstrap() {
       );
     }
   } catch (e) {
-    console.warn(`[BOOT WARNING] Could not check Postgres timezone: ${(e as Error).message}`);
+    // Round 5, D5-T11: a check that itself errors must FAIL boot on
+    // production-like envs (same tzMustFail rule as a wrong TZ), not
+    // warn-and-continue into an unverified timezone. Dev/test keep
+    // the warn path (a DB that drops between connect and here is a
+    // local transient; /api/health still reports the outage).
+    const msg = `Could not check Postgres timezone: ${(e as Error).message}`;
+    if (tzMustFail) throw new Error(`[BOOT] ${msg}`);
+    console.warn(`[BOOT WARNING] ${msg}`);
   }
 
   app.setGlobalPrefix('api');

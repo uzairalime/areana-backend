@@ -68,25 +68,32 @@ export class VenuesService {
         'For an "Other" report, please add a few details (at least 10 characters) so our team can act on it.',
       );
     }
-    const openCount = await this.prisma.venueReport.count({
-      where: { userId, status: 'open' },
-    });
-    if (openCount >= 10) {
-      throw new ConflictException(
-        'You have too many open reports right now — please wait for our team to review them.',
-      );
-    }
-    // openKey is the race guard: two concurrent reports both pass the
-    // check above, but only one insert with this key can land.
+    // Round 5, P5-S58: the cap counts status IN ('open','reviewed')
+    // — matching the duplicate rule above, so a pile of reports
+    // under investigation counts — and the cap-check is serialized
+    // with the create in one transaction (user-row lock), so
+    // parallel reports at 9 cannot both pass and overshoot to 11.
+    // openKey remains the race guard for the per-venue duplicate.
     try {
-      return await this.prisma.venueReport.create({
-        data: {
-          venueId,
-          userId,
-          category: body.category,
-          details: body.details?.trim() || null,
-          openKey: `${venueId}:${userId}`,
-        },
+      return await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR UPDATE`;
+        const outstandingCount = await tx.venueReport.count({
+          where: { userId, status: { in: ['open', 'reviewed'] } },
+        });
+        if (outstandingCount >= 10) {
+          throw new ConflictException(
+            'You have too many open reports right now — please wait for our team to review them.',
+          );
+        }
+        return tx.venueReport.create({
+          data: {
+            venueId,
+            userId,
+            category: body.category,
+            details: body.details?.trim() || null,
+            openKey: `${venueId}:${userId}`,
+          },
+        });
       });
     } catch (e) {
       if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {

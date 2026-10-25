@@ -42,28 +42,33 @@ export class UsersController {
 
   @Patch('me')
   async updateMe(@CurrentUser() user: AuthUser, @Body() dto: UpdateMeDto) {
-    // Blank/unformatted values must not store (Round 4 trivial):
-    // whitespace-only names/cities/phones used to overwrite real
-    // profile data with ' '. Values are trimmed; a provided field
-    // that trims to empty is rejected, and a phone with no digits is
-    // rejected (digits, spaces, +, - and parentheses only).
+    // Round 5, R5-S12 (policy, chosen consistently): blank fields are
+    // IGNORED per-field, never a whole-PATCH failure and never a
+    // clear — a partial edit sending { name: "New Name", city: "" }
+    // now saves the name and leaves the city untouched, instead of
+    // 400ing and discarding the valid change too. There is therefore
+    // still no way to CLEAR a field via this endpoint (a cleared
+    // panel field is omitted by the panel, which is the same outcome);
+    // clearing, if ever wanted, must be an explicit null contract,
+    // not a blank string. Non-blank values are trimmed as before,
+    // and a non-blank phone with no digits is still rejected.
     const data: { name?: string; phone?: string; city?: string } = {};
-    if (dto.name !== undefined) {
+    if (dto.name != null) {
       const name = dto.name.trim();
-      if (!name) throw new BadRequestException('Name cannot be blank');
-      data.name = name;
+      if (name) data.name = name;
     }
-    if (dto.phone !== undefined) {
+    if (dto.phone != null) {
       const phone = dto.phone.trim();
-      if (!phone || !/^\+?[0-9\s\-()]+$/.test(phone) || !/\d/.test(phone)) {
-        throw new BadRequestException('Phone number is not valid');
+      if (phone) {
+        if (!/^\+?[0-9\s\-()]+$/.test(phone) || !/\d/.test(phone)) {
+          throw new BadRequestException('Phone number is not valid');
+        }
+        data.phone = phone;
       }
-      data.phone = phone;
     }
-    if (dto.city !== undefined) {
+    if (dto.city != null) {
       const city = dto.city.trim();
-      if (!city) throw new BadRequestException('City cannot be blank');
-      data.city = city;
+      if (city) data.city = city;
     }
     if (Object.keys(data).length === 0) {
       const { passwordHash: _p, ...current } = await this.prisma.user.findUniqueOrThrow({

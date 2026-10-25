@@ -217,9 +217,11 @@ export class CourtsService {
     // uncommitted work inside that transaction (booking creation
     // re-checks overlap under the court row lock).
     const db = tx ?? this.prisma;
+    const prevDay = new Date(date);
+    prevDay.setDate(prevDay.getDate() - 1);
     const nextDay = new Date(date);
     nextDay.setDate(nextDay.getDate() + 1);
-    const [oneOff, recurring, nextBlocks] = await Promise.all([
+    const [oneOff, recurring, nextBlocks, prevBlocks] = await Promise.all([
       db.slotBlock.findMany({
         where: { courtId, date },
         select: { startMinutes: true, endMinutes: true },
@@ -232,10 +234,28 @@ export class CourtsService {
         where: { courtId, date: nextDay, startMinutes: { lt: 360 } },
         select: { startMinutes: true, endMinutes: true },
       }),
+      // Round 5, O5-S10 (= R5-S11): the MIRROR spill — a previous-day
+      // one-off block running past midnight (e.g. Fri 23:00–01:00)
+      // physically covers this date's early hours, yet was never
+      // reported here, so Sat availability showed 00:00–01:00 free
+      // and a Sat 00:00–01:00 booking sold into blocked time.
+      // Shifted −1440 and clamped at 0 (the tail starts at midnight
+      // on this date even when the block started the evening before).
+      // Recurring blocks cannot cross midnight, so this is one-off
+      // blocks only; template courts are protected separately by
+      // the template spill check.
+      db.slotBlock.findMany({
+        where: { courtId, date: prevDay, endMinutes: { gt: 1440 } },
+        select: { startMinutes: true, endMinutes: true },
+      }),
     ]);
     const spill = nextBlocks.map((b) => ({
       startMinutes: b.startMinutes + 1440,
       endMinutes: b.endMinutes + 1440,
+    }));
+    const prevSpill = prevBlocks.map((b) => ({
+      startMinutes: Math.max(0, b.startMinutes - 1440),
+      endMinutes: b.endMinutes - 1440,
     }));
     const weekday = date.getDay();
     const dayStr = toYmd(date);
@@ -266,7 +286,46 @@ export class CourtsService {
         startMinutes: r.startMinutes + 1440,
         endMinutes: r.endMinutes + 1440,
       }));
-    return [...oneOff, ...rec, ...spill, ...recSpill];
+    return [...oneOff, ...rec, ...spill, ...recSpill, ...prevSpill];
+  }
+
+  /**
+   * Shared shrink guard (Round 5, O5-S5): the ONE implementation both
+   * the owner and admin updateCourt paths use. Counts upcoming
+   * pending + confirmed bookings that fall outside the EFFECTIVE
+   * windows for their own date — template if present, else the given
+   * headline hours — not the headline alone. The admin path used to
+   * count confirmed only against raw headline hours, so it stranded
+   * pending bookings and template-governed bookings the owner path
+   * refused; the two paths now agree on whether an edit is legal.
+   */
+  async countStrandedBookings(
+    courtId: string,
+    headline: { openMinutes: number; closeMinutes: number },
+  ): Promise<number> {
+    const upcoming = await this.prisma.booking.findMany({
+      where: {
+        courtId,
+        date: { gte: startOfToday() },
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+      },
+      select: { date: true, startMinutes: true, endMinutes: true },
+    });
+    let stranded = 0;
+    for (const b of upcoming) {
+      const windows = await this.windowsForDate(
+        { id: courtId, openMinutes: headline.openMinutes, closeMinutes: headline.closeMinutes },
+        b.date,
+      );
+      if (
+        !windows.some(
+          (w) => b.startMinutes >= w.startMinutes && b.endMinutes <= w.endMinutes,
+        )
+      ) {
+        stranded++;
+      }
+    }
+    return stranded;
   }
 
   /**

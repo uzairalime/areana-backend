@@ -58,17 +58,29 @@ export class WaitlistService {
       throw new BadRequestException('That slot has already passed');
     }
 
-    const active = await this.prisma.slotWaitlist.count({
-      where: { userId, notifiedAt: null, date: { gte: startOfToday() } },
-    });
-    if (active >= MAX_ACTIVE) {
-      throw new BadRequestException(
-        `You're already waiting on ${MAX_ACTIVE} slots — remove one first`,
-      );
-    }
+    // Round 5, P5-S57: the 10-cap is enforced inside the same
+    // transaction as the create below (user-row lock serializes
+    // parallel joins for one player), and entries whose slot start
+    // has already passed no longer count — see the in-tx count.
+    // (The old pre-check counted dead same-day entries until
+    // midnight and raced parallel joins past the cap.)
 
     // The slot must exist on the day's grid and actually be taken.
-    const avail = await this.availability.getAvailability(dto.courtId, dto.date);
+    let avail;
+    try {
+      avail = await this.availability.getAvailability(dto.courtId, dto.date);
+    } catch (e) {
+      // Round 5, P5-S54 (waitlist leg): this path funnels through
+      // getActiveCourt, so an overdue-unswept (or just-paused)
+      // court surfaces as a misleading "Court not found". Say so
+      // honestly instead; other errors pass through untouched.
+      if ((e as Error)?.message?.includes('Court not found')) {
+        throw new NotFoundException(
+          'This court is no longer bookable — it may be paused or past its payment grace period',
+        );
+      }
+      throw e;
+    }
     const slot = avail.slots.find((s) => s.startMinutes === dto.startMinutes);
     if (!slot) throw new BadRequestException('No such slot on that day');
     if (slot.available) {
@@ -183,26 +195,47 @@ export class WaitlistService {
     // clearing it on re-join lets the player wait again after a
     // ping they missed or could not act on. An active (un-notified)
     // entry still conflicts below.
-    await this.prisma.slotWaitlist.deleteMany({
-      where: {
-        userId,
-        courtId: dto.courtId,
-        date,
-        startMinutes: dto.startMinutes,
-        notifiedAt: { not: null },
-      },
-    });
+    // Round 5, P5-S56 + P5-S57: the delete + cap-check + create run
+    // in ONE transaction, serialized per player by a lock on the
+    // user row — parallel joins can no longer both read 9 and both
+    // create, and a re-join's delete cannot strand a row created
+    // against a stale cap read.
+    let entry;
     try {
-      return await this.prisma.slotWaitlist.create({
-        data: {
-          userId,
-          courtId: dto.courtId,
-          date,
-          startMinutes: dto.startMinutes,
-          // The waited slot size (Round 4): pings must step the
-          // waited grid, not the court's current slot length.
-          slotMinutes: court.slotMinutes,
-        },
+      entry = await this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR UPDATE`;
+        const actives = await tx.slotWaitlist.findMany({
+          where: { userId, notifiedAt: null },
+          select: { date: true, startMinutes: true },
+        });
+        const activeCount = actives.filter(
+          (e) => slotStartAt(e) > new Date(),
+        ).length;
+        if (activeCount >= MAX_ACTIVE) {
+          throw new BadRequestException(
+            `You're already waiting on ${MAX_ACTIVE} slots — remove one first`,
+          );
+        }
+        await tx.slotWaitlist.deleteMany({
+          where: {
+            userId,
+            courtId: dto.courtId,
+            date,
+            startMinutes: dto.startMinutes,
+            notifiedAt: { not: null },
+          },
+        });
+        return tx.slotWaitlist.create({
+          data: {
+            userId,
+            courtId: dto.courtId,
+            date,
+            startMinutes: dto.startMinutes,
+            // The waited slot size (Round 4): pings must step the
+            // waited grid, not the court's current slot length.
+            slotMinutes: court.slotMinutes,
+          },
+        });
       });
     } catch (e) {
       if (
@@ -213,11 +246,48 @@ export class WaitlistService {
       }
       throw e;
     }
+    // Round 5, P5-S56: the slot may have freed between the
+    // availability read above and this create (a cancel whose
+    // notify snapshot ran before this row existed). Re-check now:
+    // if it is free, drop the just-created row and return
+    // "book it now" instead of a waitlist row that could never fire.
+    const fresh = await this.availability
+      .getAvailability(dto.courtId, dto.date)
+      .catch(() => null);
+    const freshSlot = fresh?.slots.find((s) => s.startMinutes === dto.startMinutes);
+    if (freshSlot?.available) {
+      await this.prisma.slotWaitlist
+        .delete({ where: { id: entry.id } })
+        .catch(() => {});
+      return {
+        bookNow: true,
+        message: 'That slot is open — you can book it now',
+        courtId: dto.courtId,
+        date: dto.date,
+        startMinutes: dto.startMinutes,
+      };
+    }
+    return entry;
   }
 
   listMine(userId: string) {
+    // Round 5, P5-T20: keep only slots not yet started, by start
+    // instant — an earlier-today slot that never freed no longer
+    // shows "Waiting" until midnight, and a yesterday spill-start
+    // slot still upcoming after midnight still shows.
+    const today = startOfToday();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const nowMin = minutesSinceMidnight();
     return this.prisma.slotWaitlist.findMany({
-      where: { userId, date: { gte: startOfToday() } },
+      where: {
+        userId,
+        OR: [
+          { date: { gt: today } },
+          { date: today, startMinutes: { gt: nowMin } },
+          { date: yesterday, startMinutes: { gt: 1440 + nowMin } },
+        ],
+      },
       include: {
         court: {
           select: {

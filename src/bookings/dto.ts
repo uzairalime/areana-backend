@@ -1,4 +1,5 @@
-import { IsIn, IsInt, IsOptional, IsString, Matches, Min } from 'class-validator';
+import { IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Min, MinLength } from 'class-validator';
+import { Transform } from 'class-transformer';
 import { OffsetQueryDto } from '../common/pagination';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -27,6 +28,16 @@ export class CreateBookingDto {
   @IsOptional()
   @IsString()
   promoCode?: string;
+
+  @ApiPropertyOptional({
+    example: 1600,
+    description:
+      'Total the player saw at confirm time (net, after discount). When supplied, booking creation compares it in-transaction: a mismatch 400s with the new gross/total instead of booking at a new price on a blind retry (Round 5, R5-S8).',
+  })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  expectedTotal?: number;
 }
 
 export class CreateRecurringDto {
@@ -66,11 +77,17 @@ export class MyBookingsQueryDto extends OffsetQueryDto {
 export class JoinSharedDto {
   @ApiProperty({ example: 'Ahmed' })
   @IsString()
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
+  @MinLength(1)
   name: string;
 
   @ApiPropertyOptional({ example: '03001234567' })
   @IsOptional()
   @IsString()
+  // Trimmed in the DTO; the service normalizes a blank phone to null,
+  // which the partial unique index on (bookingId, phone) requires —
+  // empty strings would otherwise collide across joiners (P5-T17).
+  @Transform(({ value }) => (typeof value === 'string' ? value.trim() : value))
   phone?: string;
 }
 

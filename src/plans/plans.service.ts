@@ -319,6 +319,15 @@ export class PlansService {
     if (payment.method === 'void') {
       throw new BadRequestException('This row is itself a reversal — it cannot be voided');
     }
+    // Round 5, R5-S3: refuse void on method='auto' rows — there is
+    // nothing of value to reverse (Rs 0), and the next sweep would
+    // re-settle the same period anyway, so a void only churns the
+    // ledger (reversal row, rolled-back flag, then a fresh Rs 0 row).
+    if (payment.method === 'auto') {
+      throw new BadRequestException(
+        'This is an automatic Rs 0 settlement — it cannot be voided (the sweep re-settles Rs 0 periods automatically)',
+      );
+    }
     // A period-less row has no coverage to roll back (R-S15): the flag
     // rollback and the override rewind both need the period, so such
     // rows are refused instead of half-unwound.
@@ -402,12 +411,21 @@ export class PlansService {
         });
         // Roll the paid flag back when this payment is still the
         // latest settlement (paidUntil within this period), and rewind
-        // a freeUntilOverride stacked past this period's start — the
-        // extension was stacked onto the coverage being voided, so it
-        // collapses to the same point. An override at or before the
-        // period start predates the voided coverage and is left alone.
-        // Both conditions are evaluated on the FRESH in-transaction
-        // row, never a pre-transaction snapshot.
+        // a freeUntilOverride stacked past this period's start.
+        // Round 5, R5-S4: the rewind restores the pre-extension
+        // snapshot (freeUntilOverridePrev, written by extendFree
+        // before overwriting) instead of collapsing the whole
+        // extension to the period start — an extension that predates
+        // the voided coverage, or was stacked in an earlier step,
+        // survives the void. An override at or before the period
+        // start predates the voided coverage and is left alone.
+        // STACKED-EXTENSION LIMITATION: freeUntilOverridePrev is a
+        // single scalar — it remembers only the immediately
+        // pre-extension value. A second stacked extension overwrites
+        // it, so voiding after two stacked extensions restores only
+        // to the first extension's result, not to the pre-extension
+        // state before both. Both conditions are evaluated on the
+        // FRESH in-transaction row, never a pre-transaction snapshot.
         const venueData: Prisma.VenueUpdateInput = {};
         if (
           fresh.billingPaidUntil &&
@@ -421,7 +439,7 @@ export class PlansService {
           payment.periodStart &&
           fresh.freeUntilOverride > payment.periodStart
         ) {
-          venueData.freeUntilOverride = payment.periodStart;
+          venueData.freeUntilOverride = fresh.freeUntilOverridePrev ?? null;
         }
         if (Object.keys(venueData).length > 0) {
           await tx.venue.update({ where: { id: venueId }, data: venueData });
@@ -433,6 +451,51 @@ export class PlansService {
         throw new BadRequestException('This payment was already voided');
       }
       throw e;
+    }
+    // Round 5, R5-S5: re-evaluate pause immediately from the FRESH
+    // billing summary — void was the only billing mutation that did
+    // not, so an overdue venue stayed listed and bookable until the
+    // nightly sweep re-paused it (and drained the bookings taken in
+    // the gap). A void that leaves the venue overdue pauses it at
+    // once, with the same audit + drain + notice the sweep applies.
+    // Pause side-effects are best-effort: the void itself already
+    // committed, so a failure here must not turn it into an error.
+    try {
+      const after = await this.prisma.venue.findUnique({ where: { id: venueId } });
+      if (after && !after.billingPaused) {
+        const summary = await this.billingSummary(after);
+        if (summary.status === 'overdue') {
+          await this.prisma.venue.update({
+            where: { id: venueId },
+            data: { billingPaused: true },
+          });
+          await this.prisma.auditLog
+            .create({
+              data: {
+                actorId: null,
+                action: 'venue.billing.paused',
+                entity: 'venue',
+                entityId: venueId,
+                details: `overdue after void of payment ${paymentId}: Rs ${summary.amountDue.toLocaleString('en-PK')} due for period ${summary.nextDueAt ?? 'unknown'}`,
+              },
+            })
+            .catch(() => {});
+          await this.bookings
+            .cancelVenueUpcomingBookings(venueId, "the arena's plan payment is overdue")
+            .catch(() => {});
+          await this.notifications
+            .pushToUser(after.ownerId, {
+              title: 'Venue paused — plan payment overdue',
+              body: `${after.name} is hidden from players until the yearly plan fee is settled. Contact Areana to reactivate instantly.`,
+              data: { type: 'billing_overdue' },
+            })
+            .catch(() => {});
+        }
+      }
+    } catch (e) {
+      this.logger.warn(
+        `Void pause re-evaluation failed for venue ${venueId}: ${(e as Error).message}`,
+      );
     }
     return result;
   }
@@ -493,59 +556,79 @@ export class PlansService {
       // ('auto') are not money, so they never block. No payment since
       // the last restart → the restart proceeds, so legitimate
       // repeated restarts are unaffected.
-      if (venue.billingStartAt) {
-        // Round 5, R5-B3: the old guard checked only the LATEST
-        // payment's void. Pay P1, pay P2, void P2, restart — the guard
-        // saw P2's void and passed, orphaning P1's still-standing
-        // settlement (money recorded, no longer reflected in any
-        // billing chain). Block restart if ANY non-void, non-auto
-        // payment since billingStartAt lacks a void reversal.
-        const settlements = await this.prisma.venuePayment.findMany({
-          // NULL method = a settlement recorded without a method:
-          // still money, so it blocks like any other payment.
-          where: {
-            venueId,
-            createdAt: { gt: venue.billingStartAt },
-            OR: [
-              { method: null },
-              { method: { notIn: ['void', 'auto'] } },
-            ],
-          },
-          select: { id: true },
-        });
-        if (settlements.length > 0) {
-          const voided = await this.prisma.venuePayment.findMany({
+      //
+      // Round 5, R5-S13: guard + update are ATOMIC — the venue row
+      // is locked (FOR UPDATE) inside one transaction and the guard
+      // re-reads billingStartAt + payments from that locked row, so
+      // a mark-paid landing between a pre-transaction guard read
+      // and the update can no longer be wiped (its ledger row
+      // surviving while its flag does not). The lock serializes
+      // against mark-paid's own in-transaction claim.
+      return this.prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+        const fresh = await tx.venue.findUnique({ where: { id: venueId } });
+        if (!fresh) throw new NotFoundException('Venue not found');
+        this.assertBillableVenue(fresh);
+        if (fresh.billingStartAt) {
+          // Round 5, R5-B3: the old guard checked only the LATEST
+          // payment's void. Pay P1, pay P2, void P2, restart — the
+          // guard saw P2's void and passed, orphaning P1's
+          // still-standing settlement (money recorded, no longer
+          // reflected in any billing chain). Block restart if ANY
+          // non-void, non-auto payment since billingStartAt lacks a
+          // void reversal. Round 5, R5-S2: Rs 0 rows are excluded
+          // (a Rs 0 manual mark-paid with method null must not
+          // block restart). Round 5, R5-T3: the boundary is >=, not
+          // > — a payment in the exact same millisecond as
+          // billingStartAt blocks (that instant is ambiguous).
+          const settlements = await tx.venuePayment.findMany({
+            // NULL method = a settlement recorded without a method:
+            // still money, so it blocks like any other payment.
             where: {
               venueId,
-              method: 'void',
-              note: { in: settlements.map((p) => `void:${p.id}`) },
+              createdAt: { gte: fresh.billingStartAt },
+              amount: { not: 0 },
+              OR: [
+                { method: null },
+                { method: { notIn: ['void', 'auto'] } },
+              ],
             },
-            select: { note: true },
+            select: { id: true },
           });
-          const voidedIds = new Set(voided.map((v) => (v.note ?? '').slice(5)));
-          const standing = settlements.filter((p) => !voidedIds.has(p.id));
-          if (standing.length > 0) {
-            throw new BadRequestException(
-              'This arena has payments recorded since its last billing restart that have not been voided — void those payments first, then restart billing.',
-            );
+          if (settlements.length > 0) {
+            const voided = await tx.venuePayment.findMany({
+              where: {
+                venueId,
+                method: 'void',
+                note: { in: settlements.map((p) => `void:${p.id}`) },
+              },
+              select: { note: true },
+            });
+            const voidedIds = new Set(voided.map((v) => (v.note ?? '').slice(5)));
+            const standing = settlements.filter((p) => !voidedIds.has(p.id));
+            if (standing.length > 0) {
+              throw new BadRequestException(
+                'This arena has payments recorded since its last billing restart that have not been voided — void those payments first, then restart billing.',
+              );
+            }
           }
         }
-      }
-      return this.prisma.venue.update({
-        where: { id: venueId },
-        data: {
-          planId,
-          billingStartAt: new Date(),
-          billingPaidUntil: null,
-          freeUntilOverride: null,
-          billingPeriodStart: null,
-          billingPeriodEnd: null,
-          billingPeriodPrice: null,
-          frozenPlanId: null,
-          billingPaused: false,
-          billingDueNotifiedFor: null,
-        },
-        include: { plan: true },
+        return tx.venue.update({
+          where: { id: venueId },
+          data: {
+            planId,
+            billingStartAt: new Date(),
+            billingPaidUntil: null,
+            freeUntilOverride: null,
+            billingPeriodStart: null,
+            billingPeriodEnd: null,
+            billingPeriodPrice: null,
+            frozenPlanId: null,
+            billingPaused: false,
+            billingDueNotifiedFor: null,
+          },
+          include: { plan: true },
+        });
       });
     }
     // Unchecked input: planId is a scalar FK, which the checked
@@ -617,6 +700,12 @@ export class PlansService {
       },
       data: {
         freeUntilOverride: newFreeUntil,
+        // Round 5, R5-S4: snapshot the pre-extension override before
+        // overwriting, so a later void rewind restores it instead of
+        // collapsing the whole extension to the voided period start.
+        // Single-scalar limitation: a second stacked extension
+        // overwrites this snapshot (see voidPayment's comment).
+        freeUntilOverridePrev: venue.freeUntilOverride,
         // Only un-pause when the venue is actually free again; an
         // extension that still ends in the past must not revive it.
         ...(newFreeUntil > now ? { billingPaused: false } : {}),
@@ -869,12 +958,16 @@ export class PlansService {
     const ctx = await this.context(venue);
     if (!ctx) return base;
     const { freeUntil, periodStart, paidUntil, now } = ctx;
-    base.freeUntil = freeUntil.toISOString();
 
     if (now < freeUntil) {
       const prepaid = paidUntil && paidUntil >= freeUntil;
       return {
         ...base,
+        // Round 5, O5-S12 (API part): freeUntil is populated ONLY
+        // for trial venues. Active/due/overdue venues used to show
+        // a stale past "Free until" date next to their paid-until
+        // date; for them it is null.
+        freeUntil: freeUntil.toISOString(),
         status: 'trial',
         nextDueAt: prepaid
           ? paidUntil.toISOString()
@@ -946,48 +1039,77 @@ export class PlansService {
       // first priced or not-yet-started period.
       let settledVenue = venue;
       let autoSettled = false;
-      for (;;) {
-        const ctx = await this.context(settledVenue);
-        if (!ctx || ctx.price !== 0) break;
-        if (ctx.periodStart > new Date()) break;
-        if (ctx.paidUntil && ctx.paidUntil >= ctx.periodEnd) break;
-        settledVenue = await this.prisma.$transaction(async (tx) => {
-          const updated = await tx.venue.update({
-            where: { id: venue.id },
-            data: { billingPaidUntil: ctx.periodEnd, billingPaused: false },
-            include: { plan: true, owner: { select: { id: true, name: true } } },
+      // Round 5, D5-S38: one venue's auto-settle failure must not
+      // abort the whole sweep (the pause claim below already had
+      // this try/catch + continue discipline; the settle loop did
+      // not). A failure here skips this venue for this sweep only.
+      try {
+        for (;;) {
+          const ctx = await this.context(settledVenue);
+          if (!ctx || ctx.price !== 0) break;
+          if (ctx.periodStart > new Date()) break;
+          if (ctx.paidUntil && ctx.paidUntil >= ctx.periodEnd) break;
+          const next = await this.prisma.$transaction(async (tx) => {
+            // Round 5, D5-S37: the Rs 0 settle now carries the same
+            // conditional claim as mark-paid (billingPaidUntil <
+            // periodEnd). Two instances (or a boot-time sweep
+            // overlapping the 00:30 cron) settling the same zero
+            // period used to insert DUPLICATE ledger rows; the
+            // loser now claims zero rows and inserts nothing.
+            const claimed = await tx.venue.updateMany({
+              where: {
+                id: venue.id,
+                OR: [
+                  { billingPaidUntil: null },
+                  { billingPaidUntil: { lt: ctx.periodEnd } },
+                ],
+              },
+              data: { billingPaidUntil: ctx.periodEnd, billingPaused: false },
+            });
+            if (claimed.count === 0) return null;
+            const updated = await tx.venue.findUniqueOrThrow({
+              where: { id: venue.id },
+              include: { plan: true, owner: { select: { id: true, name: true } } },
+            });
+            // The settlement lands in the ledger like every other one
+            // (Round 4, R-S17): the old flag-only settle left the
+            // ledger, the payment history, and void all disagreeing
+            // about which periods were settled. A Rs 0 row with method
+            // 'auto' makes all three see the same settlements.
+            await tx.venuePayment.create({
+              data: {
+                venueId: venue.id,
+                planId: ctx.plan.id,
+                amount: 0,
+                method: 'auto',
+                note: null,
+                periodStart: ctx.periodStart,
+                periodEnd: ctx.periodEnd,
+                recordedById: null,
+              },
+            });
+            return updated;
           });
-          // The settlement lands in the ledger like every other one
-          // (Round 4, R-S17): the old flag-only settle left the
-          // ledger, the payment history, and void all disagreeing
-          // about which periods were settled. A Rs 0 row with method
-          // 'auto' makes all three see the same settlements.
-          await tx.venuePayment.create({
-            data: {
-              venueId: venue.id,
-              planId: ctx.plan.id,
-              amount: 0,
-              method: 'auto',
-              note: null,
-              periodStart: ctx.periodStart,
-              periodEnd: ctx.periodEnd,
-              recordedById: null,
-            },
-          });
-          return updated;
-        });
-        autoSettled = true;
-        await this.prisma.auditLog
-          .create({
-            data: {
-              actorId: null,
-              action: 'venue.billing.auto_settled',
-              entity: 'venue',
-              entityId: venue.id,
-              details: `zero-price period ${ctx.periodStart.toISOString().slice(0, 10)} – ${ctx.periodEnd.toISOString().slice(0, 10)} settled automatically (Rs 0 plan)`,
-            },
-          })
-          .catch(() => {});
+          if (!next) break; // another sweep settled this period first
+          settledVenue = next;
+          autoSettled = true;
+          await this.prisma.auditLog
+            .create({
+              data: {
+                actorId: null,
+                action: 'venue.billing.auto_settled',
+                entity: 'venue',
+                entityId: venue.id,
+                details: `zero-price period ${ctx.periodStart.toISOString().slice(0, 10)} – ${ctx.periodEnd.toISOString().slice(0, 10)} settled automatically (Rs 0 plan)`,
+              },
+            })
+            .catch(() => {});
+        }
+      } catch (e) {
+        this.logger.warn(
+          `Billing sweep: auto-settle failed for venue ${venue.id} — skipping this venue this sweep: ${(e as Error).message}`,
+        );
+        continue;
       }
       if (autoSettled && venue.billingPaused) {
         await this.notifications
