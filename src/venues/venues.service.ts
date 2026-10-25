@@ -2,6 +2,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { offsetPageFromDb } from '../common/pagination';
+import { haversineKm, roundKm } from '../common/distance';
 import { QueryVenuesDto } from './dto';
 import { PlansService } from '../plans/plans.service';
 
@@ -174,14 +175,22 @@ export class VenuesService {
 
   // Public listing — only approved venues are visible to players.
   async list(query: QueryVenuesDto) {
-    const { q, city, sport, surface, sort, page = 1, limit = 20 } = query;
+    const { q, city, sport, surface, sort, lat, lng, page = 1, limit = 20 } = query;
     // An unknown sort must not silently become rating (Round 4
-    // trivial): the DTO documents the four values, and this guard
+    // trivial): the DTO documents the five values, and this guard
     // holds even for callers that bypass DTO validation.
-    if (sort !== undefined && !['rating', 'price_asc', 'price_desc', 'name'].includes(sort)) {
+    if (sort !== undefined && !['rating', 'price_asc', 'price_desc', 'name', 'distance'].includes(sort)) {
       throw new BadRequestException(
-        `Unknown sort: ${sort} — expected rating, price_asc, price_desc, or name`,
+        `Unknown sort: ${sort} — expected rating, price_asc, price_desc, name, or distance`,
       );
+    }
+    // Distance sort needs a reference point, and a lone lat or lng is
+    // a client bug — fail fast instead of sorting by a half point.
+    if ((lat === undefined) !== (lng === undefined)) {
+      throw new BadRequestException('lat and lng must be provided together');
+    }
+    if (sort === 'distance' && (lat === undefined || lng === undefined)) {
+      throw new BadRequestException('Distance sort needs lat and lng');
     }
     // A suspended owner's venues are paused: hidden from players and
     // unbookable until the owner is reactivated (no state to unwind —
@@ -209,9 +218,12 @@ export class VenuesService {
       ];
     }
 
-    // Price sorts need the computed fromPrice, so they page in memory
-    // over the (bounded) matching set; the rest page in the database.
+    // Price sorts need the computed fromPrice, and distance sort needs
+    // the computed distanceKm, so both page in memory over the (bounded)
+    // matching set; the rest page in the database.
     const priceSort = sort === 'price_asc' || sort === 'price_desc';
+    const distanceSort = sort === 'distance';
+    const memorySort = priceSort || distanceSort;
     const orderBy: Prisma.VenueOrderByWithRelationInput =
       sort === 'name' ? { name: 'asc' } : { rating: 'desc' };
 
@@ -284,11 +296,11 @@ export class VenuesService {
         },
       },
       orderBy,
-      ...(priceSort
+      ...(memorySort
         ? { take: 500 }
         : { skip: (page - 1) * limit, take: limit }),
     };
-    const [total, data] = priceSort
+    const [total, data] = memorySort
       ? await Promise.all([
           this.prisma.venue.count({ where }),
           this.prisma.venue.findMany(findArgs),
@@ -336,10 +348,18 @@ export class VenuesService {
       // Sports shown to players always reflect the actual active courts
       // (venue.sports heals at read time even before owners edit).
       const courtSports = [...new Set((v.courts ?? []).map((c: any) => c.sport).filter(Boolean))];
+      const distanceKm =
+        lat !== undefined && lng !== undefined
+          ? (() => {
+              const d = haversineKm(lat, lng, rest.lat, rest.lng);
+              return d === null ? null : roundKm(d);
+            })()
+          : null;
       return {
         ...rest,
         sports: courtSports.length ? courtSports : rest.sports,
         fromPrice: rates.length ? Math.min(...rates) : null,
+        distanceKm,
       };
     });
     if (priceSort) {
@@ -355,6 +375,22 @@ export class VenuesService {
           dir
         );
       });
+      return offsetPageFromDb(
+        shaped.slice((page - 1) * limit, page * limit),
+        total,
+        page,
+        limit,
+      );
+    }
+    if (distanceSort) {
+      // Nearest first, pure distance order — unlike price sort, featured
+      // does NOT float first here: the whole point of this sort is
+      // proximity. Venues without coordinates sort last, never first.
+      shaped.sort(
+        (a: any, b: any) =>
+          (a.distanceKm ?? Number.MAX_SAFE_INTEGER) -
+          (b.distanceKm ?? Number.MAX_SAFE_INTEGER),
+      );
       return offsetPageFromDb(
         shaped.slice((page - 1) * limit, page * limit),
         total,

@@ -8,6 +8,7 @@ import {
 import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { offsetPageFromDb, pageLimit } from '../common/pagination';
+import { haversineKm, roundKm } from '../common/distance';
 import { AuthUser } from '../common/auth';
 import {
   isSameDay,
@@ -164,6 +165,16 @@ export class GamePostsService {
   }
 
   async list(query: GamePostQueryDto, userId?: string) {
+    // Distance sort needs a reference point, and a lone lat or lng is
+    // a client bug — fail fast instead of sorting by a half point.
+    const { lat, lng } = query;
+    if ((lat === undefined) !== (lng === undefined)) {
+      throw new BadRequestException('lat and lng must be provided together');
+    }
+    const distanceSort = query.sort === 'distance';
+    if (distanceSort && (lat === undefined || lng === undefined)) {
+      throw new BadRequestException('Distance sort needs lat and lng');
+    }
     // Default open preserves the player board exactly; an explicit
     // non-open status is the admin filter view, where past posts must
     // stay visible — so the future-only date rule applies to open
@@ -214,7 +225,9 @@ export class GamePostsService {
     // venue are never overdue-filtered.
     const candidates = await this.prisma.gamePost.findMany({
       where,
-      select: { id: true, venueId: true },
+      // date/startMinutes ride along for the distance-sort tiebreak
+      // (same cost as the default orderBy they replace in that mode).
+      select: { id: true, venueId: true, date: true, startMinutes: true },
       orderBy: [{ isCurated: 'desc' }, { date: 'asc' }, { startMinutes: 'asc' }],
     });
     const venueIds = [
@@ -225,11 +238,15 @@ export class GamePostsService {
       ),
     ];
     const overdueVenues = new Set<string>();
+    // Venue coordinates ride along for distance sort + distanceKm.
+    const coordsByVenueId = new Map<string, { lat: number | null; lng: number | null }>();
     if (venueIds.length > 0) {
       const venues = await this.prisma.venue.findMany({
         where: { id: { in: venueIds } },
         select: {
           id: true,
+          lat: true,
+          lng: true,
           billingStartAt: true,
           billingPaidUntil: true,
           freeUntilOverride: true,
@@ -240,6 +257,7 @@ export class GamePostsService {
         },
       });
       for (const v of venues) {
+        coordsByVenueId.set(v.id, { lat: v.lat, lng: v.lng });
         if ((await this.plans.billingSummary(v as any)).status === 'overdue') {
           overdueVenues.add(v.id);
         }
@@ -248,6 +266,26 @@ export class GamePostsService {
     const visible = candidates.filter(
       (c) => !c.venueId || !overdueVenues.has(c.venueId),
     );
+    if (distanceSort) {
+      // Nearest first, pure distance order — curated does NOT float
+      // first here, and venue-less posts (no coordinates) sort last.
+      // Date/time breaks distance ties so the order stays stable.
+      const distOf = (c: (typeof visible)[number]) => {
+        const coords = c.venueId ? coordsByVenueId.get(c.venueId) : undefined;
+        const d =
+          lat !== undefined && lng !== undefined
+            ? haversineKm(lat, lng, coords?.lat, coords?.lng)
+            : null;
+        return d === null ? Number.MAX_SAFE_INTEGER : d;
+      };
+      visible.sort((a, b) => {
+        const d = distOf(a) - distOf(b);
+        if (d !== 0) return d;
+        const dateDiff = a.date.getTime() - b.date.getTime();
+        if (dateDiff !== 0) return dateDiff;
+        return a.startMinutes - b.startMinutes;
+      });
+    }
     const total = visible.length;
     const pageIds = visible
       .slice((page - 1) * limit, page * limit)
@@ -258,7 +296,7 @@ export class GamePostsService {
             where: { id: { in: pageIds } },
             include: {
               creator: { select: { name: true } },
-              venue: { select: { id: true, name: true, address: true, city: true } },
+              venue: { select: { id: true, name: true, address: true, city: true, lat: true, lng: true } },
               booking: {
                 select: {
                   totalPrice: true,
@@ -280,12 +318,24 @@ export class GamePostsService {
     const posts = pageIds
       .map((id) => byId.get(id))
       .filter((p): p is (typeof unordered)[number] => !!p);
+    // Distance from the reference point, when one was given — shared by
+    // both shaping branches below (null when the post has no venue
+    // coordinates, or when no reference point was sent).
+    const distanceKmByPost = new Map<string, number | null>();
+    for (const post of posts) {
+      const d =
+        lat !== undefined && lng !== undefined
+          ? haversineKm(lat, lng, post.venue?.lat, post.venue?.lng)
+          : null;
+      distanceKmByPost.set(post.id, d === null ? null : roundKm(d));
+    }
     if (!userId || posts.length === 0) {
       const items = posts.map((post) => {
         const { booking: _booking, participants: preview, ...rest } = post;
         return {
           ...rest,
           ...this.priceView(post),
+          distanceKm: distanceKmByPost.get(post.id) ?? null,
           squadNames: [
             post.creator.name,
             ...preview.map((x) => x.name),
@@ -319,6 +369,7 @@ export class GamePostsService {
       return {
         ...rest,
         ...this.priceView(post),
+        distanceKm: distanceKmByPost.get(post.id) ?? null,
         squadNames: [post.creator.name, ...preview.map((x) => x.name)],
         courtName: post.booking?.court?.name ?? null,
         courtSize: post.booking?.court?.size ?? null,

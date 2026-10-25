@@ -1,4 +1,5 @@
-import { IsIn, IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
+import { IsIn, IsInt, IsNumber, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
+import { Type } from 'class-transformer';
 import { OffsetQueryDto } from '../common/pagination';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
@@ -135,4 +136,26 @@ export class GamePostQueryDto extends OffsetQueryDto {
   @IsString()
   @IsIn(['open', 'full', 'closed'])
   status?: string;
+
+  @ApiPropertyOptional({ enum: ['distance'], description: 'distance = nearest venue first (needs lat + lng); otherwise the board default (curated, then date/time).' })
+  @IsOptional()
+  @IsString()
+  @IsIn(['distance'])
+  sort?: string;
+
+  @ApiPropertyOptional({ example: 31.5204, description: 'Reference latitude for distance sort + distanceKm. Must be sent together with lng.' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(-90)
+  @Max(90)
+  lat?: number;
+
+  @ApiPropertyOptional({ example: 74.3587, description: 'Reference longitude for distance sort + distanceKm. Must be sent together with lat.' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(-180)
+  @Max(180)
+  lng?: number;
 }
