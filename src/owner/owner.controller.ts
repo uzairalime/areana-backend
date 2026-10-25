@@ -57,8 +57,8 @@ export class OwnerController {
 
   @ApiTags('owner · billing')
   @Get('billing')
-  async billing(@CurrentUser() user: AuthUser) {
-    return wrapList(await this.owner.billing(user));
+  async billing(@CurrentUser() user: AuthUser, @Query() query?: OffsetQueryDto) {
+    return wrapList(await this.owner.billing(user, query?.page ?? 1, query?.limit));
   }
 
   // ---------------------------------------------------------------- venues

@@ -483,6 +483,11 @@ model Review {
   comment    String?
   ownerReply String?
   repliedAt  DateTime?
+  /// Round 5, R5 (review-reply history): every superseded owner reply
+  /// is appended here as { reply: string, repliedAt: string (ISO) }
+  /// BEFORE ownerReply/repliedAt are overwritten, so reply edits keep
+  /// a full audit trail. Empty array for reviews never edited.
+  ownerReplyHistory Json @default("[]")
   createdAt  DateTime  @default(now())
 
   @@index([venueId])

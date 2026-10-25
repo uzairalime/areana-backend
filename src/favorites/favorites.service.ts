@@ -74,6 +74,20 @@ export class FavoritesService {
     return cursorPage(live, limit, (r) => r.createdAt, undefined, (r) => r.venueId);
   }
 
+  /**
+   * Round 5, R5-29: cheap per-venue favorite check. Feasible with NO
+   * new index and no pattern bypass: Favorite's PK is exactly
+   * (userId, venueId), so this is a single PK lookup — cheaper than
+   * paging the favorites list. Returns { favorited: boolean }.
+   */
+  async check(userId: string, venueId: string) {
+    const row = await this.prisma.favorite.findUnique({
+      where: { userId_venueId: { userId, venueId } },
+      select: { userId: true },
+    });
+    return { favorited: row !== null };
+  }
+
   async add(userId: string, venueId: string) {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');

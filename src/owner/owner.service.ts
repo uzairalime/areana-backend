@@ -211,9 +211,13 @@ export class OwnerService {
     const out = [];
     for (const v of pageRows) {
       const { limit } = await this.plans.effectiveCourtLimit(v.id);
-      // Rejected courts don't consume quota (matches createCourt).
+      // Round 5, R5-3: rejected AND deactivated courts don't consume
+      // quota — this must match the enforced count in createCourt
+      // (isActive + not-rejected). The old count omitted isActive,
+      // so a deactivated court still showed as used here while the
+      // create path had already freed its slot.
       const used = await this.prisma.court.count({
-        where: { venueId: v.id, status: { not: 'rejected' } },
+        where: { venueId: v.id, isActive: true, status: { not: 'rejected' } },
       });
       out.push({ ...v, courtLimit: { limit, used } });
     }
@@ -886,14 +890,23 @@ export class OwnerService {
     // a template stay editable).
     if (newOpen !== court.openMinutes || newClose !== court.closeMinutes) {
       data.weeklyHoursVersion = { increment: 1 };
-      const stranded = await this.courtsSvc.countStrandedBookings(courtId, {
+      // Round 5, R5-1: the guard now returns the stranded bookings in
+      // the 409 payload (count + list), and — like the slotMinutes
+      // misaligned flow below — an explicit acknowledgeConflicts
+      // retry saves with the stranded bookings grandfathered as-is.
+      // Previously the guard threw a count-only message with no
+      // acknowledge path at all, so the panel could neither show
+      // which bookings were stranded nor retry past the guard.
+      const stranded = await this.courtsSvc.listStrandedBookings(courtId, {
         openMinutes: newOpen,
         closeMinutes: newClose,
       });
-      if (stranded > 0) {
-        throw new ConflictException(
-          `${stranded} upcoming booking(s) fall outside the new hours — move or cancel them first`,
-        );
+      if (stranded.length > 0 && !acknowledgeConflicts) {
+        throw new ConflictException({
+          message: `${stranded.length} upcoming booking(s) fall outside the new hours — move or cancel them first, or save again with acknowledgeConflicts to keep them as-is`,
+          count: stranded.length,
+          bookings: stranded,
+        });
       }
     }
     // Slot-length grid check (Round 4, O-S5): bookings whose start
@@ -2490,6 +2503,17 @@ export class OwnerService {
         .notifyRescheduleDecision(req.booking.userId, true, venue.name)
         .catch(() => {});
     }
+    // Round 5, R5-17: a rescheduled shared booking moves its
+    // participants too — they need the new slot, not just the squad.
+    await this.bookingOps
+      .notifyShareParticipants(
+        req.bookingId,
+        'Game time moved',
+        `Your game at ${venue.name} moved to ${req.requestedDate.toISOString().slice(0, 10)} at ${String(Math.floor(startMinutes / 60)).padStart(2, '0')}:${String(startMinutes % 60).padStart(2, '0')}.`,
+        'booking_rescheduled',
+        'Shared game moved',
+      )
+      .catch(() => {});
     return booking;
   }
 
@@ -2516,6 +2540,17 @@ export class OwnerService {
         .notifyRescheduleDecision(req.booking.userId, false, venue.name)
         .catch(() => {});
     }
+    // Round 5, R5-17: a declined reschedule also reaches share
+    // participants (the original slot stands — they plan around it).
+    await this.bookingOps
+      .notifyShareParticipants(
+        req.bookingId,
+        'Reschedule declined',
+        `The reschedule request for the game at ${venue.name} was declined — the original slot still stands.`,
+        'reschedule_decision',
+        'Shared game reschedule declined',
+      )
+      .catch(() => {});
     // updateMany returns only a count — re-read so the response keeps
     // the request shape the panel expects.
     return this.prisma.rescheduleRequest.findUniqueOrThrow({ where: { id: requestId } });
@@ -3184,7 +3219,15 @@ export class OwnerService {
         where: { id: link.userId },
         include: { role: { select: { scope: true } } },
       });
-      if (member?.role.scope === 'arena') {
+      // Round 5, R5-7: NEVER suspend an account that owns venues —
+      // the old check suspended any arena-scoped account with no
+      // staff links left, which locked an owner out of their own
+      // venues the moment their last team link was removed (e.g. an
+      // owner who also staffed another arena). Ownership is checked
+      // before any suspension, session kill, notice, or audit below.
+      const ownsVenues =
+        (await this.prisma.venue.count({ where: { ownerId: link.userId } })) > 0;
+      if (member?.role.scope === 'arena' && !ownsVenues) {
         await this.prisma.user.update({
           where: { id: link.userId },
           data: { status: 'suspended' },
@@ -3236,10 +3279,24 @@ export class OwnerService {
       select: {
         userId: true,
         date: true,
+        startMinutes: true,
         status: true,
         user: { select: { name: true, phone: true, email: true, noShowCount: true } },
       },
     });
+    // Round 5, R5-2: a "visit" is a past/current, non-cancelled
+    // booking — its slot must already have STARTED (start instant <=
+    // now). The old count incremented for every non-cancelled row,
+    // so a future pending (or future confirmed) booking counted as a
+    // visit before the player ever arrived, and lastVisit pointed at
+    // a date in the future. No-shows still count separately (they
+    // are, by definition, past slots) and are not visits.
+    const now = new Date();
+    const slotStartAt = (b: { date: Date; startMinutes: number }) => {
+      const d = new Date(b.date.getFullYear(), b.date.getMonth(), b.date.getDate());
+      d.setMinutes(b.startMinutes);
+      return d;
+    };
     const map = new Map<string, any>();
     for (const b of bookings) {
       const u = b.user!;
@@ -3255,25 +3312,52 @@ export class OwnerService {
         });
       }
       const c = map.get(b.userId!);
-      if (b.status !== BookingStatus.cancelled) {
+      if (b.status !== BookingStatus.cancelled && slotStartAt(b) <= now) {
         c.visits += 1;
         const ds = b.date.toISOString().slice(0, 10);
         if (!c.lastVisit || ds > c.lastVisit) c.lastVisit = ds;
       }
       if (b.status === BookingStatus.no_show) c.noShows += 1;
     }
-    const all = [...map.values()].sort((a, b) => b.visits - a.visits);
-    return offsetPage(all, page, pageLimit(rawLimit, 50));
+    // Round 5, R5-2: deterministic tie-breaker under offset paging.
+    // The old sort (visits desc only) left equal-visit rows in
+    // insertion order, so page boundaries could skip or repeat rows
+    // as new bookings landed. userId asc is stable and unique.
+    const all = [...map.values()].sort(
+      (a, b) => b.visits - a.visits || (a.userId < b.userId ? -1 : a.userId > b.userId ? 1 : 0),
+    );
+    // Round 5, R5-2: walk-ins cannot be attributed to a player row —
+    // walk-in bookings carry userId NULL and only a guestName — so
+    // they are NOT folded into any player's visits. They are reported
+    // as a separate aggregate on the page instead: the count of
+    // non-cancelled, already-started walk-in bookings at the same
+    // in-scope venues (same visit rule as above).
+    const walkIns = await this.prisma.booking.findMany({
+      where: {
+        venueId: { in: ids },
+        userId: null,
+        status: { not: BookingStatus.cancelled },
+      },
+      select: { date: true, startMinutes: true },
+    });
+    const walkInCount = walkIns.filter((b) => slotStartAt(b) <= now).length;
+    return { ...offsetPage(all, page, pageLimit(rawLimit, 50)), walkInCount };
   }
 
   // ---------------------------------------------------------------- reviews
   /** Plan + billing state for every venue the user operates. */
-  async billing(user: AuthUser) {
+  async billing(user: AuthUser, page = 1, rawLimit?: number) {
     // Billing is money: only owned venues, plus linked venues when the
     // caller holds billing.view. A staffer with no money-visible venue
     // gets a clean denial instead of an empty page that looks broken.
     const ids = await this.moneyVenueIds(user);
     if (ids.length === 0) {
+      // Round 5, R5-4: a zero-venue OWNER must not 403 here — they
+      // have no venues yet, which is an honest empty summary, not a
+      // permission failure. (A non-owner staffer with no money-visible
+      // venue still gets the denial above: for them empty really
+      // would mean "no access", not "no venues".)
+      if (user.roleName === 'owner') return [];
       throw new ForbiddenException(
         'Billing is only visible to venue owners and team members with billing access',
       );
@@ -3283,10 +3367,25 @@ export class OwnerService {
       include: { plan: true },
       orderBy: { createdAt: 'asc' },
     });
+    // Round 5, R5-6: payment history is offset-paged (?page&limit).
+    // The old hard `take: 10` becomes the DEFAULT page size, not a
+    // ceiling — ?limit up to the global 100 cap pages older history.
+    const limit = pageLimit(rawLimit, 10);
+    const p = Math.max(1, page);
     const out = [];
     for (const v of venues) {
       const billing = await this.plans.billingSummary(v);
       const plan = await this.plans.planForVenueId(v.id);
+      const [paymentsTotal, paymentRows] = await Promise.all([
+        this.prisma.venuePayment.count({ where: { venueId: v.id } }),
+        this.prisma.venuePayment.findMany({
+          where: { venueId: v.id },
+          orderBy: { createdAt: 'desc' },
+          skip: (p - 1) * limit,
+          take: limit,
+          include: { plan: { select: { name: true } } },
+        }),
+      ]);
       out.push({
         venue: { id: v.id, name: v.name, city: v.city, status: v.status },
         planName: billing.planName,
@@ -3294,20 +3393,12 @@ export class OwnerService {
         features: await this.plans.featuresForVenue(v.id),
         seatsUsed: await this.prisma.venueStaff.count({ where: { venueId: v.id } }),
         seatsAllowed: (await this.plans.effectiveStaffLimit(v.id)).limit,
-        payments: await this.prisma.venuePayment.findMany({
-          where: { venueId: v.id },
-          orderBy: { createdAt: 'desc' },
-          take: 10,
-          include: { plan: { select: { name: true } } },
-        }),
-        // Round 5, O5-T4: the 10 rows above used to ship with no
-        // total, so "Payment history · latest 10" could not tell a
-        // complete history from a truncated one (at exactly 10 rows
-        // an 11th older payment was invisible). The panel round
-        // renders "latest 10 of N" from this total.
-        paymentsTotal: await this.prisma.venuePayment.count({
-          where: { venueId: v.id },
-        }),
+        // OffsetPage shape (items/total/page/limit/totalPages/
+        // hasMore); paymentsTotal is kept alongside for back-compat
+        // with panels that read the old field (it equals
+        // payments.total).
+        payments: offsetPageFromDb(paymentRows, paymentsTotal, p, limit),
+        paymentsTotal,
       });
     }
     return out;

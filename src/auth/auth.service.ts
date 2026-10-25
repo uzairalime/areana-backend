@@ -15,6 +15,7 @@ import { createHash } from 'crypto';
 import { PrismaService } from '../common/prisma';
 import { MailDeliveryDelayedError, MailService } from './mail.service';
 import { ReferralsService } from '../promos/referrals.service';
+import { parseSettingInt } from '../common/settings.util';
 import {
   OwnerRegisterDto,
   RefreshDto,
@@ -66,6 +67,54 @@ export class AuthService {
     private referrals: ReferralsService,
   ) {}
 
+  /**
+   * Round 5, R5-20: the unlock instant for an OTP hourly cap, derived
+   * from stored code history — never from the client's local history.
+   * A cap clears when its OLDEST row in the last hour ages out, so
+   * resetsAt is the LATEST of the email-cap and IP-cap reset instants
+   * (a request succeeds only when BOTH caps are below their limit);
+   * retryAfterSeconds is the whole-second wait until then. Falls back
+   * to one hour from now if no qualifying row is found (defensive —
+   * a cap hit implies at least one row exists).
+   */
+  private async otpCapReset(
+    db: {
+      otpCode: {
+        findFirst: (args: {
+          where: Record<string, unknown>;
+          orderBy: { createdAt: 'asc' };
+          select: { createdAt: true };
+        }) => Promise<{ createdAt: Date } | null>;
+      };
+    },
+    email: string,
+    ip?: string,
+  ): Promise<{ retryAfterSeconds: number; resetsAt: string }> {
+    const hourAgo = new Date(Date.now() - 3600_000);
+    const [emailOldest, ipOldest] = await Promise.all([
+      db.otpCode.findFirst({
+        where: { email, createdAt: { gte: hourAgo } },
+        orderBy: { createdAt: 'asc' },
+        select: { createdAt: true },
+      }),
+      ip
+        ? db.otpCode.findFirst({
+            where: { ip, createdAt: { gte: hourAgo } },
+            orderBy: { createdAt: 'asc' },
+            select: { createdAt: true },
+          })
+        : Promise.resolve(null),
+    ]);
+    const resets = [emailOldest, ipOldest]
+      .filter((r): r is { createdAt: Date } => !!r)
+      .map((r) => r.createdAt.getTime() + 3600_000);
+    const resetMs = resets.length > 0 ? Math.max(...resets) : Date.now() + 3600_000;
+    return {
+      retryAfterSeconds: Math.max(0, Math.ceil((resetMs - Date.now()) / 1000)),
+      resetsAt: new Date(resetMs).toISOString(),
+    };
+  }
+
   // --- player: passwordless email OTP ---
   async requestOtp(dto: RequestOtpDto, ip?: string) {
     const email = dto.email.toLowerCase().trim();
@@ -74,8 +123,14 @@ export class AuthService {
       where: { email, createdAt: { gte: new Date(Date.now() - 3600_000) } },
     });
     if (recent >= OTP_MAX_PER_HOUR) {
+      // Round 5, R5-20: the 429 carries the server-computed wait +
+      // unlock instant, so the client need not derive them from the
+      // timestamps of codes it happened to request.
       throw new HttpException(
-        'Too many codes requested. Try again later.',
+        {
+          message: 'Too many codes requested. Try again later.',
+          ...(await this.otpCapReset(this.prisma, email, ip)),
+        },
         HttpStatus.TOO_MANY_REQUESTS,
       );
     }
@@ -87,7 +142,10 @@ export class AuthService {
       });
       if (recentIp >= OTP_IP_MAX_PER_HOUR) {
         throw new HttpException(
-          'Too many codes requested. Try again later.',
+          {
+            message: 'Too many codes requested. Try again later.',
+            ...(await this.otpCapReset(this.prisma, email, ip)),
+          },
           HttpStatus.TOO_MANY_REQUESTS,
         );
       }
@@ -138,13 +196,16 @@ export class AuthService {
     // message above for the same shape). Send stays outside the
     // transaction (it cannot roll back); only the persist is atomic.
     const codeHash = await bcrypt.hash(code, 10);
-    await this.prisma.$transaction(async (tx) => {
+    const created = await this.prisma.$transaction(async (tx) => {
         const recent = await tx.otpCode.count({
           where: { email, createdAt: { gte: new Date(Date.now() - 3600_000) } },
         });
         if (recent >= OTP_MAX_PER_HOUR) {
           throw new HttpException(
-            'Too many codes requested. Your previous code still works — try again later.',
+            {
+              message: 'Too many codes requested. Your previous code still works — try again later.',
+              ...(await this.otpCapReset(tx, email, ip)),
+            },
             HttpStatus.TOO_MANY_REQUESTS,
           );
         }
@@ -154,7 +215,10 @@ export class AuthService {
           });
           if (recentIp >= OTP_IP_MAX_PER_HOUR) {
             throw new HttpException(
-              'Too many codes requested. Your previous code still works — try again later.',
+              {
+                message: 'Too many codes requested. Your previous code still works — try again later.',
+                ...(await this.otpCapReset(tx, email, ip)),
+              },
               HttpStatus.TOO_MANY_REQUESTS,
             );
           }
@@ -163,7 +227,7 @@ export class AuthService {
           where: { email, consumedAt: null },
           data: { consumedAt: new Date() },
         });
-        await tx.otpCode.create({
+        return tx.otpCode.create({
           data: {
             email,
             codeHash,
@@ -172,7 +236,15 @@ export class AuthService {
           },
         });
       });
-    return { message: 'Login code sent to your email' };
+    // Round 5, R5-27: the send response carries the code's server-side
+    // expiry instant (the stored row's expiresAt, not a client-side
+    // "now + 10min" guess) and the configured TTL in seconds, so
+    // clients countdown from the server's clock, not the device's.
+    return {
+      message: 'Login code sent to your email',
+      expiresAt: created.expiresAt.toISOString(),
+      ttlSeconds: OTP_TTL_MS / 1000,
+    };
   }
 
   async verifyOtp(dto: VerifyOtpDto) {
@@ -201,6 +273,10 @@ export class AuthService {
     const playerRole = await this.prisma.role.findFirstOrThrow({ where: { name: 'player', ownerId: null } });
 
     let welcomePromoCode: string | null = null;
+    // Round 5, R5-9: one of 'none' | 'applied' | 'self' | 'invalid' |
+    // 'failed' — never a bare null the client must interpret. 'none'
+    // = no code entered; the other four are resolved below.
+    let referralStatus: 'none' | 'applied' | 'self' | 'invalid' | 'failed' = 'none';
     let user = await this.prisma.user.findUnique({ where: { email } });
     if (!user) {
       // First verification = signup: profile details required.
@@ -231,9 +307,22 @@ export class AuthService {
         }
         throw e;
       }
-      welcomePromoCode = dto.referralCode
-        ? ((await this.referrals.handleSignupReferral(user.id, dto.referralCode))?.promo.code ?? null)
-        : null;
+      if (dto.referralCode?.trim()) {
+        const res = await this.referrals.handleSignupReferral(user.id, dto.referralCode);
+        referralStatus = res.status;
+        welcomePromoCode = res.promo?.code ?? null;
+      }
+    } else if (dto.referralCode?.trim()) {
+      // A returning account cannot apply a referral (referrals are a
+      // signup-time reward), but the code's identity is still
+      // distinguishable: own code -> 'self', unknown code ->
+      // 'invalid', a valid third-party code that cannot be applied
+      // here -> 'failed'. The panel should only send referralCode on
+      // first verification, where 'applied' is reachable.
+      const referrer = await this.prisma.user.findFirst({
+        where: { referralCode: dto.referralCode.toUpperCase().trim() },
+      });
+      referralStatus = !referrer ? 'invalid' : referrer.id === user.id ? 'self' : 'failed';
     }
     if (user.status !== UserStatus.active) {
       throw new ForbiddenException('This account is not active');
@@ -252,7 +341,65 @@ export class AuthService {
     if (consumed.count === 0) {
       throw new UnauthorizedException('Code invalid or expired');
     }
-    return { ...(await this.issueTokens(user)), welcomePromoCode };
+    // Round 5, R5-27 (verify half): same expiry contract as the send
+    // response — the verified code's stored expiresAt plus the
+    // configured TTL — so the client never derives a duration from
+    // its own clock. referralStatus rides alongside (R5-9).
+    return {
+      ...(await this.issueTokens(user)),
+      welcomePromoCode,
+      referralStatus,
+      expiresAt: record.expiresAt.toISOString(),
+      ttlSeconds: OTP_TTL_MS / 1000,
+    };
+  }
+
+  /**
+   * Round 5, R5-8: the caller's live refresh sessions (unrevoked,
+   * unexpired), newest first. The session `id` is the identifier the
+   * panel shows; the token hash is NEVER returned (it is a credential
+   * equivalent). `lastUsedAt` is null by design: access tokens are
+   * stateless JWTs, so a session is only touched at creation and at
+   * rotation — there is no per-request "last used" timestamp to
+   * report, and inventing one from createdAt would be a lie.
+   * `isCurrent` cannot be determined from an access token either
+   * (only refresh tokens carry the session id), so it is omitted.
+   */
+  async listSessions(userId: string) {
+    const rows = await this.prisma.refreshSession.findMany({
+      where: { userId, revokedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, createdAt: true, expiresAt: true },
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      createdAt: r.createdAt.toISOString(),
+      expiresAt: r.expiresAt.toISOString(),
+      lastUsedAt: null as string | null,
+      revoked: false,
+    }));
+  }
+
+  /**
+   * Round 5, R5-8: revoke EVERY refresh session of the caller plus
+   * every device (push) token — the session-level equivalent of the
+   * existing device-token revoke-all. Note the stateless caveat
+   * shared with single logout: already-issued ACCESS tokens stay
+   * valid until they expire (they carry no server-side state to
+   * revoke); only refreshes and pushes stop immediately.
+   */
+  async logoutAll(userId: string) {
+    const [sessions, deviceTokens] = await Promise.all([
+      this.prisma.refreshSession.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+      this.prisma.deviceToken.deleteMany({ where: { userId } }),
+    ]);
+    return {
+      revokedSessions: sessions.count,
+      revokedDeviceTokens: deviceTokens.count,
+    };
   }
 
   async refresh(dto: RefreshDto) {
@@ -442,7 +589,15 @@ export class AuthService {
     });
     if (!user) throw new UnauthorizedException('User not found');
     const { passwordHash: _ph, ...safe } = user;
-    return safe;
+    // Round 5, R5-15: the strike limit is player-readable here (and
+    // on GET /users/me) — no admin rights needed. Same validated
+    // parse as the strike paths (default 3, min 1).
+    const limit = parseSettingInt(
+      (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value,
+      3,
+      1,
+    );
+    return { ...safe, noShowStrikeLimit: limit };
   }
 
   // Round 5, D5-S36: the login response must carry the SAME

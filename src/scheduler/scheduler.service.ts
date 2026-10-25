@@ -176,6 +176,14 @@ export class SchedulerService implements OnModuleInit {
       if (b.userId) {
         await this.notifications.notifyPlayerDecision(b.userId, false, b.venue.name, '', 'The arena did not respond in time');
       }
+      // Round 5, R5-17: pending-expiry also reaches share participants.
+      await this.bookings.notifyShareParticipants(
+        b.id,
+        'Game cancelled',
+        `The game at ${b.venue.name} expired before the arena responded — this shared game is off.`,
+        'booking_cancelled',
+        'Shared game cancelled',
+      ).catch(() => {});
     }
     if (expired > 0) this.logger.log(`Expired ${expired} pending bookings`);
   }

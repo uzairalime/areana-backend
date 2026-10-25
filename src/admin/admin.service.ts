@@ -550,6 +550,11 @@ export class AdminService {
     }
     const user = await this.prisma.user.findUniqueOrThrow({ where: { id } });
     await this.audit(actorId, `user.${status}`, 'user', id);
+    // Round 5, R5-25: cascade totals across the owner's venues, so
+    // the response can return { cancelled, stoppedEarly } instead of
+    // discarding each venue's result with .catch(() => {}).
+    let cascadeCancelled = 0;
+    let cascadeStoppedEarly = false;
     if (status === UserStatus.suspended && target.role.name === 'owner') {
       // Owner suspension follows the venue-suspension policy: upcoming
       // bookings at their venues are cancelled and players notified
@@ -561,9 +566,12 @@ export class AdminService {
         select: { id: true },
       });
       for (const v of venues) {
-        await this.bookings
-          .cancelVenueUpcomingBookings(v.id, "the arena owner's account is suspended")
-          .catch(() => {});
+        const cascade = await this.bookings.cancelVenueUpcomingBookings(
+          v.id,
+          "the arena owner's account is suspended",
+        );
+        cascadeCancelled += cascade.cancelled;
+        cascadeStoppedEarly = cascadeStoppedEarly || cascade.stoppedEarly;
       }
       await this.notifications
         .pushToUser(id, {
@@ -670,7 +678,16 @@ export class AdminService {
       // sign-in, if the account is ever reactivated.)
       await this.prisma.deviceToken.deleteMany({ where: { userId: id } });
     }
-    return { id: user.id, status: user.status };
+    // Round 5, R5-25: the cascade result rides on every set-status
+    // response (0/false when no owner-venue cascade ran), so the
+    // owner-suspend shape is stable and the panel never has to guess
+    // whether a cascade happened.
+    return {
+      id: user.id,
+      status: user.status,
+      cancelled: cascadeCancelled,
+      stoppedEarly: cascadeStoppedEarly,
+    };
   }
 
   /**
@@ -2559,14 +2576,19 @@ export class AdminService {
       // version counted confirmed only against raw headline hours,
       // stranding pending bookings and template-governed bookings
       // the owner path refused.
-      const stranded = await this.courtsSvc.countStrandedBookings(courtId, {
+      // Round 5, R5-1: same contract as the owner path — the 409
+      // carries count + the stranded booking list, and an
+      // acknowledgeConflicts retry saves with them grandfathered.
+      const stranded = await this.courtsSvc.listStrandedBookings(courtId, {
         openMinutes: newOpen,
         closeMinutes: newClose,
       });
-      if (stranded > 0) {
-        throw new ConflictException(
-          `${stranded} upcoming booking(s) fall outside the new hours — move or cancel them first`,
-        );
+      if (stranded.length > 0 && !acknowledgeConflicts) {
+        throw new ConflictException({
+          message: `${stranded.length} upcoming booking(s) fall outside the new hours — move or cancel them first, or save again with acknowledgeConflicts to keep them as-is`,
+          count: stranded.length,
+          bookings: stranded,
+        });
       }
     }
     // Slot-length grid check (Round 4, O-S5, same shape as the owner
@@ -3119,7 +3141,7 @@ export class AdminService {
     return offsetPage(out, page, pageLimit(rawLimit, 50));
   }
 
-  async venueBilling(venueId: string) {
+  async venueBilling(venueId: string, page = 1, rawLimit?: number) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
       include: {
@@ -3129,7 +3151,27 @@ export class AdminService {
     });
     if (!venue) throw new NotFoundException('Venue not found');
     const billing = await this.plans.billingSummary(venue);
-    return { venue, billing };
+    // Round 5, R5-6: same ?page&limit history contract as the owner
+    // billing endpoint (default 10, up to the global 100 cap). The
+    // admin endpoint previously returned no payment history at all.
+    const limit = pageLimit(rawLimit, 10);
+    const p = Math.max(1, page);
+    const [paymentsTotal, paymentRows] = await Promise.all([
+      this.prisma.venuePayment.count({ where: { venueId } }),
+      this.prisma.venuePayment.findMany({
+        where: { venueId },
+        orderBy: { createdAt: 'desc' },
+        skip: (p - 1) * limit,
+        take: limit,
+        include: { plan: { select: { name: true } } },
+      }),
+    ]);
+    return {
+      venue,
+      billing,
+      payments: offsetPageFromDb(paymentRows, paymentsTotal, p, limit),
+      paymentsTotal,
+    };
   }
 
   async assignVenuePlan(actorId: string, venueId: string, planId: string, restartBilling = false, confirmBelowUsage = false) {
@@ -3298,10 +3340,18 @@ export class AdminService {
     }
     const venue = await this.prisma.venue.findUniqueOrThrow({ where: { id: venueId } });
     await this.audit(actorId, 'venue.suspend', 'venue', venueId);
-    // A suspended venue's upcoming bookings do not stand.
-    await this.bookings
-      .cancelVenueUpcomingBookings(venueId, 'the arena was suspended by Areana')
-      .catch(() => {});
+    // Round 5, R5-25: a suspended venue's upcoming bookings do not
+    // stand — and the cascade result is RETURNED, not swallowed. The
+    // old `.catch(() => {})` discarded { cancelled, stoppedEarly }
+    // entirely, so the panel reported full success for a cascade that
+    // may have stopped early (or failed). A cascade throw now
+    // propagates instead of being hidden behind a success response:
+    // the venue row is already suspended at that point, and the
+    // caller must see the failure rather than a clean venue object.
+    const cascade = await this.bookings.cancelVenueUpcomingBookings(
+      venueId,
+      'the arena was suspended by Areana',
+    );
     await this.notifications
       .pushToUser(venue.ownerId, {
         title: 'Your arena has been suspended',
@@ -3309,7 +3359,7 @@ export class AdminService {
         data: { type: 'venue_suspended', venueId },
       })
       .catch(() => {});
-    return venue;
+    return { ...venue, cancelled: cascade.cancelled, stoppedEarly: cascade.stoppedEarly };
   }
 
   /**

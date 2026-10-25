@@ -17,6 +17,11 @@ export class FavoritesController {
     return this.favorites.list(user.id, query.cursor, query.limit);
   }
 
+  @Get('check')
+  check(@CurrentUser() user: AuthUser, @Query('venueId') venueId: string) {
+    return this.favorites.check(user.id, venueId);
+  }
+
   @Post()
   add(@CurrentUser() user: AuthUser, @Body() dto: FavoriteVenueDto) {
     return this.favorites.add(user.id, dto.venueId);

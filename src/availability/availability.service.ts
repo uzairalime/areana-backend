@@ -9,10 +9,24 @@ import {
   startOfToday,
 } from '../common/date.util';
 
+/**
+ * Round 5, R5-10: why a slot is (un)available, using exactly these
+ * strings — 'booked' (a pending/confirmed booking occupies it),
+ * 'past' (slot start already passed), 'too_late' (inside the venue's
+ * min-advance window — too soon to book), 'not_open_yet' (beyond the
+ * max-advance horizon — the booking window has not opened yet),
+ * 'blocked' (an owner one-off/recurring block covers it),
+ * 'available'. Precedence: past > too_late > not_open_yet > booked >
+ * blocked > available (a slot can be both booked and in the past; the
+ * time reason wins, matching what the player must be told first).
+ */
+export type SlotReason = 'booked' | 'past' | 'too_late' | 'not_open_yet' | 'blocked' | 'available';
+
 export interface SlotDto {
   startMinutes: number;
   endMinutes: number;
   available: boolean;
+  reason: SlotReason;
   price: number;
   /** True when a price window priced this slot ABOVE the base rate. */
   peak: boolean;
@@ -88,7 +102,9 @@ export class AvailabilityService {
         this.courts.blockedRangesForDate(courtId, date),
         this.courts.priceWindowsForDateRange(courtId, date),
       ]);
-    const busy = [
+    // Round 5, R5-10: bookings and blocks are kept separate (the old
+    // merged `busy` list could not tell 'booked' from 'blocked').
+    const bookedRanges = [
       ...bookings,
       ...prevBookings.map((b) => ({
         startMinutes: b.startMinutes - 1440,
@@ -98,8 +114,8 @@ export class AvailabilityService {
         startMinutes: b.startMinutes + 1440,
         endMinutes: b.endMinutes + 1440,
       })),
-      ...blockedRanges,
     ];
+    // (blockedRanges is consulted separately below for 'blocked'.)
 
     const now = new Date();
     const minBookableAt = new Date(now.getTime() + court.venue.minAdvanceMinutes * 60_000);
@@ -119,19 +135,39 @@ export class AvailabilityService {
         start += court.slotMinutes
       ) {
         const end = start + court.slotMinutes;
-        const clash = busy.some((b) => start < b.endMinutes && end > b.startMinutes);
+        const booked = bookedRanges.some((b) => start < b.endMinutes && end > b.startMinutes);
+        const blocked = blockedRanges.some((b) => start < b.endMinutes && end > b.startMinutes);
+        const clash = booked || blocked;
 
         const slotAt = new Date(date);
         slotAt.setHours(Math.floor(start / 60), start % 60, 0, 0);
         const tooSoon = slotAt < minBookableAt;
         const tooFar = slotAt > maxBookableAt;
 
+        // Round 5, R5-10: reason follows the precedence in SlotReason.
+        // 'past' is slot start <= now (a slot starting right now is
+        // already unbookable — validateWindow refuses bookingAt <=
+        // now, and minAdvance makes tooSoon true anyway for any
+        // sane minAdvanceMinutes; past still wins explicitly).
+        const reason: SlotReason =
+          slotAt <= now
+            ? 'past'
+            : tooSoon
+              ? 'too_late'
+              : tooFar
+                ? 'not_open_yet'
+                : booked
+                  ? 'booked'
+                  : blocked
+                    ? 'blocked'
+                    : 'available';
         const baseRate = Number(court.pricePerHour);
         const rate = this.courts.rateForSlotPair(priceWindows, baseRate, start);
         slots.push({
           startMinutes: start,
           endMinutes: end,
-          available: !clash && !tooSoon && !tooFar,
+          available: !clash && !tooSoon && !tooFar && reason !== 'past',
+          reason,
           price: rate * (court.slotMinutes / 60),
           peak: rate > baseRate,
           deal: rate < baseRate,
@@ -145,6 +181,11 @@ export class AvailabilityService {
       date: dateStr,
       currency: 'PKR',
       slotMinutes: court.slotMinutes,
+      // Round 5, R5-10: the venue's min-advance window, alongside the
+      // per-slot reasons, so the player web can label 'too_late'
+      // slots without a second call. (GET /venues/:id already returns
+      // minAdvanceMinutes as a venue column — no change needed there.)
+      minAdvanceMinutes: court.venue.minAdvanceMinutes,
       windows,
       slots,
     };

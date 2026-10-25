@@ -540,8 +540,8 @@ export class AdminController {
 
   @ApiTags('admin · plans')
   @Get('venues/:id/billing')
-  venueBilling(@Param('id') id: string) {
-    return this.admin.venueBilling(id);
+  venueBilling(@Param('id') id: string, @Query() query?: OffsetQueryDto) {
+    return this.admin.venueBilling(id, query?.page ?? 1, query?.limit);
   }
 
   @ApiTags('admin · plans')

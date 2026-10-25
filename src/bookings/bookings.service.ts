@@ -18,7 +18,7 @@ import {
   parseDateOnly,
   startOfToday,
 } from '../common/date.util';
-import { parseSettingInt } from '../common/settings.util';
+import { parseSettingFloat, parseSettingInt } from '../common/settings.util';
 import { CreateBookingDto, CreateRecurringDto, JoinSharedDto, MyBookingsQueryDto } from './dto';
 
 export interface CreateBookingInput extends CreateBookingDto {
@@ -304,7 +304,16 @@ export class BookingsService {
         void this.notifications.notifyOwnerConfirmedBooking(ownerEmail, booking.venue.name, summary);
       }
     }
-    return booking;
+    // Round 5, R5-19: the create response carries createdAt (already
+    // on the row) plus expiresAt — the pending-expiry deadline
+    // instant, so the success screen can show a clock-time deadline
+    // instead of a duration. Null for auto-accept (confirmed)
+    // bookings, which never expire as pending.
+    const expiresAt = await this.pendingExpiryAt(booking);
+    return {
+      ...booking,
+      expiresAt: expiresAt ? expiresAt.toISOString() : null,
+    };
   }
 
   /**
@@ -611,12 +620,154 @@ export class BookingsService {
             },
           },
         },
-        _count: { select: { participants: true } },
+        _count: { select: { participants: true, reviews: true } },
       },
-        orderBy: [{ date: 'asc' }, { startMinutes: 'asc' }],
+        // Round 5, R5-12: the past filter orders date DESC (newest
+        // first — the player reads recent history first); upcoming
+        // stays date ASC (nearest slot first).
+        orderBy:
+          query.filter === 'past'
+            ? [{ date: 'desc' }, { startMinutes: 'desc' }]
+            : [{ date: 'asc' }, { startMinutes: 'asc' }],
       }),
     ]);
-    return offsetPageFromDb(items, total, page, limit);
+    // Round 5, R5-14: hasReviewed is true when the player already
+    // reviewed that booking (Review.bookingId is unique, so the
+    // count is 0 or 1). _count is kept for back-compat.
+    const withReviewed = items.map((b) => ({
+      ...b,
+      hasReviewed: (b._count?.reviews ?? 0) > 0,
+    }));
+    return offsetPageFromDb(withReviewed, total, page, limit);
+  }
+
+  /** Round 5, R5-11: single booking detail for the owning player — */
+  /** same auth/ownership rule as listMine (id + userId match). */
+  async getMine(userId: string, bookingId: string) {
+    const booking = await this.prisma.booking.findFirst({
+      where: { id: bookingId, userId },
+      include: {
+        court: { select: { name: true, sport: true } },
+        venue: { select: { name: true, address: true, city: true, lat: true, lng: true, images: true, photos: true } },
+        gamePost: {
+          select: {
+            id: true,
+            playersNeeded: true,
+            squadSize: true,
+            level: true,
+            status: true,
+            _count: {
+              select: { participants: { where: { status: 'joined' } } },
+            },
+          },
+        },
+        _count: { select: { participants: true, reviews: true } },
+      },
+    });
+    if (!booking) throw new NotFoundException('Booking not found');
+    return { ...booking, hasReviewed: (booking._count?.reviews ?? 0) > 0 };
+  }
+
+  /**
+   * Round 5, R5-16: the caller's own pending reschedule requests,
+   * with the booking reference + requested slot. Offset-paged
+   * (?page&limit, default 20) like listMine; newest first.
+   */
+  async listPendingReschedules(userId: string, page = 1, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 20);
+    const p = Math.max(1, page);
+    const where = {
+      status: 'pending',
+      booking: { userId },
+    };
+    const [total, items] = await Promise.all([
+      this.prisma.rescheduleRequest.count({ where }),
+      this.prisma.rescheduleRequest.findMany({
+        where,
+        include: {
+          booking: {
+            select: {
+              id: true,
+              venueId: true,
+              courtId: true,
+              date: true,
+              startMinutes: true,
+              endMinutes: true,
+              status: true,
+              venue: { select: { name: true } },
+              court: { select: { name: true } },
+            },
+          },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (p - 1) * limit,
+        take: limit,
+      }),
+    ]);
+    return offsetPageFromDb(items, total, p, limit);
+  }
+
+  /**
+   * Round 5, R5-19: the pending-expiry deadline for a booking, using
+   * the scheduler's exact formula (slot-relative expiry): expiry =
+   * min(slotStart, max(createdAt + pendingExpiryHours, slotStart -
+   * 24h)). Returns null for non-pending bookings (a confirmed
+   * booking has no pending deadline). The setting is read with the
+   * same validated parse as the scheduler (default 2h, garbage/zero
+   * falls back to 2h).
+   */
+  async pendingExpiryAt(booking: {
+    status: BookingStatus;
+    date: Date;
+    startMinutes: number;
+    createdAt: Date;
+  }): Promise<Date | null> {
+    if (booking.status !== BookingStatus.pending) return null;
+    const parsed = parseSettingFloat(
+      (await this.prisma.setting.findUnique({ where: { key: 'pendingExpiryHours' } }))?.value,
+      2,
+    );
+    const hours = parsed > 0 ? parsed : 2;
+    const slotStart = this.slotStartAt(booking);
+    return new Date(
+      Math.min(
+        slotStart.getTime(),
+        Math.max(booking.createdAt.getTime() + hours * 3600_000, slotStart.getTime() - 24 * 3600_000),
+      ),
+    );
+  }
+
+  /**
+   * Round 5, R5-17: notify every SIGNED-IN share participant of a
+   * booking (BookingParticipant.userId != null) about a lifecycle
+   * event, via push + email (NotificationsService.notifyPlayerEvent).
+   * Guest joiners (userId null, phone only) have no push/email
+   * channel and are skipped. The host (booking.userId) is never a
+   * participant row, so no exclusion is needed; `excludeUserId` is
+   * accepted for callers that already notified one participant.
+   */
+  async notifyShareParticipants(
+    bookingId: string,
+    title: string,
+    body: string,
+    type: string,
+    emailSubject: string,
+    excludeUserId?: string,
+  ): Promise<void> {
+    const rows = await this.prisma.bookingParticipant.findMany({
+      where: { bookingId, userId: { not: null } },
+      select: { userId: true },
+    });
+    for (const r of rows) {
+      if (!r.userId || r.userId === excludeUserId) continue;
+      await this.notifications
+        .notifyPlayerEvent(
+          r.userId,
+          { title, body, data: { type, bookingId } },
+          emailSubject,
+        )
+        .catch(() => {});
+    }
   }
 
   async cancelMine(userId: string, bookingId: string) {
@@ -659,6 +810,15 @@ export class BookingsService {
     await this.cleanupGamePost(bookingId, 'The host cancelled their booking, so this game is off.');
     await this.notifyWaitlist(booking);
     await this.releasePromo(bookingId);
+    // Round 5, R5-17: share participants hear about the cancel too
+    // (push + email, signed-in joiners only).
+    await this.notifyShareParticipants(
+      bookingId,
+      'Game cancelled',
+      `The host cancelled the game on ${booking.date.toISOString().slice(0, 10)} — this shared game is off.`,
+      'booking_cancelled',
+      'Shared game cancelled',
+    ).catch(() => {});
     // The arena owner is told, mirroring the owner-cancel path that
     // tells the player (Round 4: player cancels used to notify
     // nobody, so the arena kept a dead booking on its books).
@@ -720,6 +880,8 @@ export class BookingsService {
         court: { select: { name: true, sport: true } },
         venue: { select: { name: true, address: true, city: true, images: true, photos: true } },
         participants: { select: { name: true, joinedAt: true } },
+        // Round 5, R5-26: capacity source (see below).
+        gamePost: { select: { playersNeeded: true } },
       },
     });
     if (!booking || booking.status === BookingStatus.cancelled) {
@@ -735,8 +897,18 @@ export class BookingsService {
     if (this.slotStarted(booking)) {
       throw new BadRequestException('This game has already started');
     }
-    const { checkInCode: _c, ...safe } = booking as any;
-    return safe;
+    const { checkInCode: _c, gamePost: _gp, ...safe } = booking as any;
+    // Round 5, R5-26: `capacity` is the max number of share
+    // participants. There is NO stored share-booking cap in the
+    // schema (joinShared enforces none), so the only server-derived
+    // cap is the linked game post's playersNeeded — the same number
+    // the game-board join path treats as "full" (joined >=
+    // playersNeeded). A shared booking with no linked game post has
+    // capacity null = uncapped; the panel renders "Squad full" only
+    // when capacity != null && participants.length >= capacity.
+    // (gamePost itself is stripped from the payload — only the
+    // derived capacity is exposed.)
+    return { ...safe, capacity: (booking as any).gamePost?.playersNeeded ?? null };
   }
 
   /**
@@ -1139,6 +1311,15 @@ export class BookingsService {
     if (booking.userId) {
       await this.notifications.notifyPlayerDecision(booking.userId, false, booking.venue.name, this.fmtWhen(booking), reason).catch(() => {});
     }
+    // Round 5, R5-17: a rejected booking is a cancelled shared game
+    // for its participants.
+    await this.notifyShareParticipants(
+      bookingId,
+      'Game cancelled',
+      `The arena did not approve the game at ${booking.venue.name} (${this.fmtWhen(booking)}) — this shared game is off.`,
+      'booking_cancelled',
+      'Shared game cancelled',
+    ).catch(() => {});
     return updated;
   }
 
@@ -1834,6 +2015,16 @@ export class BookingsService {
         })
         .catch(() => {});
     }
+    // Round 5, R5-17: cascade cancels (suspension, overdue-pause,
+    // owner delete, moderation) also reach share participants — the
+    // cascade previously told the player and the game squad only.
+    await this.notifyShareParticipants(
+      b.id,
+      'Game cancelled',
+      `The game at ${venueName ?? 'the arena'} on ${b.date.toISOString().slice(0, 10)} was cancelled: ${reason}.`,
+      'booking_cancelled',
+      'Shared game cancelled',
+    ).catch(() => {});
   }
 
   /**
@@ -1867,6 +2058,15 @@ export class BookingsService {
       await this.rejectPendingReschedules(b.id);
       await this.releasePromo(b.id);
       await this.cleanupGamePost(b.id, 'This game is off — the host is no longer on Areana.');
+      // Round 5, R5-17: player-suspension/deletion cancels also reach
+      // share participants.
+      await this.notifyShareParticipants(
+        b.id,
+        'Game cancelled',
+        `The game on ${b.date.toISOString().slice(0, 10)} was cancelled ${ownerNote} — this shared game is off.`,
+        'booking_cancelled',
+        'Shared game cancelled',
+      ).catch(() => {});
       await this.notifyWaitlist(b);
       if (b.venue.owner?.email) {
         void this.notifications.notifyOwnerNewBooking(
@@ -2008,6 +2208,14 @@ export class BookingsService {
     await this.cleanupGamePost(bookingId, 'The venue cancelled the booking, so this game is off.');
     await this.notifyWaitlist(booking);
     await this.releasePromo(bookingId);
+    // Round 5, R5-17: owner cancels reach share participants too.
+    await this.notifyShareParticipants(
+      bookingId,
+      'Game cancelled',
+      `The arena cancelled the game on ${booking.date.toISOString().slice(0, 10)} — this shared game is off.`,
+      'booking_cancelled',
+      'Shared game cancelled',
+    ).catch(() => {});
     // A cancelled game the player never hears about is a player who
     // shows up anyway — the venue cancel pushes like the venue
     // suspension cascade does.

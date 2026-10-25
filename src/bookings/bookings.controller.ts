@@ -43,6 +43,20 @@ export class BookingsController {
     return this.bookings.listMine(user.id, query);
   }
 
+  // Round 5, R5-16: the caller's pending reschedule requests.
+  // Defined before ':id' below so the static segment can never be
+  // swallowed by the param route.
+  @ApiBearerAuth()
+  @RequirePerm('bookings.read')
+  @Get('reschedules/pending')
+  pendingReschedules(@CurrentUser() user: AuthUser, @Query('page') page?: string, @Query('limit') limit?: string) {
+    return this.bookings.listPendingReschedules(
+      user.id,
+      page ? Number(page) : 1,
+      limit ? Number(limit) : undefined,
+    );
+  }
+
   @ApiBearerAuth()
   @RequirePerm('bookings.read')
   @Patch(':id/cancel')
@@ -167,5 +181,17 @@ export class BookingsController {
   @Post('shared/:shareCode/join')
   joinShared(@Param('shareCode') shareCode: string, @Body() dto: JoinSharedDto) {
     return this.bookings.joinShared(shareCode, dto);
+  }
+
+  // Round 5, R5-11: single booking detail for the owning player.
+  // LAST route in this controller on purpose: the one-segment static
+  // GETs above ('me', 'validate-promo', 'reschedules/pending') must
+  // win over this param route, or e.g. GET /bookings/validate-promo
+  // would be read as booking id "validate-promo".
+  @ApiBearerAuth()
+  @RequirePerm('bookings.read')
+  @Get(':id')
+  getMine(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.bookings.getMine(user.id, id);
   }
 }

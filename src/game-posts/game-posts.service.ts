@@ -813,6 +813,33 @@ export class GamePostsService {
     });
     if (!participant) throw new NotFoundException('You have not joined this game');
     await this.prisma.gameParticipant.delete({ where: { id: participant.id } });
+    // Round 5, R5-17: the host hears when a player leaves their game
+    // (push + email, joined players only — a pending requester who
+    // withdraws never held a spot, so no notice). Previously leaving
+    // notified nobody and the host only noticed a reopened spot.
+    if (participant.status === 'joined') {
+      const hostPost = await this.prisma.gamePost.findUnique({
+        where: { id: postId },
+        select: { creatorId: true, sport: true },
+      });
+      if (hostPost && hostPost.creatorId !== userId) {
+        const leaver = await this.prisma.user.findUnique({
+          where: { id: userId },
+          select: { name: true },
+        });
+        await this.notifications
+          .notifyPlayerEvent(
+            hostPost.creatorId,
+            {
+              title: 'Squad update',
+              body: `${leaver?.name ?? 'A player'} left your ${hostPost.sport} game — their spot is open again.`,
+              data: { type: 'game_roster_changed', postId },
+            },
+            `Player left your ${hostPost.sport} game`,
+          )
+          .catch(() => {});
+      }
+    }
     // Reopen the game if it had filled up — unless it already started,
     // in which case its status no longer matters.
     // Round 5, P5-S46: started = start instant, not play date.

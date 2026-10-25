@@ -306,4 +306,35 @@ export class NotificationsService {
       data: { type: 'game_join_request' },
     });
   }
+
+  /**
+   * Round 5, R5-5 + R5-17: push + email to a PLAYER (review replies,
+   * share-participant notices, game-post leave notices). pushToUser
+   * writes the inbox copy + FCM push; the email reuses the
+   * fire-and-forget-with-one-retry helper the owner mails use, so a
+   * mail failure is logged, never thrown — callers still .catch() the
+   * push half as elsewhere. Deleted/anonymized accounts have no
+   * deliverable address (deleted+<id>@areana.invalid) and are skipped.
+   */
+  async notifyPlayerEvent(
+    userId: string,
+    msg: PushMessage,
+    emailSubject: string,
+  ): Promise<void> {
+    await this.pushToUser(userId, msg).catch(() => {});
+    try {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { email: true },
+      });
+      if (user?.email && !user.email.endsWith('@areana.invalid')) {
+        await this.sendOwnerMail(user.email, emailSubject, msg.body, `player-event ${msg.data?.type ?? 'general'}`);
+      }
+    } catch (e) {
+      // sendOwnerMail itself never throws; this guards only the
+      // email lookup above. A notice failure must never fail the
+      // booking/review/game operation that triggered it.
+      this.logger.warn(`Player email lookup failed for ${userId}: ${(e as Error).message}`);
+    }
+  }
 }

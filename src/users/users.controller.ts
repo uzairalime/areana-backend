@@ -4,14 +4,18 @@ import { ApiBearerAuth, ApiConsumes, ApiProperty, ApiPropertyOptional, ApiTags }
 import { IsOptional, IsString } from 'class-validator';
 import { AuthUser, CurrentUser, RequirePerm } from '../common/auth';
 import { PrismaService } from '../common/prisma';
+import { parseSettingInt } from '../common/settings.util';
 import { BookingsService } from '../bookings/bookings.service';
 import { StorageService } from '../storage/storage.service';
 import { FileInterceptor } from '@nestjs/platform-express';
 
 class UpdateMeDto {
   @ApiPropertyOptional() @IsOptional() @IsString() name?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() phone?: string;
-  @ApiPropertyOptional() @IsOptional() @IsString() city?: string;
+  // Round 5, R5-24: phone/city accept an explicit null (NULL-CLEARS).
+  // @IsOptional skips null in validation, so null reaches the handler
+  // where it is distinguished from "absent" (undefined = untouched).
+  @ApiPropertyOptional() @IsOptional() @IsString() phone?: string | null;
+  @ApiPropertyOptional() @IsOptional() @IsString() city?: string | null;
 }
 
 class DeviceTokenDto {
@@ -37,27 +41,39 @@ export class UsersController {
       where: { id: user.id },
       include: { role: { select: { name: true } } },
     });
-    return me;
+    // Round 5, R5-15: player-readable strike limit (same field on
+    // GET /auth/me). Read from the noShowStrikeLimit setting with
+    // the same validated parse the strike paths use (default 3).
+    const noShowStrikeLimit = parseSettingInt(
+      (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value,
+      3,
+      1,
+    );
+    return { ...me, noShowStrikeLimit };
   }
 
   @Patch('me')
   async updateMe(@CurrentUser() user: AuthUser, @Body() dto: UpdateMeDto) {
-    // Round 5, R5-S12 (policy, chosen consistently): blank fields are
-    // IGNORED per-field, never a whole-PATCH failure and never a
-    // clear — a partial edit sending { name: "New Name", city: "" }
-    // now saves the name and leaves the city untouched, instead of
-    // 400ing and discarding the valid change too. There is therefore
-    // still no way to CLEAR a field via this endpoint (a cleared
-    // panel field is omitted by the panel, which is the same outcome);
-    // clearing, if ever wanted, must be an explicit null contract,
-    // not a blank string. Non-blank values are trimmed as before,
-    // and a non-blank phone with no digits is still rejected.
-    const data: { name?: string; phone?: string; city?: string } = {};
+    // Round 5, R5-24 (NULL-CLEARS, superseding the R5-S12 note that
+    // there was "no way to CLEAR a field"): the exact rule is —
+    //   absent (undefined)  -> field untouched
+    //   null                -> field CLEARED (phone, city only)
+    //   blank string (""/whitespace) -> IGNORED, field untouched
+    //   non-blank string    -> trimmed and saved (phone still
+    //                          validated for digits)
+    // Name keeps the old rule (null is ignored, not a clear — the
+    // task's contract names phone and city only). No invariant
+    // breaks: User.phone/city are nullable columns, nothing requires
+    // them post-signup (bookings, joins, and notices all tolerate
+    // null), and deleteMe already nulls both.
+    const data: { name?: string; phone?: string | null; city?: string | null } = {};
     if (dto.name != null) {
       const name = dto.name.trim();
       if (name) data.name = name;
     }
-    if (dto.phone != null) {
+    if (dto.phone === null) {
+      data.phone = null;
+    } else if (dto.phone != null) {
       const phone = dto.phone.trim();
       if (phone) {
         if (!/^\+?[0-9\s\-()]+$/.test(phone) || !/\d/.test(phone)) {
@@ -66,7 +82,9 @@ export class UsersController {
         data.phone = phone;
       }
     }
-    if (dto.city != null) {
+    if (dto.city === null) {
+      data.city = null;
+    } else if (dto.city != null) {
       const city = dto.city.trim();
       if (city) data.city = city;
     }
@@ -199,6 +217,13 @@ export class UsersController {
         data: { revokedAt: new Date() },
       }),
       this.prisma.deviceToken.deleteMany({ where: { userId: id } }),
+      // Round 5, R5-13: waitlist rows are DELETED (not anonymised) —
+      // matching the existing deleteMe pattern for favorites,
+      // notifications, and device tokens, which are also deleted
+      // outright. A waitlist row has no history value once its owner
+      // is gone (unlike bookings/reviews, which stay anonymised),
+      // and leaving it would keep pinging a dead account.
+      this.prisma.slotWaitlist.deleteMany({ where: { userId: id } }),
       this.prisma.favorite.deleteMany({ where: { userId: id } }),
       this.prisma.notification.deleteMany({ where: { userId: id } }),
       this.prisma.user.update({

@@ -29,22 +29,43 @@ export class ReferralsService {
   /**
    * Called at signup when a referral code was supplied.
    * Creates the pending referral and a 15% welcome promo for the referee.
+   *
+   * Round 5, R5-9: the outcome is DISTINGUISHABLE, not a bare null:
+   * 'applied' (referral + welcome promo created), 'invalid' (no user
+   * holds that code), 'self' (the referee's own code), 'failed'
+   * (the code was valid but the referral/promo could not be created
+   * — e.g. the referee already has a referral row, or the promo
+   * create threw). Callers must surface the status even when the
+   * promo is null, so the client never has to guess which failure it
+   * was. A promo-create throw is caught here and reported as
+   * 'failed' rather than failing the whole signup.
    */
-  async handleSignupReferral(refereeId: string, referralCode: string) {
+  async handleSignupReferral(
+    refereeId: string,
+    referralCode: string,
+  ): Promise<
+    | { status: 'applied'; promo: { code: string } }
+    | { status: 'invalid' | 'self' | 'failed'; promo: null }
+  > {
     const referrer = await this.prisma.user.findFirst({
       where: { referralCode: referralCode.toUpperCase().trim() },
     });
-    if (!referrer || referrer.id === refereeId) return null;
+    if (!referrer) return { status: 'invalid', promo: null };
+    if (referrer.id === refereeId) return { status: 'self', promo: null };
     const existing = await this.prisma.referral.findUnique({
       where: { refereeId },
     });
-    if (existing) return null;
+    if (existing) return { status: 'failed', promo: null };
 
-    await this.prisma.referral.create({
-      data: { referrerId: referrer.id, refereeId, status: 'pending' },
-    });
-    const promo = await this.promos.createPersonalPromo(refereeId, 'percent', 15, 30, 'WELCOME');
-    return { promo };
+    try {
+      await this.prisma.referral.create({
+        data: { referrerId: referrer.id, refereeId, status: 'pending' },
+      });
+      const promo = await this.promos.createPersonalPromo(refereeId, 'percent', 15, 30, 'WELCOME');
+      return { status: 'applied', promo };
+    } catch {
+      return { status: 'failed', promo: null };
+    }
   }
 
   /**

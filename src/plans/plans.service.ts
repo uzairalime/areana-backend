@@ -59,6 +59,19 @@ export interface BillingSummary {
   billingPaused: boolean;
   /** When the grace window closes (status due/overdue); null otherwise. */
   graceEndsAt: string | null;
+  /**
+   * Round 5, R5-22: frozen-period fields. A plan change without a
+   * billing restart freezes the CURRENT period to the old plan
+   * (Venue.frozenPlanId + billingPeriod*). All three are null when
+   * the venue is not frozen, so panels can render "frozen to [plan]
+   * until [period end]" only when frozenPlanId is non-null.
+   * frozenPlanName resolves the frozen plan row (null if the plan
+   * row is gone); frozenPeriodEnd is the frozen period's end
+   * instant (Venue.billingPeriodEnd), NOT the next due date.
+   */
+  frozenPlanId: string | null;
+  frozenPlanName: string | null;
+  frozenPeriodEnd: string | null;
 }
 
 // Shared month arithmetic lives in common/date.util — plans billing
@@ -943,6 +956,15 @@ export class PlansService {
     venue: Venue & { plan?: unknown },
   ): Promise<BillingSummary> {
     const plan = await this.effectivePlan(venue);
+    // Round 5, R5-22: frozen fields ride on the shared base, so BOTH
+    // the admin and owner billing paths carry them (both call this
+    // one method). Frozen = frozenPlanId set; the period end only
+    // means something while frozen, hence null otherwise even when
+    // billingPeriodEnd is populated for another reason.
+    const frozenPlanId = (venue as { frozenPlanId?: string | null }).frozenPlanId ?? null;
+    const frozenPlan = frozenPlanId
+      ? await this.prisma.plan.findUnique({ where: { id: frozenPlanId } })
+      : null;
     const base: BillingSummary = {
       status: 'none',
       planId: plan?.id ?? null,
@@ -954,6 +976,10 @@ export class PlansService {
       paidUntil: venue.billingPaidUntil?.toISOString() ?? null,
       billingPaused: venue.billingPaused,
       graceEndsAt: null,
+      frozenPlanId,
+      frozenPlanName: frozenPlan?.name ?? null,
+      frozenPeriodEnd:
+        frozenPlanId && venue.billingPeriodEnd ? venue.billingPeriodEnd.toISOString() : null,
     };
     const ctx = await this.context(venue);
     if (!ctx) return base;

@@ -6,11 +6,15 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../common/prisma';
 import { cursorPage, keysetWhere, pageLimit } from '../common/pagination';
+import { NotificationsService } from '../notifications/notifications.service';
 import { CreateReviewDto } from './dto';
 
 @Injectable()
 export class ReviewsService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private notifications: NotificationsService,
+  ) {}
 
   async create(userId: string, dto: CreateReviewDto) {
     const booking = await this.prisma.booking.findFirst({
@@ -65,22 +69,68 @@ export class ReviewsService {
 
   async listByVenue(venueId: string, cursor?: string, rawLimit?: number) {
     const limit = pageLimit(rawLimit, 20);
-    const rows = await this.prisma.review.findMany({
-      where: { venueId, ...keysetWhere(cursor, 'createdAt', 'desc') },
-      include: { user: { select: { name: true } } },
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      take: limit + 1,
-    });
-    return cursorPage(rows, limit);
+    const [total, rows] = await Promise.all([
+      this.prisma.review.count({ where: { venueId } }),
+      this.prisma.review.findMany({
+        where: { venueId, ...keysetWhere(cursor, 'createdAt', 'desc') },
+        include: { user: { select: { name: true } } },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        take: limit + 1,
+      }),
+    ]);
+    // Round 5, R5-18: `total` is the count of ALL reviews for the
+    // venue, not just this page — the old cursor page carried no
+    // total, so the header could not show "N reviews".
+    return cursorPage(rows, limit, undefined, total);
   }
 
   /** Called by the owner module (ownership is verified there). */
   async replyToReview(reviewId: string, reply: string) {
-    const review = await this.prisma.review.findUnique({ where: { id: reviewId } });
-    if (!review) throw new NotFoundException('Review not found');
-    return this.prisma.review.update({
+    const review = await this.prisma.review.findUnique({
       where: { id: reviewId },
-      data: { ownerReply: reply, repliedAt: new Date() },
+      include: { venue: { select: { name: true } } },
     });
+    if (!review) throw new NotFoundException('Review not found');
+    // Round 5, R5-5: reply edits keep history. The previous reply
+    // (if any) is appended to ownerReplyHistory as
+    // { reply, repliedAt (ISO) } BEFORE ownerReply/repliedAt are
+    // overwritten — a first reply leaves history []. The history
+    // lives on the Review row itself (ownerReplyHistory JSON column,
+    // migration 20261025180000_round5_r5_review_reply_history), not
+    // a separate table: replies are few, append-only, and always read
+    // with the review.
+    const priorHistory: { reply: string; repliedAt: string | null }[] =
+      Array.isArray(review.ownerReplyHistory)
+        ? (review.ownerReplyHistory as { reply: string; repliedAt: string | null }[])
+        : [];
+    const history =
+      review.ownerReply != null
+        ? [
+            ...priorHistory,
+            {
+              reply: review.ownerReply,
+              repliedAt: review.repliedAt ? review.repliedAt.toISOString() : null,
+            },
+          ]
+        : priorHistory;
+    const updated = await this.prisma.review.update({
+      where: { id: reviewId },
+      data: { ownerReply: reply, repliedAt: new Date(), ownerReplyHistory: history },
+    });
+    // Round 5, R5-5: the player hears about the reply (push + email),
+    // on first reply AND on edits — previously a reply notified
+    // nobody, so the player never knew the arena had responded.
+    await this.notifications
+      .notifyPlayerEvent(
+        review.userId,
+        {
+          title: 'Arena replied to your review',
+          body: `${review.venue.name} replied to your review: "${reply}"`,
+          data: { type: 'review_reply', venueId: review.venueId, reviewId },
+        },
+        `Reply to your review — ${review.venue.name}`,
+      )
+      .catch(() => {});
+    return updated;
   }
 }

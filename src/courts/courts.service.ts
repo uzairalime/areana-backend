@@ -299,19 +299,29 @@ export class CourtsService {
    * pending bookings and template-governed bookings the owner path
    * refused; the two paths now agree on whether an edit is legal.
    */
-  async countStrandedBookings(
+  /**
+   * Round 5, R5-1: the stranded bookings themselves (not just their
+   * count), in the exact shape the shrink-guard error carries:
+   * [{ id, date (YYYY-MM-DD), startMinutes, endMinutes }], ordered by
+   * date then start, so the panel can show the list before the owner
+   * acknowledges and retries. `date` is a YYYY-MM-DD string (same
+   * convention as OwnerService.conflictView) — never a Date object —
+   * so the error payload serializes identically everywhere.
+   */
+  async listStrandedBookings(
     courtId: string,
     headline: { openMinutes: number; closeMinutes: number },
-  ): Promise<number> {
+  ): Promise<{ id: string; date: string; startMinutes: number; endMinutes: number }[]> {
     const upcoming = await this.prisma.booking.findMany({
       where: {
         courtId,
         date: { gte: startOfToday() },
         status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
       },
-      select: { date: true, startMinutes: true, endMinutes: true },
+      select: { id: true, date: true, startMinutes: true, endMinutes: true },
+      orderBy: [{ date: 'asc' }, { startMinutes: 'asc' }],
     });
-    let stranded = 0;
+    const stranded: { id: string; date: string; startMinutes: number; endMinutes: number }[] = [];
     for (const b of upcoming) {
       const windows = await this.windowsForDate(
         { id: courtId, openMinutes: headline.openMinutes, closeMinutes: headline.closeMinutes },
@@ -322,10 +332,22 @@ export class CourtsService {
           (w) => b.startMinutes >= w.startMinutes && b.endMinutes <= w.endMinutes,
         )
       ) {
-        stranded++;
+        stranded.push({
+          id: b.id,
+          date: toYmd(b.date),
+          startMinutes: b.startMinutes,
+          endMinutes: b.endMinutes,
+        });
       }
     }
     return stranded;
+  }
+
+  async countStrandedBookings(
+    courtId: string,
+    headline: { openMinutes: number; closeMinutes: number },
+  ): Promise<number> {
+    return (await this.listStrandedBookings(courtId, headline)).length;
   }
 
   /**
