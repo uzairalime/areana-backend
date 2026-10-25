@@ -236,6 +236,17 @@ export class IdempotencyInterceptor implements NestInterceptor {
     if (!key || !actorId) return next.handle();
 
     const url: string = (req.url ?? '').split('?')[0];
+    // Round 5, R5-B1: Nest registers controller routes with the global
+    // prefix baked into the path, so inside an interceptor req.url is
+    // the FULL path ("/api/admin/venues/…") — verified empirically
+    // against a real Nest app with setGlobalPrefix('api'): the
+    // interceptor observed req.url === "/api/admin/venues/123/suspend"
+    // with an empty baseUrl. The REPLAY_CHECKS patterns are anchored
+    // ^/admin/, so they must match against the prefix-stripped path,
+    // or the replay policy silently never executes and every keyed
+    // replay is verbatim. The scope string keeps the full URL (read
+    // and write both use it, so scope matching is unaffected).
+    const path = url.replace(/^\/api(?=\/|$)/, '');
     const scope = `${req.method} ${url}#sha256:${bodyHash(req.body)}`;
     const since = new Date(Date.now() - TTL_MS);
 
@@ -254,7 +265,7 @@ export class IdempotencyInterceptor implements NestInterceptor {
     if (existing && existing.createdAt >= since) {
       const stored = existing.response as Record<string, unknown>;
       const rule = REPLAY_CHECKS.find(
-        (r) => r.method === req.method && r.pattern.test(url),
+        (r) => r.method === req.method && r.pattern.test(path),
       );
       let fresh = true;
       if (rule) {

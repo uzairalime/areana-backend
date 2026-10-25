@@ -790,6 +790,13 @@ export class OwnerService {
     if (dto.slotMinutes !== undefined && dto.slotMinutes < 15) {
       throw new BadRequestException('slotMinutes must be at least 15');
     }
+    // Round 5, O5-B3: the create DTO has @Min(0) but the update path
+    // accepted negative prices (the panel's own < 0 check masked it
+    // for panel users only). Service-level check as well as the DTO
+    // guard, so a negative rate can never reach a booking's pricing.
+    if (dto.pricePerHour !== undefined && dto.pricePerHour < 0) {
+      throw new BadRequestException('pricePerHour must be at least 0');
+    }
     const court = await this.prisma.court.findUnique({ where: { id: courtId } });
     if (!court) throw new NotFoundException('Court not found');
     await this.assertVenue(user, court.venueId);
@@ -1284,17 +1291,27 @@ export class OwnerService {
       }
       seenWeekdays.add(d.weekday);
     }
-    // Closing all 7 days must be rejected, not stored: the save
+    // Closing all days must be rejected, not stored: the save
     // deletes every CourtWeeklyWindow row, and windowsForDate treats
     // "no template rows at all" as "fall back to headline hours" —
     // so an all-closed save silently REOPENS the court at its default
     // hours and sells bookings on a court the owner believes is closed
-    // for renovation. (Closing 6 of 7 days works: the remaining rows
-    // keep the template alive, so closed weekdays stay closed.) This
-    // runs before any write, so a rejected save leaves the previous
-    // template intact.
+    // for renovation. This runs before any write, so a rejected save
+    // leaves the previous template intact.
+    // Round 5, O5-B1: the old guard fired only when all 7 weekdays
+    // were present and empty. A 6-day (or partial-week) array with
+    // zero open windows wiped the template exactly the same way —
+    // omitted weekdays are closed for the conflict scan, but the save
+    // still deletes every row and, with no rows left, falls back to
+    // headline hours. The rule is now: ANY non-empty days array with
+    // zero open windows is rejected. The one exception is the EMPTY
+    // array, which is the deliberate clear-template operation (revert
+    // to headline hours) preserved from Round 4: the panel always
+    // sends all 7 weekdays, so no panel flow sends [], and an API
+    // client sending [] is explicitly clearing, not closing. The
+    // panel must never present "clear template" as "closed".
     if (
-      seenWeekdays.size === 7 &&
+      dto.days.length > 0 &&
       dto.days.every((d) => d.windows.length === 0)
     ) {
       throw new BadRequestException(
@@ -1377,14 +1394,45 @@ export class OwnerService {
     // The window replace, the headline sync, and the version bump run
     // in one transaction: a crash between them used to leave the
     // template saved with a stale version, defeating the guard above.
+    // Round 5, O5-B2: the version guard is now a CONDITIONAL WRITE,
+    // not check-then-act. The old code checked the version from an
+    // unlocked read, then ran validation + conflict scan (multiple
+    // awaits), then bumped unconditionally — two tabs with the same
+    // version both saved (version 5 → 7, neither got 409). The
+    // in-transaction update below matches weeklyHoursVersion =
+    // expected; zero rows claimed means a concurrent save landed
+    // first, and the whole transaction rolls back with a 409.
     const savedCourt = await this.prisma.$transaction(async (tx) => {
+      let updated: { weeklyHoursVersion: number } | null = null;
+      if (dto.expectedVersion !== undefined) {
+        const claimed = await tx.court.updateMany({
+          where: { id: courtId, weeklyHoursVersion: dto.expectedVersion },
+          data: {
+            ...(flat.length > 0
+              ? {
+                  openMinutes: Math.min(...flat.map((w) => w.startMinutes)),
+                  closeMinutes: Math.max(...flat.map((w) => w.endMinutes)),
+                }
+              : {}),
+            weeklyHoursVersion: { increment: 1 },
+          },
+        });
+        if (claimed.count === 0) {
+          throw new ConflictException(
+            'Weekly hours changed since you loaded them — reload and try again',
+          );
+        }
+        updated = await tx.court.findUniqueOrThrow({
+          where: { id: courtId },
+          select: { weeklyHoursVersion: true },
+        });
+      }
       await tx.courtWeeklyWindow.deleteMany({ where: { courtId } });
       if (flat.length > 0) {
         await tx.courtWeeklyWindow.createMany({ data: flat });
       }
-      // Keep the court's headline hours in sync (earliest open /
-      // latest close across the week) for dashboards and occupancy
-      // math — and bump the optimistic-concurrency version.
+      if (updated) return updated;
+      // No expectedVersion (old clients): unconditional bump, as before.
       return tx.court.update({
         where: { id: courtId },
         data: {
@@ -1593,11 +1641,10 @@ export class OwnerService {
     // (live venue, approved court), and the slot must not have
     // started while the request sat pending.
     await this.courtsSvc.getActiveCourt(booking.courtId);
-    const now = new Date();
-    const started =
-      booking.date < startOfToday() ||
-      (isSameDay(booking.date, now) && booking.startMinutes <= minutesSinceMidnight(now));
-    if (started) throw new BadRequestException('Cannot accept a slot that already started');
+    // Round 5, P5-S46: started = start instant, not play date.
+    if (this.bookingOps.slotStarted(booking)) {
+      throw new BadRequestException('Cannot accept a slot that already started');
+    }
     return this.bookingOps.acceptBooking(bookingId);
   }
 
@@ -1631,11 +1678,10 @@ export class OwnerService {
     // skipWindowCheck below only waives the min-advance window, not
     // the past.
     const slotDate = parseDateOnly(dto.date);
-    const now = new Date();
-    const past =
-      slotDate < startOfToday() ||
-      (isSameDay(slotDate, now) && dto.startMinutes <= minutesSinceMidnight(now));
-    if (past) {
+    // Round 5, P5-S46: past = start instant, not play date — a
+    // spill-start walk-in (e.g. Friday 01:00 stored as Friday + 1500)
+    // is not in the past at Saturday 00:30.
+    if (this.bookingOps.slotStarted({ date: slotDate, startMinutes: dto.startMinutes })) {
       throw new BadRequestException('Walk-ins cannot be backdated — the slot has already started');
     }
     const booking = await this.bookingOps.create({
@@ -1654,6 +1700,7 @@ export class OwnerService {
     // The follow-up update is status-conditioned (Round 4, R-S5): an
     // unconditional update would resurrect a booking a cascade
     // cancelled between creation and this write.
+    const now = new Date();
     const isToday = isSameDay(slotDate, now);
     const claimed = await this.prisma.booking.updateMany({
       where: {
@@ -1736,11 +1783,7 @@ export class OwnerService {
     // started (or was checked in) must not be moved — moving it would
     // rewrite a game already in play. Like every other failure here,
     // this auto-rejects the request.
-    const now = new Date();
-    const origStarted =
-      req.booking.date < startOfToday() ||
-      (isSameDay(req.booking.date, now) &&
-        req.booking.startMinutes <= minutesSinceMidnight(now));
+    const origStarted = this.bookingOps.slotStarted(req.booking);
     if (origStarted || req.booking.checkedInAt) {
       throw new BadRequestException('The original slot has already started and cannot be moved');
     }

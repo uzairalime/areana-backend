@@ -134,6 +134,11 @@ model RefreshSession {
   expiresAt DateTime
   revokedAt DateTime?
   createdAt DateTime  @default(now())
+  // Round 5, P5-S7: set ONLY when this session was revoked by a
+  // rotation, pointing at the successor session. Lets a lost-response
+  // retry prove it is a retry of the same rotation (grace window)
+  // instead of theft. Logout revocations leave this null.
+  replacedById String?
 
   @@index([userId])
 }

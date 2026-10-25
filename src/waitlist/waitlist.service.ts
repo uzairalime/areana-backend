@@ -12,6 +12,7 @@ import {
   isSameDay,
   minutesSinceMidnight,
   parseDateOnly,
+  slotStartAt,
   startOfToday,
 } from '../common/date.util';
 import { JoinWaitlistDto } from './dto';
@@ -51,10 +52,9 @@ export class WaitlistService {
 
     const date = parseDateOnly(dto.date);
     const now = new Date();
-    if (
-      date < startOfToday() ||
-      (isSameDay(date, now) && dto.startMinutes <= minutesSinceMidnight(now))
-    ) {
+    // Round 5, P5-S46: passed = start instant, not play date — a
+    // spill-start slot is not passed at 00:30 the next morning.
+    if (slotStartAt({ date, startMinutes: dto.startMinutes }) <= now) {
       throw new BadRequestException('That slot has already passed');
     }
 

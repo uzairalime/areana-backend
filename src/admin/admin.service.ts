@@ -2352,6 +2352,11 @@ export class AdminService {
     if (dto.slotMinutes !== undefined && dto.slotMinutes < 15) {
       throw new BadRequestException('slotMinutes must be at least 15');
     }
+    // Round 5, O5-B3: service-level negative-price guard on the admin
+    // create path too (the DTO already has @Min(0); defense in depth).
+    if (dto.pricePerHour < 0) {
+      throw new BadRequestException('pricePerHour must be at least 0');
+    }
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
     if (venue.archivedAt || venue.status === 'suspended' || venue.status === 'rejected') {
@@ -2445,6 +2450,12 @@ export class AdminService {
   ) {
     if (dto.slotMinutes !== undefined && dto.slotMinutes < 15) {
       throw new BadRequestException('slotMinutes must be at least 15');
+    }
+    // Round 5, O5-B3: service-level negative-price guard on the admin
+    // update path too (the admin DTO already has @Min(0); this is
+    // defense in depth, matching the owner path).
+    if (dto.pricePerHour !== undefined && dto.pricePerHour < 0) {
+      throw new BadRequestException('pricePerHour must be at least 0');
     }
     const court = await this.prisma.court.findUnique({
       where: { id: courtId },

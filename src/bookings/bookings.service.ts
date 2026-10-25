@@ -403,27 +403,25 @@ export class BookingsService {
   }
 
   async cancelRecurringSeries(userId: string, recurrenceId: string) {
+    // Round 5, P5-S46: include yesterday so spill-start occurrences
+    // (instant still today) reach the slotStarted filter below.
+    const yesterday = new Date(startOfToday());
+    yesterday.setDate(yesterday.getDate() - 1);
     const candidates = await this.prisma.booking.findMany({
       where: {
         recurrenceId,
         userId,
         status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
-        date: { gte: startOfToday() },
+        date: { gte: yesterday },
       },
       select: { id: true, date: true, startMinutes: true, status: true },
     });
     // The started-check applies to today's occurrence too: a series
     // cancel must not kill a slot that is already in play — it stays
     // confirmed while the rest of the series is cancelled.
-    const now = new Date();
-    const nowMin = minutesSinceMidnight(now);
-    const affected = candidates.filter(
-      (b) =>
-        !(
-          b.date < startOfToday() ||
-          (isSameDay(b.date, now) && b.startMinutes <= nowMin)
-        ),
-    );
+    // Round 5, P5-S46: started = start instant (slotStarted), so a
+    // spill-start occurrence is judged by its instant, not its date.
+    const affected = candidates.filter((b) => !this.slotStarted(b));
     // Claim each occurrence with the status it had when read: an owner
     // accept landing between the read and this write wins — the
     // just-confirmed occurrence is not silently cancelled, and its side
@@ -542,16 +540,36 @@ export class BookingsService {
     if (!UPCOMING.includes(booking.status)) {
       throw new BadRequestException('Only upcoming bookings can be cancelled');
     }
-    const now = new Date();
-    const started =
-      booking.date < startOfToday() ||
-      (isSameDay(booking.date, now) && booking.startMinutes <= minutesSinceMidnight(now));
-    if (started) throw new BadRequestException('Cannot cancel a slot that already started');
+    // Round 5, P5-S46: started = start instant, not play date.
+    if (this.slotStarted(booking)) {
+      throw new BadRequestException('Cannot cancel a slot that already started');
+    }
 
-    const updated = await this.prisma.booking.update({
-      where: { id: bookingId },
+    // Round 5, P5-B1: the old unconditional update cancelled
+    // checked-in bookings (a player on the premises, slot freed and
+    // re-sold) and let a check-in landing between the read and the
+    // write leave a cancelled booking with checkedInAt set. The claim
+    // below makes cancel vs check-in a single-winner race, mirroring
+    // cancelByOwner/markNoShow: only the claimer runs the wake.
+    const claimed = await this.prisma.booking.updateMany({
+      where: {
+        id: bookingId,
+        userId,
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        checkedInAt: null,
+      },
       data: { status: BookingStatus.cancelled },
     });
+    if (claimed.count === 0) {
+      const current = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+      if (current?.checkedInAt) {
+        throw new BadRequestException('This booking is already checked in — it cannot be cancelled');
+      }
+      if (current && !UPCOMING.includes(current.status)) {
+        throw new BadRequestException('Only upcoming bookings can be cancelled');
+      }
+      throw new BadRequestException('This booking can no longer be cancelled');
+    }
     await this.rejectPendingReschedules(bookingId);
     await this.cleanupGamePost(bookingId, 'The host cancelled their booking, so this game is off.');
     await this.notifyWaitlist(booking);
@@ -582,7 +600,7 @@ export class BookingsService {
         })
         .catch(() => {});
     }
-    return updated;
+    return this.prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
   }
 
   // ------------------------------------------------------------------ share
@@ -757,14 +775,11 @@ export class BookingsService {
     // The original slot must not have started (or ended), and a booking
     // already checked in can no longer move — otherwise an in-progress
     // game could be teleported to another day.
+    // Round 5, P5-S46: started = start instant, not play date.
     if (booking.checkedInAt) {
       throw new BadRequestException('A checked-in booking cannot be rescheduled');
     }
-    const now = new Date();
-    const started =
-      booking.date < startOfToday() ||
-      (isSameDay(booking.date, now) && booking.startMinutes <= minutesSinceMidnight(now));
-    if (started) {
+    if (this.slotStarted(booking)) {
       throw new BadRequestException('Cannot reschedule a slot that already started');
     }
     const existing = await this.prisma.rescheduleRequest.findFirst({
@@ -850,6 +865,12 @@ export class BookingsService {
    * (check-in opens 30 minutes early, so a checked-in booking is live
    * even before its start minute). Shared by every cascade that must
    * not cancel games already in play.
+   * Round 5, P5-S46: "started" is the start INSTANT, not the play
+   * date — a spill-start booking (startMinutes >= 1440, e.g. Friday
+   * 01:00 stored as Friday + 1500) is NOT started at midnight, it
+   * starts at Saturday 01:00. The old date comparison treated it as
+   * started from midnight, making it un-cancellable, unjoinable, and
+   * invisible to the cascade at exactly the time it was still upcoming.
    */
   private slotLive(b: {
     date: Date;
@@ -857,11 +878,7 @@ export class BookingsService {
     checkedInAt?: Date | null;
   }): boolean {
     if (b.checkedInAt) return true;
-    const now = new Date();
-    return (
-      b.date < startOfToday() ||
-      (isSameDay(b.date, now) && b.startMinutes <= minutesSinceMidnight(now))
-    );
+    return this.slotStarted(b);
   }
 
   /** Owner/staff act on bookings of their venues (ownership verified by caller). */
@@ -1226,10 +1243,20 @@ export class BookingsService {
         owner: { select: { status: true } },
       },
     });
+    // Round 5, P5-S46: candidates must include yesterday's spill-start
+    // bookings (startMinutes >= 1440, instant still today). The old
+    // `date >= today` filter excluded them before slotLive ever ran,
+    // so a suspension cascade left a still-upcoming spill booking
+    // standing at a suspended venue. Yesterday is enough: slot starts
+    // fit inside windows ending by 1800, so no spill instant reaches
+    // past 06:00 the next day. slotLive (instant-based) filters the
+    // genuinely-started ones out.
+    const yesterday = new Date(startOfToday());
+    yesterday.setDate(yesterday.getDate() - 1);
     const candidates = await this.prisma.booking.findMany({
       where: {
         venueId,
-        date: { gte: startOfToday() },
+        date: { gte: yesterday },
         status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
       },
       select: {
@@ -1272,9 +1299,23 @@ export class BookingsService {
       // Only the pushes (player/squad/waitlist notices) stay outside
       // the transaction — a crash there loses a notification, never
       // state.
-      const claimed = await this.prisma.$transaction((tx) =>
-        this.claimCascadeInTx(tx, b),
-      );
+      // Round 5, R5-B5: the first loop gets the same in-transaction
+      // sanction re-check the drain passes have (Round 4, R-S3). The
+      // old first loop checked only before the tx, so an unsuspend
+      // landing between the pre-check and a booking's claim cancelled
+      // one extra booking at a venue that was live again. The venue
+      // row is locked inside the tx and the FULL sanction predicate
+      // re-read there; a mismatch aborts this booking's claim.
+      const claimed = await this.prisma.$transaction(async (tx) => {
+        if (sanctionAtStart) {
+          await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+          const current = await this.readSanctionInTx(tx, venueId);
+          if (!current || !this.sameSanction(current, sanctionAtStart)) {
+            return null;
+          }
+        }
+        return this.claimCascadeInTx(tx, b);
+      });
       if (!claimed) continue;
       cancelled++;
       // One booking's failing wake must never abort the whole cascade:
@@ -1330,7 +1371,9 @@ export class BookingsService {
         const rows = await tx.booking.findMany({
           where: {
             venueId,
-            date: { gte: startOfToday() },
+            // Round 5, P5-S46: yesterday, same as the snapshot above —
+            // spill-start bookings must reach the slotLive filter.
+            date: { gte: yesterday },
             status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
           },
           select: {
@@ -1430,8 +1473,11 @@ export class BookingsService {
     tx: Prisma.TransactionClient,
     b: { id: string },
   ): Promise<{ squad: string[] } | null> {
+    // Round 5, R5-B6: checkedInAt IS NULL in the claim, mirroring the
+    // markNoShow claim — a check-in landing between the snapshot
+    // filter and this write must win, not get cancelled mid-game.
     const claimed = await tx.booking.updateMany({
-      where: { id: b.id, status: { in: [BookingStatus.pending, BookingStatus.confirmed] } },
+      where: { id: b.id, status: { in: [BookingStatus.pending, BookingStatus.confirmed] }, checkedInAt: null },
       data: { status: BookingStatus.cancelled },
     });
     if (claimed.count === 0) return null;
@@ -1507,10 +1553,14 @@ export class BookingsService {
    * they are left alone. Returns how many bookings were cancelled.
    */
   async cancelFutureBookings(userId: string, ownerNote: string) {
+    // Round 5, P5-S46: include yesterday so spill-start bookings
+    // (instant still today) reach the slotLive filter below.
+    const yesterday = new Date(startOfToday());
+    yesterday.setDate(yesterday.getDate() - 1);
     const candidates = await this.prisma.booking.findMany({
       where: {
         userId,
-        date: { gte: startOfToday() },
+        date: { gte: yesterday },
         status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
       },
       include: {
@@ -1569,12 +1619,10 @@ export class BookingsService {
         wasJoined: (cur?.wasJoined ?? false) || r.status === 'joined',
       });
     }
-    const now = new Date();
     for (const { post, wasJoined } of byPost.values()) {
       if (!wasJoined) continue;
-      const started =
-        post.date < startOfToday() ||
-        (isSameDay(post.date, now) && post.startMinutes <= minutesSinceMidnight(now));
+      // Round 5, P5-S46: started = start instant, not play date.
+      const started = this.slotStarted(post);
       if (post.status === 'full' && !started) {
         await this.prisma.gamePost.update({
           where: { id: post.id },
@@ -1654,11 +1702,10 @@ export class BookingsService {
     // Same guards as the player cancel path: a slot that already
     // started is history, not a cancellation — and a checked-in
     // player is already on the court.
-    const now = new Date();
-    const started =
-      booking.date < startOfToday() ||
-      (isSameDay(booking.date, now) && booking.startMinutes <= minutesSinceMidnight(now));
-    if (started) throw new BadRequestException('Cannot cancel a slot that already started');
+    // Round 5, P5-S46: started = start instant, not play date.
+    if (this.slotStarted(booking)) {
+      throw new BadRequestException('Cannot cancel a slot that already started');
+    }
     if (booking.checkedInAt) {
       throw new BadRequestException('This booking is already checked in — it cannot be cancelled');
     }
@@ -1702,17 +1749,14 @@ export class BookingsService {
   }
 
   /**
-   * True once the slot's start has passed. Start instant, not play
+   * True once the slot's start has passed. Start INSTANT, not play
    * date, so an overnight game stops taking joiners at its start
    * (Round 4 join-until-START rule) even though it ends after
-   * midnight.
+   * midnight — and so a spill-start booking (startMinutes >= 1440)
+   * is not "already started" from midnight (Round 5, P5-S46).
    */
   slotStarted(b: { date: Date; startMinutes: number }, now = new Date()): boolean {
-    const today = startOfToday();
-    return (
-      b.date < today ||
-      (isSameDay(b.date, now) && b.startMinutes <= minutesSinceMidnight(now))
-    );
+    return this.slotStartAt(b) <= now;
   }
 
   /**

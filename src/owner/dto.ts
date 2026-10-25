@@ -48,7 +48,7 @@ export class UpdateCourtDto {
   @ApiPropertyOptional() @IsOptional() @IsString() size?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() surface?: string;
   @ApiPropertyOptional() @IsOptional() indoor?: boolean;
-  @ApiPropertyOptional() @IsOptional() @IsNumber() pricePerHour?: number;
+  @ApiPropertyOptional() @IsOptional() @IsNumber() @Min(0) pricePerHour?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() openMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() closeMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(15) slotMinutes?: number;

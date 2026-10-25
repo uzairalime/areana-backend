@@ -13,6 +13,7 @@ import {
   isSameDay,
   minutesSinceMidnight,
   parseDateOnly,
+  slotStartAt,
   startOfToday,
 } from '../common/date.util';
 import { CreateGamePostDto, GamePostQueryDto, UpdateGamePostDto } from './dto';
@@ -122,17 +123,29 @@ export class GamePostsService {
     if (query.city) where.city = { equals: query.city, mode: 'insensitive' };
     // Date filter: future days wholesale; for today, only games that
     // haven't started yet (a 6pm game shouldn't list as open at 9pm).
+    // Round 5, P5-S46: yesterday's SPILL posts count too — a Friday
+    // 01:00 game stored as Friday + 1500 starts Saturday 01:00, so
+    // at Saturday 00:30 it is still upcoming. A DB where-clause
+    // cannot express "start instant > now", but spill starts fit
+    // inside windows ending by 1800, so yesterday's spill branch is
+    // startMinutes > 1440 + nowMin. Same branch for an explicit
+    // yesterday date filter.
     const today = startOfToday();
     const nowMin = minutesSinceMidnight();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
     if (query.date) {
       const d = parseDateOnly(query.date);
       where.date = d;
       if (status === 'open' && isSameDay(d, today)) where.startMinutes = { gt: nowMin };
+      else if (status === 'open' && isSameDay(d, yesterday))
+        where.startMinutes = { gt: 1440 + nowMin };
     } else if (status === 'open') {
       and.push({
         OR: [
           { date: { gt: today } },
           { date: today, startMinutes: { gt: nowMin } },
+          { date: yesterday, startMinutes: { gt: 1440 + nowMin } },
         ],
       });
     }
@@ -333,11 +346,8 @@ export class GamePostsService {
         );
       }
       const now = new Date();
-      if (
-        booking.date < startOfToday() ||
-        (isSameDay(booking.date, now) &&
-          booking.startMinutes <= minutesSinceMidnight(now))
-      ) {
+      // Round 5, P5-S46: started = start instant, not play date.
+      if (slotStartAt(booking) <= now) {
         throw new BadRequestException('This booking has already started');
       }
       const existing = await this.prisma.gamePost.findUnique({
@@ -382,11 +392,11 @@ export class GamePostsService {
     }
     const date = parseDateOnly(dto.date);
     const now = new Date();
-    if (date < startOfToday()) {
-      throw new BadRequestException('Game date is in the past');
-    }
-    if (isSameDay(date, now) && dto.startMinutes <= minutesSinceMidnight(now)) {
-      throw new BadRequestException('That start time has already passed today');
+    // Round 5, P5-S46: past = start instant, not play date — a
+    // spill-start curated game (startMinutes >= 1440) is not in the
+    // past at 00:30 the next morning.
+    if (slotStartAt({ date, startMinutes: dto.startMinutes }) <= now) {
+      throw new BadRequestException('That start time has already passed');
     }
     let city = dto.city;
     if (dto.venueId) {
@@ -442,10 +452,8 @@ export class GamePostsService {
     // trivial): the old code edited the numbers on closed posts
     // (just without recomputing the status), so a finished game
     // could be quietly rewritten after the fact.
-    const now = new Date();
-    const played =
-      post.date < startOfToday() ||
-      (isSameDay(post.date, now) && post.startMinutes <= minutesSinceMidnight(now));
+    // Round 5, P5-S46: played = start instant, not play date.
+    const played = slotStartAt(post) <= new Date();
     if (post.status === 'closed' || played) {
       throw new BadRequestException('This game is closed and can no longer be edited');
     }
@@ -516,10 +524,8 @@ export class GamePostsService {
         if (!v) throw new NotFoundException('This game is no longer available');
       }
       const now = new Date();
-      if (
-        post.date < startOfToday() ||
-        (isSameDay(post.date, now) && post.startMinutes <= minutesSinceMidnight(now))
-      ) {
+      // Round 5, P5-S46: started = start instant, not play date.
+      if (slotStartAt(post) <= now) {
         throw new BadRequestException('This game has already started');
       }
       const existing = await tx.gameParticipant.findFirst({
@@ -601,10 +607,8 @@ export class GamePostsService {
         throw new ForbiddenException('Only the host can accept players');
       }
       const nowA = new Date();
-      if (
-        post.date < startOfToday() ||
-        (isSameDay(post.date, nowA) && post.startMinutes <= minutesSinceMidnight(nowA))
-      ) {
+      // Round 5, P5-S46: started = start instant, not play date.
+      if (slotStartAt(post) <= nowA) {
         throw new BadRequestException('This game has already started');
       }
       const row = await tx.gameParticipant.findUnique({
@@ -697,12 +701,9 @@ export class GamePostsService {
     await this.prisma.gameParticipant.delete({ where: { id: participant.id } });
     // Reopen the game if it had filled up — unless it already started,
     // in which case its status no longer matters.
+    // Round 5, P5-S46: started = start instant, not play date.
     const post = await this.prisma.gamePost.findUnique({ where: { id: postId } });
-    const started =
-      post &&
-      (post.date < startOfToday() ||
-        (isSameDay(post.date, new Date()) &&
-          post.startMinutes <= minutesSinceMidnight()));
+    const started = post && slotStartAt(post) <= new Date();
     if (!started) {
       await this.prisma.gamePost.updateMany({
         where: { id: postId, status: 'full' },

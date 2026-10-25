@@ -27,6 +27,15 @@ const OTP_TTL_MS = 10 * 60 * 1000;
 const OTP_MAX_ATTEMPTS = 5;
 const OTP_MAX_PER_HOUR = 5;
 const OTP_IP_MAX_PER_HOUR = 30;
+// Round 5, P5-S7: grace window for a lost-response rotation replay.
+// A refresh that rotated server-side but whose response was lost to a
+// network drop looks exactly like token reuse on retry — the old
+// scheme revoked EVERY session for it. Within this window after the
+// rotation, a replay of the just-rotated token rotates AGAIN from the
+// successor session instead of killing sessions. After the window, a
+// replayed old token is treated as theft (revoke-all) as before.
+// Logout revocations never carry a successor, so they never qualify.
+const ROTATION_GRACE_MS = 120_000;
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -172,10 +181,19 @@ export class AuthService {
       throw new ForbiddenException('This account is not active');
     }
     // All checks passed — now consume the code so it cannot be replayed.
-    await this.prisma.otpCode.update({
-      where: { id: record.id },
+    // Round 5, P5-S51: the consume is CONDITIONAL (id AND consumedAt
+    // IS NULL). The old unconditional update re-set consumedAt on a
+    // row a resend had already invalidated, so a verification in
+    // flight during a resend issued tokens for the superseded code —
+    // and the new code stayed live too. Zero rows claimed means the
+    // code was superseded mid-flight: no tokens, ever.
+    const consumed = await this.prisma.otpCode.updateMany({
+      where: { id: record.id, consumedAt: null },
       data: { consumedAt: new Date() },
     });
+    if (consumed.count === 0) {
+      throw new UnauthorizedException('Code invalid or expired');
+    }
     return { ...(await this.issueTokens(user)), welcomePromoCode };
   }
 
@@ -193,31 +211,60 @@ export class AuthService {
       throw new UnauthorizedException('Invalid refresh token');
     }
     // Session-backed rotation: the presented token must be the live,
-    // unrevoked session token. Anything else (an old rotated token, a
-    // logged-out one) is treated as reuse — kill every session.
+    // unrevoked session token.
     const session = payload.sid
       ? await this.prisma.refreshSession.findUnique({ where: { id: payload.sid } })
       : null;
-    if (
-      !session ||
-      session.userId !== user.id ||
-      session.revokedAt ||
-      session.expiresAt <= new Date() ||
-      session.tokenHash !== hashToken(dto.refreshToken)
-    ) {
-      if (session) {
-        await this.prisma.refreshSession.updateMany({
-          where: { userId: user.id, revokedAt: null },
-          data: { revokedAt: new Date() },
-        });
-      }
-      throw new UnauthorizedException('Invalid refresh token');
+    const now = new Date();
+    const presentedHash = hashToken(dto.refreshToken);
+    const isLive =
+      !!session &&
+      session.userId === user.id &&
+      !session.revokedAt &&
+      session.expiresAt > now &&
+      session.tokenHash === presentedHash;
+    if (isLive) {
+      return this.rotateTokens(user, session.id);
     }
-    await this.prisma.refreshSession.update({
-      where: { id: session.id },
-      data: { revokedAt: new Date() },
-    });
-    return this.issueTokens(user);
+    // Lost-response replay (Round 5, P5-S7): the first refresh rotated
+    // server-side but its response never reached the client, so the
+    // client retries with the now-revoked old token. If that token
+    // matches the revoked session, the session was revoked BY A
+    // ROTATION (replacedById set — logouts never set it), the rotation
+    // is within the grace window, and the successor session is still
+    // live, this is a retry of the same rotation, not theft: rotate
+    // again from the successor instead of revoking every session.
+    if (
+      session &&
+      session.userId === user.id &&
+      session.tokenHash === presentedHash &&
+      session.revokedAt &&
+      session.replacedById &&
+      now.getTime() - session.revokedAt.getTime() <= ROTATION_GRACE_MS
+    ) {
+      const successor = await this.prisma.refreshSession.findUnique({
+        where: { id: session.replacedById },
+      });
+      if (
+        successor &&
+        successor.userId === user.id &&
+        !successor.revokedAt &&
+        successor.expiresAt > now
+      ) {
+        return this.rotateTokens(user, successor.id);
+      }
+    }
+    // Anything else (an old rotated token outside grace, a logged-out
+    // one, an expired one, a hash mismatch) is treated as reuse —
+    // kill every session, as before. (P5-S53's expired/logged-out
+    // distinction is out of scope for this round and unchanged.)
+    if (session) {
+      await this.prisma.refreshSession.updateMany({
+        where: { userId: user.id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+    }
+    throw new UnauthorizedException('Invalid refresh token');
   }
 
   /** Revokes the session behind a refresh token (best-effort, idempotent). */
@@ -328,7 +375,6 @@ export class AuthService {
 
   private async issueTokens(user: User) {
     const role = await this.prisma.role.findUniqueOrThrow({ where: { id: user.roleId } });
-    const payload = { sub: user.id, email: user.email, roleId: user.roleId, roleName: role.name };
     const refreshTtl: number = this.config.get('jwt.refreshTtl');
     const session = await this.prisma.refreshSession.create({
       data: {
@@ -337,13 +383,31 @@ export class AuthService {
         expiresAt: new Date(Date.now() + refreshTtl * 1000),
       },
     });
+    const { accessToken, refreshToken } = await this.signTokens(user, role.name, session.id);
+    return {
+      accessToken,
+      refreshToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: role.name,
+        permissions: role.permissions,
+      },
+    };
+  }
+
+  /** Sign access + refresh tokens for an already-created session row, then store the refresh hash. */
+  private async signTokens(user: User, roleName: string, sessionId: string) {
+    const payload = { sub: user.id, email: user.email, roleId: user.roleId, roleName };
+    const refreshTtl: number = this.config.get('jwt.refreshTtl');
     const [accessToken, refreshToken] = await Promise.all([
       this.jwt.signAsync(payload, {
         secret: this.config.get('jwt.accessSecret'),
         expiresIn: this.config.get('jwt.accessTtl'),
       }),
       this.jwt.signAsync(
-        { ...payload, sid: session.id },
+        { ...payload, sid: sessionId },
         {
           secret: this.config.get('jwt.refreshSecret'),
           expiresIn: refreshTtl,
@@ -351,9 +415,36 @@ export class AuthService {
       ),
     ]);
     await this.prisma.refreshSession.update({
-      where: { id: session.id },
+      where: { id: sessionId },
       data: { tokenHash: hashToken(refreshToken) },
     });
+    return { accessToken, refreshToken };
+  }
+
+  /**
+   * Rotate a session: create the successor and revoke the predecessor
+   * WITH the link (replacedById) in ONE transaction, then sign. The
+   * link is what lets a lost-response retry prove it is a retry of
+   * this exact rotation (Round 5, P5-S7) instead of theft.
+   */
+  private async rotateTokens(user: User, fromSessionId: string) {
+    const role = await this.prisma.role.findUniqueOrThrow({ where: { id: user.roleId } });
+    const refreshTtl: number = this.config.get('jwt.refreshTtl');
+    const session = await this.prisma.$transaction(async (tx) => {
+      const ns = await tx.refreshSession.create({
+        data: {
+          userId: user.id,
+          tokenHash: 'pending',
+          expiresAt: new Date(Date.now() + refreshTtl * 1000),
+        },
+      });
+      await tx.refreshSession.update({
+        where: { id: fromSessionId },
+        data: { revokedAt: new Date(), replacedById: ns.id },
+      });
+      return ns;
+    });
+    const { accessToken, refreshToken } = await this.signTokens(user, role.name, session.id);
     return {
       accessToken,
       refreshToken,

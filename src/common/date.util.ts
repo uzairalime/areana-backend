@@ -58,3 +58,19 @@ export function isSameDay(a: Date, b: Date): boolean {
     a.getDate() === b.getDate()
   );
 }
+
+/**
+ * Slot start as an instant. Built from local midnight of the play day —
+ * not from the stored Date, which is UTC midnight (05:00 PKT) and would
+ * shift every instant by five hours — and setMinutes rolls values past
+ * 1440 across midnight, so an overnight spill slot (startMinutes 1500
+ * on Friday = Saturday 01:00) gets its true instant. Every "already
+ * started" check must use this, never `date < today`: a spill-start
+ * booking is NOT started at midnight, it starts at its instant
+ * (Round 5, P5-S46). Mirrors BookingsService.slotStartAt.
+ */
+export function slotStartAt(b: { date: Date; startMinutes: number }): Date {
+  const d = new Date(b.date.getFullYear(), b.date.getMonth(), b.date.getDate());
+  d.setMinutes(b.startMinutes);
+  return d;
+}

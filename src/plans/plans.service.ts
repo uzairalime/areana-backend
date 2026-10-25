@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -373,6 +374,20 @@ export class PlansService {
     let result;
     try {
       result = await this.prisma.$transaction(async (tx) => {
+        // Round 5, R5-B4: the venue row is LOCKED and re-read inside
+        // the transaction. The old code read the venue BEFORE the tx
+        // and rolled flags back from that stale snapshot, so a
+        // mark-paid landing between the read and the tx was erased
+        // (ledger row survived, flag did not, and a re-mark would
+        // duplicate the ledger row). The row lock serializes against
+        // mark-paid's in-transaction claim: if the settlement landed
+        // first, the fresh read shows paidUntil past this period and
+        // the rollback condition below refuses to touch it; if the
+        // void locks first, the later mark-paid re-tests its own claim
+        // against the voided state and settles the period legitimately.
+        await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+        const fresh = await tx.venue.findUnique({ where: { id: venueId } });
+        if (!fresh) throw new NotFoundException('Venue not found');
         await tx.venuePayment.create({
           data: {
             venueId,
@@ -391,18 +406,20 @@ export class PlansService {
         // extension was stacked onto the coverage being voided, so it
         // collapses to the same point. An override at or before the
         // period start predates the voided coverage and is left alone.
+        // Both conditions are evaluated on the FRESH in-transaction
+        // row, never a pre-transaction snapshot.
         const venueData: Prisma.VenueUpdateInput = {};
         if (
-          venue.billingPaidUntil &&
+          fresh.billingPaidUntil &&
           payment.periodEnd &&
-          venue.billingPaidUntil <= payment.periodEnd
+          fresh.billingPaidUntil <= payment.periodEnd
         ) {
           venueData.billingPaidUntil = payment.periodStart;
         }
         if (
-          venue.freeUntilOverride &&
+          fresh.freeUntilOverride &&
           payment.periodStart &&
-          venue.freeUntilOverride > payment.periodStart
+          fresh.freeUntilOverride > payment.periodStart
         ) {
           venueData.freeUntilOverride = payment.periodStart;
         }
@@ -477,27 +494,39 @@ export class PlansService {
       // the last restart → the restart proceeds, so legitimate
       // repeated restarts are unaffected.
       if (venue.billingStartAt) {
-        const lastPayment = await this.prisma.venuePayment.findFirst({
+        // Round 5, R5-B3: the old guard checked only the LATEST
+        // payment's void. Pay P1, pay P2, void P2, restart — the guard
+        // saw P2's void and passed, orphaning P1's still-standing
+        // settlement (money recorded, no longer reflected in any
+        // billing chain). Block restart if ANY non-void, non-auto
+        // payment since billingStartAt lacks a void reversal.
+        const settlements = await this.prisma.venuePayment.findMany({
           // NULL method = a settlement recorded without a method:
           // still money, so it blocks like any other payment.
           where: {
             venueId,
+            createdAt: { gt: venue.billingStartAt },
             OR: [
               { method: null },
               { method: { notIn: ['void', 'auto'] } },
             ],
           },
-          orderBy: { createdAt: 'desc' },
-          select: { id: true, createdAt: true },
+          select: { id: true },
         });
-        if (lastPayment && lastPayment.createdAt > venue.billingStartAt) {
-          const voided = await this.prisma.venuePayment.findFirst({
-            where: { venueId, method: 'void', note: `void:${lastPayment.id}` },
-            select: { id: true },
+        if (settlements.length > 0) {
+          const voided = await this.prisma.venuePayment.findMany({
+            where: {
+              venueId,
+              method: 'void',
+              note: { in: settlements.map((p) => `void:${p.id}`) },
+            },
+            select: { note: true },
           });
-          if (!voided) {
+          const voidedIds = new Set(voided.map((v) => (v.note ?? '').slice(5)));
+          const standing = settlements.filter((p) => !voidedIds.has(p.id));
+          if (standing.length > 0) {
             throw new BadRequestException(
-              'This arena has a payment recorded since its last billing restart — void that payment first, then restart billing.',
+              'This arena has payments recorded since its last billing restart that have not been voided — void those payments first, then restart billing.',
             );
           }
         }
@@ -568,8 +597,24 @@ export class PlansService {
           ? freeUntil
           : now;
     const newFreeUntil = addMonths(base, months);
-    const updated = await this.prisma.venue.update({
-      where: { id: venueId },
+    // Round 5, R5-B2: extend-free had no claim or unique backstop —
+    // unlike mark-paid/suspend/role/user-status. If the idempotency
+    // row failed to store (the fail-open case) or two identical
+    // requests raced past the read, the second execution stacked
+    // another N months onto the already-extended date. The write is
+    // now conditioned on the pre-read money state (freeUntilOverride
+    // AND billingPaidUntil, both nullable-aware: a NULL precondition
+    // matches only NULL, so a concurrent change to either field
+    // makes the claim fail instead of stacking). Zero rows claimed
+    // means the free state moved under us — reload and retry.
+    // (A concurrent plan change alone does not move either field, so
+    // it is not covered by this claim; the stacking vector is.)
+    const claimed = await this.prisma.venue.updateMany({
+      where: {
+        id: venueId,
+        freeUntilOverride: venue.freeUntilOverride,
+        billingPaidUntil: venue.billingPaidUntil,
+      },
       data: {
         freeUntilOverride: newFreeUntil,
         // Only un-pause when the venue is actually free again; an
@@ -582,6 +627,14 @@ export class PlansService {
         billingPeriodPrice: null,
         frozenPlanId: null,
       },
+    });
+    if (claimed.count === 0) {
+      throw new ConflictException(
+        'Free period changed since you loaded it — reload and try again',
+      );
+    }
+    const updated = await this.prisma.venue.findUniqueOrThrow({
+      where: { id: venueId },
       include: { plan: true },
     });
     return updated;
