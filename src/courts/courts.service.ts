@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, UserStatus, VenueStatus } from '@prisma/client';
+import { BookingStatus, Prisma, UserStatus, VenueStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
-import { addMonths } from '../common/date.util';
+import { addMonths, startOfToday } from '../common/date.util';
 
 export interface DayWindow {
   startMinutes: number;
@@ -110,8 +110,9 @@ export class CourtsService {
   }
 
   /** Price windows (peak/off-peak rates) applying on a given date. */
-  async priceWindowsForDate(courtId: string, date: Date) {
-    const rows = await this.prisma.courtPriceWindow.findMany({
+  async priceWindowsForDate(courtId: string, date: Date, tx?: Prisma.TransactionClient) {
+    const db = tx ?? this.prisma;
+    const rows = await db.courtPriceWindow.findMany({
       where: { courtId },
     });
     const weekday = date.getDay();
@@ -125,18 +126,17 @@ export class CourtsService {
   }
 
   /**
-   * Price windows for a date AND the next date, for overnight slots:
-   * post-midnight hours of an overnight window (startMinutes >= 1440)
-   * are priced by the MORNING's weekday windows, never the evening's —
-   * a Sat 00:00–02:00 peak window must price Fri night's 00:00–02:00
-   * slots, not Fri's evening windows.
+   * Price windows for a date AND the next date, for overnight slots.
+   * Precedence for a post-midnight hour (startMinutes >= 1440), see
+   * rateForSlotPair: the next day's morning window first, then the
+   * evening window covering the spill hour, then the base rate.
    */
-  async priceWindowsForDateRange(courtId: string, date: Date) {
+  async priceWindowsForDateRange(courtId: string, date: Date, tx?: Prisma.TransactionClient) {
     const nextDay = new Date(date);
     nextDay.setDate(nextDay.getDate() + 1);
     const [day, next] = await Promise.all([
-      this.priceWindowsForDate(courtId, date),
-      this.priceWindowsForDate(courtId, nextDay),
+      this.priceWindowsForDate(courtId, date, tx),
+      this.priceWindowsForDate(courtId, nextDay, tx),
     ]);
     return { day, next };
   }
@@ -158,8 +158,13 @@ export class CourtsService {
 
   /**
    * Overnight-aware slot rate: slots at/after midnight price from the
-   * next day's windows (with minutes shifted back into that day),
-   * daytime slots from the date's own windows.
+   * next day's windows (with minutes shifted back into that day) —
+   * UNLESS no morning window covers the hour, in which case the
+   * evening window covering the spill hour prices it (Round 4, O-S20:
+   * an evening peak window ending past midnight used to price its
+   * post-midnight hours at the next day's BASE rate, because the
+   * morning lookup found nothing and never consulted the evening
+   * window). Daytime slots price from the date's own windows.
    */
   rateForSlotPair(
     windows: {
@@ -170,7 +175,15 @@ export class CourtsService {
     startMinutes: number,
   ): number {
     if (startMinutes >= 1440) {
-      return this.priceRateForSlot(windows.next, baseRate, startMinutes - 1440);
+      const morning = windows.next.find(
+        (x) => startMinutes - 1440 >= x.startMinutes && startMinutes - 1440 < x.endMinutes,
+      );
+      if (morning) return Number(morning.pricePerHour);
+      const evening = windows.day.find(
+        (x) => startMinutes >= x.startMinutes && startMinutes < x.endMinutes,
+      );
+      if (evening) return Number(evening.pricePerHour);
+      return baseRate;
     }
     return this.priceRateForSlot(windows.day, baseRate, startMinutes);
   }
@@ -254,20 +267,28 @@ export class CourtsService {
    * would otherwise keep taking bookings. Computed here because
    * injecting PlansService would cycle modules (Plans → Bookings →
    * Courts). Keep this in step with plans.context/billingSummary.
+   * When the caller passes its transaction client (Round 4, R-S7),
+   * the plan and grace-days reads go through it, so a plan/grace
+   * change committed inside the caller's transaction is seen —
+   * the gate is no longer best-effort against a stale snapshot.
    */
-  private async isBillingOverdue(venue: {
-    billingStartAt: Date | null;
-    billingPaidUntil: Date | null;
-    freeUntilOverride: Date | null;
-    billingPeriodStart: Date | null;
-    billingPeriodEnd: Date | null;
-    billingPeriodPrice?: unknown;
-    planId: string | null;
-  }): Promise<boolean> {
+  private async isBillingOverdue(
+    venue: {
+      billingStartAt: Date | null;
+      billingPaidUntil: Date | null;
+      freeUntilOverride: Date | null;
+      billingPeriodStart: Date | null;
+      billingPeriodEnd: Date | null;
+      billingPeriodPrice?: unknown;
+      planId: string | null;
+    },
+    tx?: Prisma.TransactionClient,
+  ): Promise<boolean> {
     if (!venue.billingStartAt) return false;
+    const db = tx ?? this.prisma;
     const plan = venue.planId
-      ? await this.prisma.plan.findUnique({ where: { id: venue.planId } })
-      : await this.prisma.plan.findFirst({ where: { isDefault: true } });
+      ? await db.plan.findUnique({ where: { id: venue.planId } })
+      : await db.plan.findFirst({ where: { isDefault: true } });
     if (!plan) return false;
     const freeUntil =
       venue.freeUntilOverride ?? addMonths(venue.billingStartAt, plan.freeMonths);
@@ -311,7 +332,7 @@ export class CourtsService {
         : null;
     const price = frozenPrice ?? plan.priceYearly;
     if (price === 0) return false;
-    const setting = await this.prisma.setting.findUnique({
+    const setting = await db.setting.findUnique({
       where: { key: 'billingGraceDays' },
     });
     const grace = setting ? parseInt(setting.value, 10) || 14 : 14;
@@ -395,7 +416,7 @@ export class CourtsService {
       },
       include: { venue: true },
     });
-    if (!court || (await this.isBillingOverdue(court.venue))) {
+    if (!court || (await this.isBillingOverdue(court.venue, tx))) {
       throw new NotFoundException('Court not found');
     }
     // Same legacy slotMinutes guard as getActiveCourt, re-run inside
@@ -403,5 +424,44 @@ export class CourtsService {
     if (court.slotMinutes <= 0) {
       throw new BadRequestException('Court slot length is invalid');
     }
+  }
+
+  /**
+   * Upcoming bookings whose start no longer sits on the grid implied
+   * by a NEW slot length (Round 4, O-S5): the booking must sit inside
+   * one effective window for its date (template if present, else the
+   * given headline hours) and align to that window's start on the new
+   * grid. Bookings outside every window are NOT misaligned — they are
+   * the shrink guard's (O-S4) problem, not the grid's.
+   */
+  async findMisalignedBookings(
+    courtId: string,
+    newSlotMinutes: number,
+    headline: { openMinutes: number; closeMinutes: number },
+  ) {
+    const rows = await this.prisma.booking.findMany({
+      where: {
+        courtId,
+        date: { gte: startOfToday() },
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+      },
+      include: { user: { select: { name: true } } },
+      orderBy: [{ date: 'asc' }, { startMinutes: 'asc' }],
+    });
+    const misaligned = [];
+    for (const b of rows) {
+      const windows = await this.windowsForDate(
+        { id: courtId, openMinutes: headline.openMinutes, closeMinutes: headline.closeMinutes },
+        b.date,
+      );
+      const w = windows.find(
+        (x) => b.startMinutes >= x.startMinutes && b.endMinutes <= x.endMinutes,
+      );
+      if (!w) continue;
+      if ((b.startMinutes - w.startMinutes) % newSlotMinutes !== 0) {
+        misaligned.push(b);
+      }
+    }
+    return misaligned;
   }
 }

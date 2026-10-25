@@ -26,6 +26,7 @@ export class QueryVenuesDto {
   @ApiPropertyOptional({ enum: ['rating', 'price_asc', 'price_desc', 'name'], default: 'rating' })
   @IsOptional()
   @IsString()
+  @IsIn(['rating', 'price_asc', 'price_desc', 'name'])
   sort?: string;
 
   @ApiPropertyOptional({ default: 1 })

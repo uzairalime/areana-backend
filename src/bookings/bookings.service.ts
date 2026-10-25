@@ -75,7 +75,8 @@ export class BookingsService {
     // covering it (peak/off-peak), else the court's base rate — so a
     // booking spanning the peak boundary prices each hour correctly.
     // Post-midnight slots of an overnight booking price from the
-    // morning's weekday windows, not the evening's.
+    // morning's weekday windows first, falling back to the evening
+    // window covering the spill hour, then the base rate (O-S20).
     const priceWindows = await this.courts.priceWindowsForDateRange(court.id, date);
     const baseRate = Number(court.pricePerHour);
     let gross = 0;
@@ -120,13 +121,55 @@ export class BookingsService {
       await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${court.venueId} FOR UPDATE`;
       await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${court.id} FOR UPDATE`;
       await this.courts.assertBookableInTx(tx, court.id);
+      // Re-read price + slot length inside the tx and re-price (Round
+      // 4, R-S6/R-S8): the pre-check's rate and slot length can go
+      // stale between pre-check and insert (owner reprices or resizes
+      // the court), which used to store a booking at a price the
+      // player never saw, on a grid that no longer exists. A changed
+      // price aborts with "price changed, please confirm" instead of
+      // silently charging the new amount; the end minute is always
+      // re-derived from the tx-fresh slot length × slot count.
+      const fresh = await tx.court.findUnique({
+        where: { id: court.id },
+        select: { pricePerHour: true, slotMinutes: true },
+      });
+      if (!fresh) throw new NotFoundException('Court not found');
+      if (fresh.slotMinutes <= 0) {
+        throw new BadRequestException('Court slot length is invalid');
+      }
+      const txEndMinutes = startMinutes + fresh.slotMinutes * slotCount;
+      const txPriceWindows = await this.courts.priceWindowsForDateRange(court.id, date, tx);
+      const txBaseRate = Number(fresh.pricePerHour);
+      let txGross = 0;
+      for (let i = 0; i < slotCount; i++) {
+        txGross +=
+          this.courts.rateForSlotPair(
+            txPriceWindows,
+            txBaseRate,
+            startMinutes + i * fresh.slotMinutes,
+          ) * (fresh.slotMinutes / 60);
+      }
+      txGross = Math.round(txGross * 100) / 100;
+      if (txGross !== gross) {
+        throw new BadRequestException('Price changed — please confirm the new price and try again');
+      }
       // Hours re-validation inside the tx: the pre-check's windows can
       // go stale between pre-check and insert (owner shrinks hours, or
       // adds a template closing the weekday), stranding a booking
       // outside the hours it was sold under. Blocks are covered by
       // assertNoOverlap below, which already re-checks them in-tx.
-      await this.courts.assertSlotInTx(tx, court.id, date, startMinutes, endMinutes);
-      await this.assertNoOverlap(court.id, date, startMinutes, endMinutes, tx);
+      // A tx-time window failure means the hours moved since the
+      // player picked the slot, so it gets its own message (R-S8) —
+      // not the generic pre-check one.
+      try {
+        await this.courts.assertSlotInTx(tx, court.id, date, startMinutes, txEndMinutes);
+      } catch (e) {
+        if (e instanceof BadRequestException) {
+          throw new BadRequestException('Court hours changed — please pick again');
+        }
+        throw e;
+      }
+      await this.assertNoOverlap(court.id, date, startMinutes, txEndMinutes, tx);
       const b = await tx.booking.create({
         data: {
           userId: input.userId,
@@ -135,7 +178,7 @@ export class BookingsService {
           courtId: court.id,
           date,
           startMinutes,
-          endMinutes,
+          endMinutes: txEndMinutes,
           // Never store a negative price: a discount larger than the
           // gross (e.g. a misconfigured promo) floors at zero.
           totalPrice: Math.max(0, gross - discount),
@@ -158,15 +201,24 @@ export class BookingsService {
     });
 
     // Notify the arena owner (email) — only for player-made requests, not walk-ins.
+    // Auto-accept venues used to notify nobody: the old condition
+    // required a pending request, so a confirmed booking never emailed
+    // (Round 4). Pending requests keep the approval wording; confirmed
+    // bookings get the confirmed wording.
     const ownerEmail = (booking.venue as any).owner?.email;
-    if (ownerEmail && input.userId && booking.status === BookingStatus.pending) {
+    if (ownerEmail && input.userId) {
       const hh = String(Math.floor(startMinutes / 60)).padStart(2, '0');
       const mm = String(startMinutes % 60).padStart(2, '0');
-      await this.notifications.notifyOwnerNewBooking(
-        ownerEmail,
-        booking.venue.name,
-        `${booking.court.name} — ${input.date} ${hh}:${mm} (${slotCount} slot${slotCount > 1 ? 's' : ''}), Rs ${Number(booking.totalPrice).toFixed(0)}`,
-      ).catch(() => {});
+      const summary = `${booking.court.name} — ${input.date} ${hh}:${mm} (${slotCount} slot${slotCount > 1 ? 's' : ''}), Rs ${Number(booking.totalPrice).toFixed(0)}`;
+      if (booking.status === BookingStatus.pending) {
+        await this.notifications
+          .notifyOwnerNewBooking(ownerEmail, booking.venue.name, summary)
+          .catch(() => {});
+      } else if (booking.status === BookingStatus.confirmed) {
+        await this.notifications
+          .notifyOwnerConfirmedBooking(ownerEmail, booking.venue.name, summary)
+          .catch(() => {});
+      }
     }
     return booking;
   }
@@ -336,6 +388,18 @@ export class BookingsService {
         skipped.push({ date: ds, reason: e.message ?? 'Unavailable' });
       }
     }
+    // A series that creates nothing must not return a bare 200 success
+    // (Round 4 trivial): the empty result carries an explicit message
+    // so the caller can tell "nothing booked" from "all booked".
+    if (created.length === 0) {
+      return {
+        recurrenceId,
+        created,
+        skipped,
+        message:
+          'No bookings could be created for this series — every date was unavailable (see skipped)',
+      };
+    }
     return { recurrenceId, created, skipped };
   }
 
@@ -493,6 +557,34 @@ export class BookingsService {
     await this.cleanupGamePost(bookingId, 'The host cancelled their booking, so this game is off.');
     await this.notifyWaitlist(booking);
     await this.releasePromo(bookingId);
+    // The arena owner is told, mirroring the owner-cancel path that
+    // tells the player (Round 4: player cancels used to notify
+    // nobody, so the arena kept a dead booking on its books).
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: booking.venueId },
+      select: {
+        name: true,
+        ownerId: true,
+        owner: { select: { email: true } },
+      },
+    });
+    if (venue) {
+      const hh = String(Math.floor(booking.startMinutes / 60)).padStart(2, '0');
+      const mm = String(booking.startMinutes % 60).padStart(2, '0');
+      const summary = `${booking.date.toISOString().slice(0, 10)} ${hh}:${mm}`;
+      if (venue.owner?.email) {
+        await this.notifications
+          .notifyOwnerCancelledBooking(venue.owner.email, venue.name, summary)
+          .catch(() => {});
+      }
+      await this.notifications
+        .pushToUser(venue.ownerId, {
+          title: 'Booking cancelled',
+          body: `A player cancelled their booking at ${venue.name} (${summary}).`,
+          data: { type: 'booking_cancelled', venueId: booking.venueId },
+        })
+        .catch(() => {});
+    }
     return updated;
   }
 
@@ -519,6 +611,13 @@ export class BookingsService {
       },
     });
     if (!booking || booking.status === BookingStatus.cancelled) {
+      throw new NotFoundException('Booking link is invalid or expired');
+    }
+    // Joins until START (Round 4 decision, enforced identically in
+    // getShared, the join page path via this lookup, and joinShared):
+    // a link for a game that already started takes no new joiners,
+    // even if the game is still being played.
+    if (this.slotStarted(booking)) {
       throw new NotFoundException('Booking link is invalid or expired');
     }
     const { checkInCode: _c, ...safe } = booking as any;
@@ -557,6 +656,13 @@ export class BookingsService {
   /**
    * When a booked slot frees up (cancellation, reschedule-away), tell
    * everyone waitlisted for exactly that slot — first come, first served.
+   * The ping uses each entry's WAITED slot size (Round 4): the old
+   * code stepped the freed range by the court's CURRENT slotMinutes,
+   * so after an owner resized the court, waiters on the old grid were
+   * never pinged. Entries whose waited slot overlaps the freed range
+   * are claimed (atomic UPDATE ... WHERE notifiedAt IS NULL) and
+   * pinged; entries created before slot sizes were stored fall back
+   * to the court's current slotMinutes.
    */
   async notifyWaitlist(booking: {
     courtId: string;
@@ -573,38 +679,42 @@ export class BookingsService {
     // possibly already stored) would loop forever stepping by 0 or
     // backwards — skip the notify rather than hang the request.
     if (court.slotMinutes <= 0) return;
-    // Every slot in the freed range — a 2-hour cancellation frees two
-    // waitlist slots, not just the first.
-    for (
-      let s = booking.startMinutes;
-      s < booking.endMinutes;
-      s += court.slotMinutes
-    ) {
+    const entries = await this.prisma.slotWaitlist.findMany({
+      where: { courtId: booking.courtId, date: booking.date, notifiedAt: null },
+      select: { id: true, userId: true, startMinutes: true, slotMinutes: true },
+      orderBy: { startMinutes: 'asc' },
+    });
+    for (const e of entries) {
+      const size = e.slotMinutes ?? court.slotMinutes;
+      if (size <= 0) continue;
+      // The waited slot must overlap the freed range — a waiter on
+      // 09:00–10:00 is not pinged for a freed 10:00–11:00, and a
+      // waiter on the old 60-minute grid is still pinged when their
+      // hour frees under the new 30-minute grid.
+      if (!(e.startMinutes < booking.endMinutes && e.startMinutes + size > booking.startMinutes)) {
+        continue;
+      }
       // Claim BEFORE notifying: the old read-then-ping-then-mark let
       // two concurrent cancellations both read the same un-notified
       // entries and ping every waiter twice. The UPDATE ... RETURNING
       // claims exactly the rows this caller won; a loser claims
       // nothing and pings nobody.
-      const claimed = await this.prisma.$queryRaw<{ id: string; userId: string }[]>`
+      const claimed = await this.prisma.$queryRaw<{ id: string }[]>`
         UPDATE "SlotWaitlist"
         SET "notifiedAt" = NOW()
-        WHERE "courtId" = ${booking.courtId}
-          AND "date" = ${booking.date.toISOString().slice(0, 10)}::date
-          AND "startMinutes" = ${s}
+        WHERE "id" = ${e.id}
           AND "notifiedAt" IS NULL
-        RETURNING "id", "userId"`;
+        RETURNING "id"`;
       if (claimed.length === 0) continue;
-      const hh = String(Math.floor(s / 60) % 24).padStart(2, '0');
-      const mm = String(s % 60).padStart(2, '0');
-      for (const e of claimed) {
-        await this.notifications
-          .pushToUser(e.userId, {
-            title: 'A slot just opened up',
-            body: `${court.venue.name} · ${court.name} on ${booking.date.toISOString().slice(0, 10)} at ${hh}:${mm} is free again — grab it before someone else does.`,
-            data: { type: 'slot_opened' },
-          })
-          .catch(() => {});
-      }
+      const hh = String(Math.floor(e.startMinutes / 60) % 24).padStart(2, '0');
+      const mm = String(e.startMinutes % 60).padStart(2, '0');
+      await this.notifications
+        .pushToUser(e.userId, {
+          title: 'A slot just opened up',
+          body: `${court.venue.name} · ${court.name} on ${booking.date.toISOString().slice(0, 10)} at ${hh}:${mm} is free again — grab it before someone else does.`,
+          data: { type: 'slot_opened' },
+        })
+        .catch(() => {});
     }
   }
 
@@ -613,11 +723,12 @@ export class BookingsService {
     if (!booking || booking.status === BookingStatus.cancelled) {
       throw new NotFoundException('Booking link is invalid or expired');
     }
-    // A link for a game that already happened can't take new joiners —
-    // end instant, so an overnight game still accepts joiners after
-    // midnight while it is being played.
-    if (this.slotEnded(booking)) {
-      throw new BadRequestException('This game has already taken place');
+    // Joins until START (Round 4 decision): a game that already
+    // started takes no new joiners — the old end-instant rule let an
+    // overnight game accept joiners after midnight while it was being
+    // played.
+    if (this.slotStarted(booking)) {
+      throw new BadRequestException('This game has already started');
     }
     // One join per phone number — stops accidental (or spammed) duplicates.
     if (dto.phone) {
@@ -671,6 +782,41 @@ export class BookingsService {
     slotAt.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
     if (slotAt <= new Date()) throw new BadRequestException('New slot must be in the future');
 
+    // The requested slot must actually be bookable (Round 4): the old
+    // code accepted any future minute — startMinutes 9999, or a
+    // closed-hour slot — and left the owner to auto-reject it. Sane
+    // integer first (the setHours rollover above would otherwise
+    // bless 9999 as a date a week out), then containment in one
+    // effective window for the requested date on the court's grid —
+    // including the previous evening's spill window for early-morning
+    // requests (same rule as reschedule-accept, O-S13).
+    if (!Number.isInteger(startMinutes) || startMinutes < 0 || startMinutes >= 1440) {
+      throw new BadRequestException('Requested slot is outside court hours');
+    }
+    const court = await this.prisma.court.findUnique({ where: { id: booking.courtId } });
+    if (!court) throw new NotFoundException('Court not found');
+    if (court.slotMinutes <= 0) {
+      throw new BadRequestException('Court slot length is invalid');
+    }
+    const windows = await this.courts.windowsForDate(court, date);
+    let window = windows.find(
+      (w) => startMinutes >= w.startMinutes && endMinutes <= w.endMinutes,
+    );
+    if (!window && startMinutes < 360) {
+      const prevDate = new Date(date);
+      prevDate.setDate(prevDate.getDate() - 1);
+      const prevWindows = await this.courts.windowsForDate(court, prevDate);
+      const spill = prevWindows
+        .filter((w) => w.endMinutes > 1440)
+        .map((w) => ({ startMinutes: w.startMinutes - 1440, endMinutes: w.endMinutes - 1440 }));
+      window = spill.find(
+        (w) => startMinutes >= w.startMinutes && endMinutes <= w.endMinutes,
+      );
+    }
+    if (!window || (startMinutes - window.startMinutes) % court.slotMinutes !== 0) {
+      throw new BadRequestException('Requested slot is outside court hours');
+    }
+
     return this.prisma.rescheduleRequest.create({
       data: {
         bookingId,
@@ -679,6 +825,26 @@ export class BookingsService {
         requestedEndMinutes: endMinutes,
       },
     });
+  }
+
+  /**
+   * The player withdraws their own pending reschedule request (Round
+   * 4): previously a request could only leave pending by an owner
+   * decision, so a player who changed their mind was stuck until the
+   * owner acted. The claim is status-conditioned, so a concurrent
+   * owner decision wins instead of being overwritten.
+   */
+  async withdrawReschedule(userId: string, bookingId: string) {
+    const booking = await this.prisma.booking.findFirst({ where: { id: bookingId, userId } });
+    if (!booking) throw new NotFoundException('Booking not found');
+    const claimed = await this.prisma.rescheduleRequest.updateMany({
+      where: { bookingId, status: 'pending' },
+      data: { status: 'withdrawn', decidedAt: new Date() },
+    });
+    if (claimed.count === 0) {
+      throw new BadRequestException('No pending reschedule request to withdraw');
+    }
+    return { withdrawn: true };
   }
 
   // ------------------------------------------------------- owner operations
@@ -1055,7 +1221,13 @@ export class BookingsService {
   async cancelVenueUpcomingBookings(venueId: string, reason: string) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
-      select: { name: true, status: true },
+      select: {
+        name: true,
+        status: true,
+        moderationStatus: true,
+        billingPaused: true,
+        owner: { select: { status: true } },
+      },
     });
     const candidates = await this.prisma.booking.findMany({
       where: {
@@ -1076,25 +1248,37 @@ export class BookingsService {
     const upcoming = candidates.filter((b) => !this.slotLive(b));
     // The snapshot above can go stale mid-loop: an unsuspend landing
     // while a suspension cascade is still cancelling would otherwise
-    // keep cancelling a live venue's weekend. Re-read the venue status
-    // before each booking and stop the moment it changed — a human
-    // just decided something about this venue, and the cascade must
-    // not overrule them.
-    const statusAtStart = venue?.status;
+    // keep cancelling a live venue's weekend. The stop rule snapshots
+    // the FULL "venue is still sanctioned" predicate (Round 4, R-S2)
+    // — status + moderation + billingPaused + owner status, not just
+    // the venue status column — and re-checks it before each booking
+    // and each drain pass. A human decision changing any leg stops
+    // the cascade; the cascade must not overrule them.
+    const sanctionAtStart = venue
+      ? {
+          status: venue.status,
+          moderationStatus: venue.moderationStatus,
+          billingPaused: venue.billingPaused,
+          ownerStatus: venue.owner.status,
+        }
+      : null;
     let cancelled = 0;
     for (const b of upcoming) {
-      if (statusAtStart !== undefined) {
-        const current = await this.prisma.venue.findUnique({
-          where: { id: venueId },
-          select: { status: true },
-        });
-        if (!current || current.status !== statusAtStart) break;
+      if (sanctionAtStart) {
+        const current = await this.readSanction(venueId);
+        if (!current || !this.sameSanction(current, sanctionAtStart)) break;
       }
-      const claimed = await this.prisma.booking.updateMany({
-        where: { id: b.id, status: { in: [BookingStatus.pending, BookingStatus.confirmed] } },
-        data: { status: BookingStatus.cancelled },
-      });
-      if (claimed.count === 0) continue;
+      // Claim + database wake in ONE transaction (Round 4, R-S4):
+      // the old claim-then-finalize split left a crash window where
+      // the booking was cancelled but its game post stayed, its promo
+      // stayed spent, and its pending reschedules stayed pending.
+      // Only the pushes (player/squad/waitlist notices) stay outside
+      // the transaction — a crash there loses a notification, never
+      // state.
+      const claimed = await this.prisma.$transaction((tx) =>
+        this.claimCascadeInTx(tx, b),
+      );
+      if (!claimed) continue;
       cancelled++;
       // One booking's failing wake must never abort the whole cascade:
       // a game post deleted between findUnique and delete used to throw
@@ -1102,7 +1286,7 @@ export class BookingsService {
       // reported success. Log the failure and continue — the booking
       // itself is already cancelled; only its wake is partial.
       try {
-        await this.finalizeCascadeCancel(b, venue?.name, venueId, reason);
+        await this.finalizeCascadeNotices(b, venue?.name, venueId, reason, claimed.squad);
       } catch (err) {
         this.logger.error(
           `Cascade finalize failed for booking ${b.id}: ${(err as Error).message}`,
@@ -1119,20 +1303,27 @@ export class BookingsService {
     // re-verification to commit, so a pass either waits for an
     // in-flight insert and then sees it, or runs after the insert
     // committed and sees it), claims whatever is still standing, and
-    // repeats until a pass finds nothing. The status-change stop rule
+    // repeats until a pass finds nothing. The sanction stop rule
     // applies here too, and the pass cap bounds the loop if bookings
     // keep arriving (a creation starting after the final pass still
     // fails its own re-verification against the suspended venue/owner).
     for (let pass = 0; pass < 5; pass++) {
-      if (statusAtStart !== undefined) {
-        const current = await this.prisma.venue.findUnique({
-          where: { id: venueId },
-          select: { status: true },
-        });
-        if (!current || current.status !== statusAtStart) break;
+      if (sanctionAtStart) {
+        const current = await this.readSanction(venueId);
+        if (!current || !this.sameSanction(current, sanctionAtStart)) break;
       }
-      const claimed = await this.prisma.$transaction(async (tx) => {
+      const { stopped, done } = await this.prisma.$transaction(async (tx) => {
         await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+        // Re-check the sanction predicate INSIDE the transaction,
+        // after the row lock (Round 4, R-S3): a sanction change that
+        // landed between the pass's pre-check and the lock must abort
+        // the claim, not just the next pass.
+        if (sanctionAtStart) {
+          const current = await this.readSanctionInTx(tx, venueId);
+          if (!current || !this.sameSanction(current, sanctionAtStart)) {
+            return { stopped: true, done: [] as { booking: (typeof upcoming)[number]; squad: string[] }[] };
+          }
+        }
         const rows = await tx.booking.findMany({
           where: {
             venueId,
@@ -1150,21 +1341,19 @@ export class BookingsService {
           },
         });
         const standing = rows.filter((b) => !this.slotLive(b));
-        const done: typeof standing = [];
+        const done: { booking: (typeof standing)[number]; squad: string[] }[] = [];
         for (const b of standing) {
-          const c = await tx.booking.updateMany({
-            where: { id: b.id, status: { in: [BookingStatus.pending, BookingStatus.confirmed] } },
-            data: { status: BookingStatus.cancelled },
-          });
-          if (c.count > 0) done.push(b);
+          const claimed = await this.claimCascadeInTx(tx, b);
+          if (claimed) done.push({ booking: b, squad: claimed.squad });
         }
-        return done;
+        return { stopped: false, done };
       });
-      if (claimed.length === 0) break;
-      cancelled += claimed.length;
-      for (const b of claimed) {
+      if (stopped) break;
+      if (done.length === 0) break;
+      cancelled += done.length;
+      for (const { booking: b, squad } of done) {
         try {
-          await this.finalizeCascadeCancel(b, venue?.name, venueId, reason);
+          await this.finalizeCascadeNotices(b, venue?.name, venueId, reason, squad);
         } catch (err) {
           this.logger.error(
             `Cascade finalize failed for booking ${b.id}: ${(err as Error).message}`,
@@ -1175,14 +1364,103 @@ export class BookingsService {
     return cancelled;
   }
 
+  /** The full "venue is still sanctioned" predicate for the cascade stop rule. */
+  private async readSanction(venueId: string) {
+    const v = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: {
+        status: true,
+        moderationStatus: true,
+        billingPaused: true,
+        owner: { select: { status: true } },
+      },
+    });
+    if (!v) return null;
+    return {
+      status: v.status,
+      moderationStatus: v.moderationStatus,
+      billingPaused: v.billingPaused,
+      ownerStatus: v.owner.status,
+    };
+  }
+
+  private async readSanctionInTx(tx: Prisma.TransactionClient, venueId: string) {
+    const v = await tx.venue.findUnique({
+      where: { id: venueId },
+      select: {
+        status: true,
+        moderationStatus: true,
+        billingPaused: true,
+        owner: { select: { status: true } },
+      },
+    });
+    if (!v) return null;
+    return {
+      status: v.status,
+      moderationStatus: v.moderationStatus,
+      billingPaused: v.billingPaused,
+      ownerStatus: v.owner.status,
+    };
+  }
+
+  private sameSanction(
+    a: { status: unknown; moderationStatus: unknown; billingPaused: unknown; ownerStatus: unknown },
+    b: { status: unknown; moderationStatus: unknown; billingPaused: unknown; ownerStatus: unknown },
+  ) {
+    return (
+      a.status === b.status &&
+      a.moderationStatus === b.moderationStatus &&
+      a.billingPaused === b.billingPaused &&
+      a.ownerStatus === b.ownerStatus
+    );
+  }
+
   /**
-   * The per-booking wake after a cascade claim: reschedule rejection,
-   * game-post cleanup, waitlist ping, promo refund, player notice.
-   * Shared by the snapshot loop and the drain passes so a booking
-   * cancelled late gets exactly the same treatment as one cancelled
-   * early — never a silent cancellation.
+   * Claim one booking for the cascade AND run its database wake inside
+   * the caller's transaction (Round 4, R-S4): status-conditioned
+   * cancel, pending reschedules rejected, linked game post deleted,
+   * promo released. Returns null when another path already claimed
+   * the booking. The squad user ids are returned so the caller can
+   * notify them after commit.
    */
-  private async finalizeCascadeCancel(
+  private async claimCascadeInTx(
+    tx: Prisma.TransactionClient,
+    b: { id: string },
+  ): Promise<{ squad: string[] } | null> {
+    const claimed = await tx.booking.updateMany({
+      where: { id: b.id, status: { in: [BookingStatus.pending, BookingStatus.confirmed] } },
+      data: { status: BookingStatus.cancelled },
+    });
+    if (claimed.count === 0) return null;
+    await tx.rescheduleRequest.updateMany({
+      where: { bookingId: b.id, status: 'pending' },
+      data: { status: 'rejected', reason: 'Booking is no longer active', decidedAt: new Date() },
+    });
+    const post = await tx.gamePost.findUnique({
+      where: { bookingId: b.id },
+      select: { id: true },
+    });
+    let squad: string[] = [];
+    if (post) {
+      squad = (
+        await tx.gameParticipant.findMany({
+          where: { postId: post.id, userId: { not: null } },
+          select: { userId: true },
+        })
+      ).map((s) => s.userId!);
+      await tx.gamePost.deleteMany({ where: { bookingId: b.id } });
+    }
+    await this.promos.refundBookingPromo(b.id, tx);
+    return { squad };
+  }
+
+  /**
+   * The per-booking wake AFTER a cascade claim commits: squad told
+   * their game is off, freed slots pinged to their waitlists, player
+   * told why. Runs post-commit (pushes cannot be transactional) and
+   * never aborts the cascade — the caller logs and continues.
+   */
+  private async finalizeCascadeNotices(
     b: {
       id: string;
       userId: string | null;
@@ -1195,11 +1473,18 @@ export class BookingsService {
     venueName: string | undefined,
     venueId: string,
     reason: string,
+    squadUserIds: string[],
   ) {
-    await this.rejectPendingReschedules(b.id);
-    await this.cleanupGamePost(b.id, 'The arena cancelled the booking, so this game is off.');
+    for (const userId of squadUserIds) {
+      await this.notifications
+        .pushToUser(userId, {
+          title: 'Game cancelled',
+          body: 'The arena cancelled the booking, so this game is off.',
+          data: { type: 'game_cancelled' },
+        })
+        .catch(() => {});
+    }
     await this.notifyWaitlist(b);
-    await this.releasePromo(b.id);
     if (b.userId) {
       await this.notifications
         .pushToUser(b.userId, {
@@ -1413,6 +1698,20 @@ export class BookingsService {
       where: { bookingId, status: 'pending' },
       data: { status: 'rejected', reason, decidedAt: new Date() },
     });
+  }
+
+  /**
+   * True once the slot's start has passed. Start instant, not play
+   * date, so an overnight game stops taking joiners at its start
+   * (Round 4 join-until-START rule) even though it ends after
+   * midnight.
+   */
+  slotStarted(b: { date: Date; startMinutes: number }, now = new Date()): boolean {
+    const today = startOfToday();
+    return (
+      b.date < today ||
+      (isSameDay(b.date, now) && b.startMinutes <= minutesSinceMidnight(now))
+    );
   }
 
   /**

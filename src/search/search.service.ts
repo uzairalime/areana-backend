@@ -41,7 +41,7 @@ export class SearchService {
             isActive: true,
             status: 'approved',
             ...(q.sport ? { sport: { equals: q.sport, mode: 'insensitive' } } : {}),
-            ...(q.size ? { size: q.size } : {}),
+            ...(q.size ? { size: { equals: q.size, mode: 'insensitive' } } : {}),
             ...(q.indoor !== undefined ? { indoor: q.indoor } : {}),
           },
         },
@@ -67,7 +67,7 @@ export class SearchService {
             isActive: true,
             status: 'approved',
             ...(q.sport ? { sport: { equals: q.sport, mode: 'insensitive' } } : {}),
-            ...(q.size ? { size: q.size } : {}),
+            ...(q.size ? { size: { equals: q.size, mode: 'insensitive' } } : {}),
             ...(q.indoor !== undefined ? { indoor: q.indoor } : {}),
           },
           select: {

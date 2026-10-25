@@ -195,7 +195,7 @@ export class PlansService {
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(${PLAN_WRITE_LOCK})`;
       const plan = await tx.plan.findUnique({
         where: { id },
-        include: { _count: { select: { venues: true, payments: true } } },
+        include: { _count: { select: { venues: true, payments: true, frozenVenues: true } } },
       });
       if (!plan) throw new NotFoundException('Plan not found');
       if (plan.isDefault) {
@@ -210,6 +210,16 @@ export class PlansService {
       }
       if (plan._count.venues > 0) {
         throw new BadRequestException(`This plan still has ${plan._count.venues} venue(s) on it — move them first`);
+      }
+      // Frozen venues pin this plan as their frozenPlanId (plan-change
+      // freeze): deleting the plan would leave their frozen period
+      // pointing at a deleted plan (SetNull) while the frozen price
+      // still governs — refuse until the freeze is resolved by a
+      // restart or a settled period, like the venue/payment guards.
+      if (plan._count.frozenVenues > 0) {
+        throw new BadRequestException(
+          `This plan still freezes ${plan._count.frozenVenues} venue(s) — resolve those freezes first`,
+        );
       }
       // Ledger rows reference the plan for receipt plan names (the
       // relation is SetNull, so a delete would silently blank history).
@@ -226,14 +236,17 @@ export class PlansService {
 
   /**
    * Void a wrong mark-paid: a compensating reversing ledger row (negative
-   * amount, same period) plus rolling the venue's paid flag back when
-   * this payment is still the latest settlement — no schema change.
-   * The reversal is keyed by note `void:<paymentId>`, so a second void
+   * amount, same period) plus rolling the venue's paid flag back. Only
+   * the LATEST standing settlement may be voided (Round 4, R-S13) —
+   * voiding a middle period used to punch a hole in the paid chain
+   * while the flag still claimed the later periods paid, so voids now
+   * unwind from the front: void the later payment(s) first. The
+   * reversal is keyed by note `void:<paymentId>`, so a second void
    * of the same payment is a clean 409, not a second reversal. Revenue
-   * sums net out (original + reversal = 0). When a LATER period was
-   * already settled, the flag is left alone — unwinding the chain
-   * would unpay a period the venue already settled — but the money is
-   * still returned on the ledger.
+   * sums net out (original + reversal = 0). A freeUntilOverride
+   * stacked onto the voided period's coverage rewinds with it
+   * (R-S14) — otherwise the override kept the venue free past the
+   * voided period and the flag rollback was a no-op.
    */
   async voidPayment(venueId: string, paymentId: string, actorId?: string) {
     const payment = await this.prisma.venuePayment.findUnique({
@@ -245,11 +258,50 @@ export class PlansService {
     if (payment.method === 'void') {
       throw new BadRequestException('This row is itself a reversal — it cannot be voided');
     }
+    // A period-less row has no coverage to roll back (R-S15): the flag
+    // rollback and the override rewind both need the period, so such
+    // rows are refused instead of half-unwound.
+    if (!payment.periodStart || !payment.periodEnd) {
+      throw new BadRequestException('This payment has no billing period — it cannot be voided');
+    }
+    // The already-check matches the partial unique index exactly
+    // (R-T2): note AND method = 'void', so an ordinary payment that
+    // happens to carry the same note text never blocks a void.
     const already = await this.prisma.venuePayment.findFirst({
-      where: { venueId, note: `void:${paymentId}` },
+      where: { venueId, method: 'void', note: `void:${paymentId}` },
     });
     if (already) {
       throw new BadRequestException('This payment was already voided');
+    }
+    // Only the latest STANDING settlement may be voided. A later
+    // payment whose own void already reversed it does not block — the
+    // chain is unwound from the front, so a voided later period is
+    // already out of the chain.
+    const laterPayments = await this.prisma.venuePayment.findMany({
+      where: {
+        venueId,
+        method: { not: 'void' },
+        id: { not: paymentId },
+        periodEnd: { gt: payment.periodEnd },
+      },
+      select: { id: true },
+    });
+    if (laterPayments.length > 0) {
+      const voidedNotes = await this.prisma.venuePayment.findMany({
+        where: {
+          venueId,
+          method: 'void',
+          note: { in: laterPayments.map((p) => `void:${p.id}`) },
+        },
+        select: { note: true },
+      });
+      const voidedIds = new Set(voidedNotes.map((v) => (v.note ?? '').slice(5)));
+      const standing = laterPayments.filter((p) => !voidedIds.has(p.id));
+      if (standing.length > 0) {
+        throw new BadRequestException(
+          'Only the latest settlement can be voided — void the later payment(s) first',
+        );
+      }
     }
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
@@ -273,18 +325,29 @@ export class PlansService {
             recordedById: actorId ?? null,
           },
         });
-        // Roll the paid flag back only when this payment is still the
-        // latest settlement (paidUntil within this period); otherwise a
-        // later settlement still governs and the flag stays.
+        // Roll the paid flag back when this payment is still the
+        // latest settlement (paidUntil within this period), and rewind
+        // a freeUntilOverride stacked past this period's start — the
+        // extension was stacked onto the coverage being voided, so it
+        // collapses to the same point. An override at or before the
+        // period start predates the voided coverage and is left alone.
+        const venueData: Prisma.VenueUpdateInput = {};
         if (
           venue.billingPaidUntil &&
           payment.periodEnd &&
           venue.billingPaidUntil <= payment.periodEnd
         ) {
-          await tx.venue.update({
-            where: { id: venueId },
-            data: { billingPaidUntil: payment.periodStart },
-          });
+          venueData.billingPaidUntil = payment.periodStart;
+        }
+        if (
+          venue.freeUntilOverride &&
+          payment.periodStart &&
+          venue.freeUntilOverride > payment.periodStart
+        ) {
+          venueData.freeUntilOverride = payment.periodStart;
+        }
+        if (Object.keys(venueData).length > 0) {
+          await tx.venue.update({ where: { id: venueId }, data: venueData });
         }
         return { voided: true, paymentId, amount: payment.amount };
       });
@@ -463,9 +526,32 @@ export class PlansService {
     // was already marked paid). The panel modal already promises full
     // settlement, so a mismatched amount is a caller error, not a
     // partial payment.
-    if (amount !== undefined && amount !== ctx.price) {
+    //
+    // Re-mark after a void (Round 4, R-S16): a period settled, voided,
+    // and settled again must settle at its ORIGINAL amount, not the
+    // current plan price — the plan may have repriced since the void,
+    // and charging the new price would rewrite the period's ledger
+    // history. The latest void reversal for this exact period points
+    // at the original payment via its note.
+    let expectedPrice = ctx.price;
+    const voided = await this.prisma.venuePayment.findFirst({
+      where: {
+        venueId,
+        method: 'void',
+        periodStart: ctx.periodStart,
+        periodEnd: ctx.periodEnd,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (voided?.note?.startsWith('void:')) {
+      const original = await this.prisma.venuePayment.findUnique({
+        where: { id: voided.note.slice(5) },
+      });
+      if (original) expectedPrice = Number(original.amount);
+    }
+    if (amount !== undefined && amount !== expectedPrice) {
       throw new BadRequestException(
-        `Payment amount must equal the period price (Rs ${ctx.price.toLocaleString('en-PK')}) — partial payments are not accepted`,
+        `Payment amount must equal the period price (Rs ${expectedPrice.toLocaleString('en-PK')}) — partial payments are not accepted`,
       );
     }
     const paidUntil =
@@ -497,13 +583,14 @@ export class PlansService {
       });
       // Every settlement lands in the payments ledger, so platform revenue
       // is a sum of records — never a guess from flags. The amount is
-      // always the period price (validated above): a settlement covers
-      // exactly one whole period, never part of one.
+      // always the period price (validated above), or the voided
+      // original's amount on a re-mark after a void (R-S16): a
+      // settlement covers exactly one whole period, never part of one.
       await tx.venuePayment.create({
         data: {
           venueId,
           planId: ctx.plan.id,
-          amount: amount ?? ctx.price,
+          amount: amount ?? expectedPrice,
           method: opts?.method ?? null,
           note: opts?.note ?? null,
           periodStart: ctx.periodStart,
@@ -709,10 +796,30 @@ export class PlansService {
         if (!ctx || ctx.price !== 0) break;
         if (ctx.periodStart > new Date()) break;
         if (ctx.paidUntil && ctx.paidUntil >= ctx.periodEnd) break;
-        settledVenue = await this.prisma.venue.update({
-          where: { id: venue.id },
-          data: { billingPaidUntil: ctx.periodEnd, billingPaused: false },
-          include: { plan: true, owner: { select: { id: true, name: true } } },
+        settledVenue = await this.prisma.$transaction(async (tx) => {
+          const updated = await tx.venue.update({
+            where: { id: venue.id },
+            data: { billingPaidUntil: ctx.periodEnd, billingPaused: false },
+            include: { plan: true, owner: { select: { id: true, name: true } } },
+          });
+          // The settlement lands in the ledger like every other one
+          // (Round 4, R-S17): the old flag-only settle left the
+          // ledger, the payment history, and void all disagreeing
+          // about which periods were settled. A Rs 0 row with method
+          // 'auto' makes all three see the same settlements.
+          await tx.venuePayment.create({
+            data: {
+              venueId: venue.id,
+              planId: ctx.plan.id,
+              amount: 0,
+              method: 'auto',
+              note: null,
+              periodStart: ctx.periodStart,
+              periodEnd: ctx.periodEnd,
+              recordedById: null,
+            },
+          });
+          return updated;
         });
         autoSettled = true;
         await this.prisma.auditLog

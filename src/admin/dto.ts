@@ -233,6 +233,13 @@ export class AdminUpdateCourtDto {
   @ApiPropertyOptional() @IsOptional() @IsInt() closeMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsInt() @Min(15) slotMinutes?: number;
   @ApiPropertyOptional() @IsOptional() @IsBoolean() isActive?: boolean;
+  @ApiPropertyOptional({
+    description:
+      'Set true to save even when existing bookings fall off the new slot grid (they are kept).',
+  })
+  @IsOptional()
+  @IsBoolean()
+  acknowledgeConflicts?: boolean;
 }
 
 

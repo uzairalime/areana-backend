@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser, Public, RequirePerm } from '../common/auth';
 import { BookingsService } from './bookings.service';
@@ -68,6 +68,13 @@ export class BookingsController {
     return this.bookings.requestReschedule(user.id, id, dto.date, dto.startMinutes);
   }
 
+  @ApiBearerAuth()
+  @RequirePerm('bookings.read')
+  @Post(':id/reschedule/withdraw')
+  withdrawReschedule(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.bookings.withdrawReschedule(user.id, id);
+  }
+
   // --- promo preview (before booking) ---
   @ApiBearerAuth()
   @RequirePerm('bookings.create')
@@ -86,15 +93,28 @@ export class BookingsController {
     @Query('startMinutes') startMinutesRaw?: string,
   ) {
     const court = await this.courts.getActiveCourt(courtId);
-    const n = Math.max(1, parseInt(slotCount ?? '1', 10));
+    // Garbage slot inputs must not reach the pricing loop (Round 4
+    // trivial): parseInt('abc') is NaN, and Math.max(1, NaN) is NaN,
+    // so a garbage slotCount used to price the preview at NaN; an
+    // absurd count looped millions of times. A booking fits one day:
+    // at the 15-minute minimum slot length a 20-hour court holds at
+    // most 80 slots.
+    const parsedCount = slotCount === undefined ? 1 : Number(slotCount);
+    if (!Number.isInteger(parsedCount) || parsedCount < 1 || parsedCount > 80) {
+      throw new BadRequestException('slotCount must be a whole number between 1 and 80');
+    }
+    const n = parsedCount;
     let amount: number;
     if (dateStr && startMinutesRaw !== undefined) {
-      // Window-rate preview: the old base-rate-only amount priced peak
-      // slots wrong (off by Rs 500 in the reported example) — the
-      // preview must match booking creation's per-slot engine,
-      // including the morning's weekday windows for overnight slots.
+      const parsedStart = Number(startMinutesRaw);
+      if (!Number.isInteger(parsedStart) || parsedStart < 0 || parsedStart >= 1800) {
+        throw new BadRequestException('startMinutes must be a whole number between 0 and 1799');
+      }
+      const start = parsedStart;
+      // Window-rate preview: the preview must match booking
+      // creation's per-slot engine, including the morning's weekday
+      // windows for overnight slots.
       const date = parseDateOnly(dateStr);
-      const start = parseInt(startMinutesRaw, 10);
       const windows = await this.courts.priceWindowsForDateRange(court.id, date);
       const baseRate = Number(court.pricePerHour);
       amount = 0;

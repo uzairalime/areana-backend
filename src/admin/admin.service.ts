@@ -30,6 +30,7 @@ import { AmenitiesService } from '../amenities/amenities.service';
 import { CreateRoleDto, CreateUserDto, UpdateRoleDto } from './dto';
 import type { UpdatePromoDto } from './dto';
 import { CreateBadgeDto, UpdateBadgeDto } from '../badges/dto';
+import { CourtsService, toYmd } from '../courts/courts.service';
 import { SportsService } from '../sports/sports.service';
 
 @Injectable()
@@ -38,6 +39,7 @@ export class AdminService {
     private prisma: PrismaService,
     private badges: BadgesService,
     private bookings: BookingsService,
+    private courtsSvc: CourtsService,
     private disputes: DisputesService,
     private suggestions: SuggestionsService,
     private notifications: NotificationsService,
@@ -824,16 +826,27 @@ export class AdminService {
   }
 
   async createRole(actorId: string, dto: CreateRoleDto) {
-    const exists = await this.prisma.role.findFirst({ where: { name: dto.name, ownerId: null } });
+    // Stored names are trimmed (Round 4, R-T4): a whitespace-only
+    // name must not store.
+    const name = dto.name.trim();
+    if (!name) throw new BadRequestException('Role name is required');
+    // Case-insensitive pre-check (Round 4, R-S10): the old exact
+    // match let "Manager" and "manager" both exist as system roles,
+    // confusing name-based lookups — the owner-side guard already
+    // checks this way, and the lower(name) partial unique index is
+    // the backstop.
+    const exists = await this.prisma.role.findFirst({
+      where: { name: { equals: name, mode: 'insensitive' }, ownerId: null },
+    });
     if (exists) throw new ConflictException('Role name taken');
     // The pre-check races a second admin creating the same system
     // role: NULL ownerId defeats @@unique([ownerId, name]) (Postgres
-    // treats NULLs as distinct), so the partial unique index on name
-    // WHERE ownerId IS NULL is the backstop — map its P2002 to the
-    // same clean 409 instead of a raw Prisma error.
+    // treats NULLs as distinct), so the partial unique index on
+    // lower(name) WHERE ownerId IS NULL is the backstop — map its
+    // P2002 to the same clean 409 instead of a raw Prisma error.
     let role;
     try {
-      role = await this.prisma.role.create({ data: { ...dto, scope: dto.scope as any } });
+      role = await this.prisma.role.create({ data: { ...dto, name, scope: dto.scope as any } });
     } catch (e: unknown) {
       if ((e as { code?: string })?.code === 'P2002') {
         throw new ConflictException('Role name taken');
@@ -1279,23 +1292,46 @@ export class AdminService {
       }
       const courts = [];
       for (const c of dto.courts ?? []) {
-        courts.push(
-          await tx.court.create({
-            data: {
-              status: 'approved',
-              venueId: venue.id,
-              name: c.name,
-              sport: courtSportByRaw.get(c.sport) ?? c.sport,
-              size: c.size,
-              surface: c.surface,
-              indoor: c.indoor ?? false,
-              pricePerHour: c.pricePerHour,
-              openMinutes: c.openMinutes ?? 360,
-              closeMinutes: c.closeMinutes ?? 1380,
-              slotMinutes: c.slotMinutes ?? 60,
-            },
-          }),
-        );
+        // Per-court name check INSIDE the transaction (Round 4,
+        // R-S11): the pre-transaction DTO dedupe catches most
+        // collisions, but the tx-scoped check + the P2002 mapping
+        // below are the backstops, matching the createCourt paths.
+        // Stored names are trimmed — the pre-check compares trimmed,
+        // so the stored value must match what was compared.
+        const courtName = c.name.trim();
+        const clash = await tx.court.findMany({
+          where: { venueId: venue.id },
+          select: { name: true },
+        });
+        if (clash.some((s) => s.name.trim().toLowerCase() === courtName.toLowerCase())) {
+          throw new ConflictException(
+            `A court named "${courtName}" already exists at this arena`,
+          );
+        }
+        try {
+          courts.push(
+            await tx.court.create({
+              data: {
+                status: 'approved',
+                venueId: venue.id,
+                name: courtName,
+                sport: courtSportByRaw.get(c.sport) ?? c.sport,
+                size: c.size,
+                surface: c.surface,
+                indoor: c.indoor ?? false,
+                pricePerHour: c.pricePerHour,
+                openMinutes: c.openMinutes ?? 360,
+                closeMinutes: c.closeMinutes ?? 1380,
+                slotMinutes: c.slotMinutes ?? 60,
+              },
+            }),
+          );
+        } catch (e) {
+          if ((e as { code?: string })?.code === 'P2002') {
+            throw new ConflictException('A court with this name already exists at this arena');
+          }
+          throw e;
+        }
       }
       return { user, venue, courts };
     });
@@ -1909,11 +1945,18 @@ export class AdminService {
     if (venueReadiness(venue, courts).ready) {
       return { venue, dropped: false };
     }
-    const dropped = await this.prisma.venue.update({
-      where: { id: venueId },
+    // The drop itself re-checks approved (Round 4, R-T3): a status
+    // change between the read above and this write must not drop a
+    // venue that is no longer approved (e.g. just suspended).
+    const dropped = await this.prisma.venue.updateMany({
+      where: { id: venueId, status: VenueStatus.approved },
       data: { status: VenueStatus.pending },
     });
-    return { venue: dropped, dropped: true };
+    if (dropped.count === 0) {
+      return { venue, dropped: false };
+    }
+    const droppedVenue = await this.prisma.venue.findUnique({ where: { id: venueId } });
+    return { venue: droppedVenue ?? venue, dropped: true };
   }
 
   /**
@@ -2266,11 +2309,14 @@ export class AdminService {
   /**
    * Recompute (not union) venue sports from the courts still active —
    * the delete/deactivate counterpart of syncVenueSports. The union
-   * would leave a deleted court's sport listed forever.
+   * would leave a deleted court's sport listed forever. Approved
+   * active courts only (Round 4, R-S18): the readiness count counts
+   * approved + active, so a pending court must not keep its sport
+   * listed either.
    */
   private async recomputeVenueSports(venueId: string) {
     const courts = await this.prisma.court.findMany({
-      where: { venueId, isActive: true },
+      where: { venueId, isActive: true, status: 'approved' },
       select: { sport: true },
     });
     const sports = [...new Set(courts.map((c) => c.sport))];
@@ -2313,7 +2359,11 @@ export class AdminService {
         'Courts cannot be added while the arena is archived, suspended, or rejected',
       );
     }
-    await this.assertCourtNameFree(venueId, dto.name);
+    // Stored names are trimmed (Round 4, R-T5): a whitespace-only
+    // name must not store.
+    const courtName = dto.name.trim();
+    if (!courtName) throw new BadRequestException('Court name is required');
+    await this.assertCourtNameFree(venueId, courtName);
     const open0 = dto.openMinutes ?? 360;
     const close0 = dto.closeMinutes ?? 1380;
     if (close0 - open0 < 60 || close0 - open0 > 1200) {
@@ -2342,7 +2392,7 @@ export class AdminService {
       return tx.court.create({
         data: {
           venueId,
-          name: dto.name,
+          name: courtName,
           sport,
           size: dto.size,
           surface: dto.surface,
@@ -2390,6 +2440,7 @@ export class AdminService {
       closeMinutes?: number;
       slotMinutes?: number;
       isActive?: boolean;
+      acknowledgeConflicts?: boolean;
     },
   ) {
     if (dto.slotMinutes !== undefined && dto.slotMinutes < 15) {
@@ -2400,8 +2451,17 @@ export class AdminService {
       include: { venue: { select: { name: true, ownerId: true } } },
     });
     if (!court) throw new NotFoundException('Court not found');
-    if (dto.name !== undefined && dto.name !== court.name) {
-      await this.assertCourtNameFree(court.venueId, dto.name, courtId);
+    // acknowledgeConflicts is a flow flag, not a court column — it
+    // must never reach the Prisma update (unknown-field throw).
+    const { acknowledgeConflicts, ...rest } = dto;
+    // Stored names are trimmed (Round 4, R-T5): a whitespace-only
+    // name must not store.
+    const name = rest.name !== undefined ? rest.name.trim() : undefined;
+    if (rest.name !== undefined && !name) {
+      throw new BadRequestException('Court name is required');
+    }
+    if (name !== undefined && name !== court.name) {
+      await this.assertCourtNameFree(court.venueId, name, courtId);
     }
     // Deactivation refuses upcoming bookings, like archiveVenue and
     // the owner path: switching a court off with games still booked
@@ -2420,7 +2480,10 @@ export class AdminService {
         );
       }
     }
-    const data: Prisma.CourtUpdateInput = { ...dto };
+    const data: Prisma.CourtUpdateInput = {
+      ...rest,
+      ...(name !== undefined ? { name } : {}),
+    };
     if (dto.sport !== undefined)
       data.sport = await this.sports.normalizeSport(dto.sport, court.sport);
     const newOpen = dto.openMinutes ?? court.openMinutes;
@@ -2428,7 +2491,12 @@ export class AdminService {
     if (newClose - newOpen < 60 || newClose - newOpen > 1200) {
       throw new BadRequestException('Court hours must span between 1 and 20 hours');
     }
-    if (dto.openMinutes !== undefined || dto.closeMinutes !== undefined) {
+    // The span check applies only when the hours actually change
+    // (Round 4, L-S11): re-saving a court whose bookings predate a
+    // template (or an earlier hours change) used to refuse the save
+    // even though nothing about the hours moved — grandfathered
+    // courts stay editable until their hours are touched.
+    if (newOpen !== court.openMinutes || newClose !== court.closeMinutes) {
       // Shrinking hours must not strand confirmed upcoming bookings.
       const stranded = await this.prisma.booking.count({
         where: {
@@ -2442,6 +2510,29 @@ export class AdminService {
         throw new ConflictException(
           `${stranded} upcoming booking(s) fall outside the new hours — move or cancel them first`,
         );
+      }
+    }
+    // Slot-length grid check (Round 4, O-S5, same shape as the owner
+    // path): bookings falling off the new grid are listed and the
+    // save is held until acknowledged.
+    if (dto.slotMinutes !== undefined && dto.slotMinutes !== court.slotMinutes) {
+      const misaligned = await this.courtsSvc.findMisalignedBookings(
+        courtId,
+        dto.slotMinutes,
+        { openMinutes: newOpen, closeMinutes: newClose },
+      );
+      if (misaligned.length > 0 && !acknowledgeConflicts) {
+        return {
+          saved: false,
+          conflicts: misaligned.map((b) => ({
+            bookingId: b.id,
+            date: toYmd(b.date),
+            startMinutes: b.startMinutes,
+            endMinutes: b.endMinutes,
+            status: b.status,
+            player: b.user?.name ?? (b.guestName ? `${b.guestName} (walk-in)` : 'Guest'),
+          })),
+        };
       }
     }
     // An approved court whose price, sport, hours, or slot length
@@ -2463,25 +2554,35 @@ export class AdminService {
     // the owner path: a booking created between the pre-check above
     // and this write would otherwise be stranded on a switched-off
     // court. Non-deactivation edits keep the plain update.
-    const updated =
-      dto.isActive === false && court.isActive
-        ? await this.prisma.$transaction(async (tx) => {
-            await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${courtId} FOR UPDATE`;
-            const upcoming = await tx.booking.count({
-              where: {
-                courtId,
-                date: { gte: startOfToday() },
-                status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
-              },
-            });
-            if (upcoming > 0) {
-              throw new ConflictException(
-                `${upcoming} upcoming booking(s) still sit on this court — move or cancel them first`,
-              );
-            }
-            return tx.court.update({ where: { id: courtId }, data });
-          })
-        : await this.prisma.court.update({ where: { id: courtId }, data });
+    // Both writes map a raced P2002 to the same clean 409 as create
+    // (Round 4, R-S9).
+    let updated;
+    try {
+      updated =
+        dto.isActive === false && court.isActive
+          ? await this.prisma.$transaction(async (tx) => {
+              await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${courtId} FOR UPDATE`;
+              const upcoming = await tx.booking.count({
+                where: {
+                  courtId,
+                  date: { gte: startOfToday() },
+                  status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+                },
+              });
+              if (upcoming > 0) {
+                throw new ConflictException(
+                  `${upcoming} upcoming booking(s) still sit on this court — move or cancel them first`,
+                );
+              }
+              return tx.court.update({ where: { id: courtId }, data });
+            })
+          : await this.prisma.court.update({ where: { id: courtId }, data });
+    } catch (e) {
+      if ((e as { code?: string })?.code === 'P2002') {
+        throw new ConflictException('A court with this name already exists at this arena');
+      }
+      throw e;
+    }
     await this.syncVenueSports(court.venueId);
     await this.audit(
       actorId,
@@ -2503,8 +2604,22 @@ export class AdminService {
       // Same zombie rule as court delete: deactivating the last active
       // court drops sports with no court left and drops an approved
       // venue that no longer meets the checklist back to pending.
+      // A drop carries the same audit + owner notice as the
+      // updateVenue drop path (Round 4, R-S19) and surfaces
+      // backToPending in the response.
       await this.recomputeVenueSports(court.venueId);
-      await this.dropVenueIfUnready(court.venueId);
+      const { dropped } = await this.dropVenueIfUnready(court.venueId);
+      if (dropped) {
+        await this.audit(actorId, 'venue.readiness_drop', 'venue', court.venueId, 'approved → pending: go-live checklist no longer met after court deactivation');
+        await this.notifications
+          .pushToUser(court.venue.ownerId, {
+            title: 'Arena back in review',
+            body: `"${court.venue.name}" no longer meets the go-live checklist, so it is back in review until the gaps are fixed.`,
+            data: { type: 'venue_edited', venueId: court.venueId },
+          })
+          .catch(() => {});
+      }
+      return { ...updated, backToPending: dropped };
     }
     return updated;
   }
@@ -2632,9 +2747,11 @@ export class AdminService {
     // Deleting the last court must not leave a billing-accruing,
     // admin-visible, player-invisible zombie: drop sports with no
     // court left, and drop an approved venue that no longer meets the
-    // go-live checklist back to pending.
+    // go-live checklist back to pending. A drop carries the same
+    // audit + owner notice as the updateVenue drop path (Round 4,
+    // R-S19) and surfaces backToPending in the response.
     await this.recomputeVenueSports(court.venueId);
-    await this.dropVenueIfUnready(court.venueId);
+    const { dropped } = await this.dropVenueIfUnready(court.venueId);
     await this.audit(actorId, 'court.delete', 'court', courtId, court.name);
     await this.notifications
       .pushToUser(court.venue.ownerId, {
@@ -2643,7 +2760,17 @@ export class AdminService {
         data: { type: 'court_deleted', venueId: court.venueId },
       })
       .catch(() => {});
-    return { deleted: true };
+    if (dropped) {
+      await this.audit(actorId, 'venue.readiness_drop', 'venue', court.venueId, 'approved → pending: go-live checklist no longer met after court delete');
+      await this.notifications
+        .pushToUser(court.venue.ownerId, {
+          title: 'Arena back in review',
+          body: `"${court.venue.name}" no longer meets the go-live checklist, so it is back in review until the gaps are fixed.`,
+          data: { type: 'venue_edited', venueId: court.venueId },
+        })
+        .catch(() => {});
+    }
+    return { deleted: true, backToPending: dropped };
   }
 
   async addCourtImage(courtId: string, file: Express.Multer.File) {
@@ -3676,10 +3803,19 @@ export class AdminService {
     // The audit row is written inside the dispute transaction itself;
     // notifications below are best-effort and run after it commits.
     const d = await this.disputes.resolveDispute(id, action, resolution ?? '', actorId);
-    const booking = await this.prisma.booking.findUnique({
-      where: { id: d.bookingId },
-      select: { venue: { select: { id: true, name: true, ownerId: true } } },
-    });
+    // A null-booking dispute (Round 4, L-S10) has no venue to notify:
+    // the old unconditional findUnique({ id: null }) threw a Prisma
+    // validation error AFTER the resolution committed, turning a
+    // successful dismiss into a 500. Dismiss is the operator path for
+    // null-booking queue items — confirm_no_show already refuses them
+    // inside resolveDispute — so a null bookingId simply skips the
+    // venue lookup and the owner notice.
+    const booking = d.bookingId
+      ? await this.prisma.booking.findUnique({
+          where: { id: d.bookingId },
+          select: { venue: { select: { id: true, name: true, ownerId: true } } },
+        })
+      : null;
     const note = d.resolution ? ` Resolution: ${d.resolution}` : '';
     await this.notifications
       .pushToUser(d.raisedById, {

@@ -143,6 +143,29 @@ export class NotificationsService {
     );
   }
 
+  /** Auto-accept venues: the booking is already confirmed, so the owner
+   * email must not read like an approval request (Round 4: confirmed
+   * bookings used to notify nobody, because the create path only
+   * emailed for pending requests). */
+  async notifyOwnerConfirmedBooking(ownerEmail: string, venueName: string, summary: string) {
+    await this.mail.sendMail(
+      ownerEmail,
+      `New booking confirmed — ${venueName}`,
+      `A booking at your arena was confirmed automatically (auto-accept):\n\n${summary}\n\nOpen your Areana panel to view it.`,
+    );
+  }
+
+  /** Player-cancelled bookings: the owner is told, mirroring the
+   * owner-cancel path that tells the player (Round 4: player cancels
+   * used to notify nobody). */
+  async notifyOwnerCancelledBooking(ownerEmail: string, venueName: string, summary: string) {
+    await this.mail.sendMail(
+      ownerEmail,
+      `Booking cancelled — ${venueName}`,
+      `A player cancelled their booking:\n\n${summary}\n\nOpen your Areana panel to view your bookings.`,
+    );
+  }
+
   async notifyPlayerDecision(userId: string, accepted: boolean, venueName: string, when: string, reason?: string) {
     const title = accepted ? 'Booking confirmed' : 'Booking not approved';
     const body = accepted

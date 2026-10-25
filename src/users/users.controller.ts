@@ -42,9 +42,38 @@ export class UsersController {
 
   @Patch('me')
   async updateMe(@CurrentUser() user: AuthUser, @Body() dto: UpdateMeDto) {
+    // Blank/unformatted values must not store (Round 4 trivial):
+    // whitespace-only names/cities/phones used to overwrite real
+    // profile data with ' '. Values are trimmed; a provided field
+    // that trims to empty is rejected, and a phone with no digits is
+    // rejected (digits, spaces, +, - and parentheses only).
+    const data: { name?: string; phone?: string; city?: string } = {};
+    if (dto.name !== undefined) {
+      const name = dto.name.trim();
+      if (!name) throw new BadRequestException('Name cannot be blank');
+      data.name = name;
+    }
+    if (dto.phone !== undefined) {
+      const phone = dto.phone.trim();
+      if (!phone || !/^\+?[0-9\s\-()]+$/.test(phone) || !/\d/.test(phone)) {
+        throw new BadRequestException('Phone number is not valid');
+      }
+      data.phone = phone;
+    }
+    if (dto.city !== undefined) {
+      const city = dto.city.trim();
+      if (!city) throw new BadRequestException('City cannot be blank');
+      data.city = city;
+    }
+    if (Object.keys(data).length === 0) {
+      const { passwordHash: _p, ...current } = await this.prisma.user.findUniqueOrThrow({
+        where: { id: user.id },
+      });
+      return current;
+    }
     const { passwordHash: _passwordHash, ...me } = await this.prisma.user.update({
       where: { id: user.id },
-      data: dto,
+      data,
     });
     return me;
   }
@@ -54,6 +83,10 @@ export class UsersController {
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(FileInterceptor('image'))
   async uploadAvatar(@CurrentUser() user: AuthUser, @UploadedFile() file: Express.Multer.File) {
+    // No file used to 500 inside image processing (Round 4 trivial).
+    if (!file) {
+      throw new BadRequestException('No image file uploaded');
+    }
     const saved = await this.storage.saveAvatarImage(user.id, file);
     const updated = await this.prisma.user.update({
       where: { id: user.id },

@@ -168,6 +168,14 @@ export class VenuesService {
   // Public listing — only approved venues are visible to players.
   async list(query: QueryVenuesDto) {
     const { q, city, sport, surface, sort, page = 1, limit = 20 } = query;
+    // An unknown sort must not silently become rating (Round 4
+    // trivial): the DTO documents the four values, and this guard
+    // holds even for callers that bypass DTO validation.
+    if (sort !== undefined && !['rating', 'price_asc', 'price_desc', 'name'].includes(sort)) {
+      throw new BadRequestException(
+        `Unknown sort: ${sort} — expected rating, price_asc, price_desc, or name`,
+      );
+    }
     // A suspended owner's venues are paused: hidden from players and
     // unbookable until the owner is reactivated (no state to unwind —
     // the owner's status is the single switch).

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { StorageModule } from '../storage/storage.module';
 import { BadgesModule } from '../badges/badges.module';
+import { CourtsModule } from '../courts/courts.module';
 import { DisputesModule } from '../disputes/disputes.module';
 import { SuggestionsModule } from '../suggestions/suggestions.module';
 import { AdminController } from './admin.controller';
@@ -12,7 +13,7 @@ import { AmenitiesModule } from '../amenities/amenities.module';
 import { AnalyticsService } from './analytics.service';
 
 @Module({
-  imports: [BadgesModule, BookingsModule, DisputesModule, SuggestionsModule, StorageModule, PlansModule, SportsModule, AmenitiesModule],
+  imports: [BadgesModule, BookingsModule, CourtsModule, DisputesModule, SuggestionsModule, StorageModule, PlansModule, SportsModule, AmenitiesModule],
   controllers: [AdminController],
   providers: [AdminService, AnalyticsService],
 })

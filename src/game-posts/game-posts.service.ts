@@ -438,6 +438,17 @@ export class GamePostsService {
     if (post.creatorId !== userId) {
       throw new ForbiddenException('Only the host can edit this game');
     }
+    // A closed or already-played game must not be edited (Round 4
+    // trivial): the old code edited the numbers on closed posts
+    // (just without recomputing the status), so a finished game
+    // could be quietly rewritten after the fact.
+    const now = new Date();
+    const played =
+      post.date < startOfToday() ||
+      (isSameDay(post.date, now) && post.startMinutes <= minutesSinceMidnight(now));
+    if (post.status === 'closed' || played) {
+      throw new BadRequestException('This game is closed and can no longer be edited');
+    }
     const joined = post._count.participants;
     if (dto.playersNeeded !== undefined && dto.playersNeeded < joined) {
       throw new BadRequestException(
@@ -471,11 +482,19 @@ export class GamePostsService {
       const post = await tx.gamePost.findUnique({
         where: { id: postId },
         include: {
-          booking: { select: { totalPrice: true, discountAmount: true } },
+          booking: { select: { totalPrice: true, discountAmount: true, status: true } },
           _count: { select: { participants: { where: { status: 'joined' } } } },
         },
       });
       if (!post) throw new NotFoundException('Game not found');
+      // A game whose booking was cancelled is an orphan post (Round
+      // 4, L-S9): the host's cancel deletes the post, but a post
+      // that survived (or was created on a booking cancelled since)
+      // must refuse new joiners instead of filling a dead game. The
+      // backfill closing orphan posts is a later data round.
+      if (post.booking && post.booking.status === 'cancelled') {
+        throw new BadRequestException('This game is no longer available');
+      }
       if (post.creatorId === user.id) {
         throw new BadRequestException("You created this game — you're already hosting it");
       }

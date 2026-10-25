@@ -1,0 +1,13 @@
+-- Round 4, Round 2 (waitlist slot size at wait time): SlotWaitlist
+-- records the court's slotMinutes when the entry is created, so
+-- waitlist pings use the waited slot size even if the owner later
+-- changes the court's slot length. NULL for pre-existing entries —
+-- those fall back to the court's current slotMinutes at ping time.
+--
+-- R-S12 dedupe pre-checks (for the sibling Round 2 indexes; this
+-- migration itself adds no unique index):
+--   Duplicate system role names (case-insensitive):
+--   SELECT lower("name"), COUNT(*) FROM "Role" WHERE "ownerId" IS NULL GROUP BY lower("name") HAVING COUNT(*) > 1;
+--   Duplicate court names within one venue (case-insensitive):
+--   SELECT "venueId", lower("name"), COUNT(*) FROM "Court" GROUP BY 1, 2 HAVING COUNT(*) > 1;
+ALTER TABLE "SlotWaitlist" ADD COLUMN IF NOT EXISTS "slotMinutes" INTEGER;

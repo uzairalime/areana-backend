@@ -386,11 +386,14 @@ export class OwnerService {
       where: { venueId, isActive: true, status: 'approved' },
     });
     if (venueReadiness(venue, courts).ready) return false;
-    await this.prisma.venue.update({
-      where: { id: venueId },
+    // The drop itself re-checks approved (Round 4, R-T3): a status
+    // change between the read above and this write must not drop a
+    // venue that is no longer approved (e.g. just suspended).
+    const dropped = await this.prisma.venue.updateMany({
+      where: { id: venueId, status: VenueStatus.approved },
       data: { status: VenueStatus.pending },
     });
-    return true;
+    return dropped.count > 0;
   }
 
   async submitVenue(user: AuthUser, venueId: string) {
@@ -710,11 +713,12 @@ export class OwnerService {
    * a deleted court's sport listed forever, so players filter by it,
    * find the venue, and find no such court. Admin-set sports with no
    * court are dropped here too — a listed sport with no court to play
-   * it on is a dead filter either way.
+   * it on is a dead filter either way. Approved active courts only
+   * (Round 4, R-S18), matching the readiness count.
    */
   private async recomputeVenueSports(venueId: string) {
     const courts = await this.prisma.court.findMany({
-      where: { venueId, isActive: true },
+      where: { venueId, isActive: true, status: 'approved' },
       select: { sport: true },
     });
     const sports = [...new Set(courts.map((c) => c.sport))];
@@ -736,8 +740,13 @@ export class OwnerService {
         'Courts cannot be added while the arena is archived, suspended, or rejected',
       );
     }
-    await this.assertCourtNameFree(venueId, dto.name);
-    const data = { ...dto, sport: await this.sports.normalizeSport(dto.sport) };
+    // Stored names are trimmed (Round 4, R-T5): a whitespace-only
+    // name must not store, and a padded name must not dodge the
+    // uniqueness check.
+    const courtName = dto.name.trim();
+    if (!courtName) throw new BadRequestException('Court name is required');
+    await this.assertCourtNameFree(venueId, courtName);
+    const data = { ...dto, name: courtName, sport: await this.sports.normalizeSport(dto.sport) };
     if (data.openMinutes != null && data.closeMinutes != null) {
       data.closeMinutes = this.normalizeCourtHours(data.openMinutes, data.closeMinutes);
     }
@@ -784,8 +793,18 @@ export class OwnerService {
     const court = await this.prisma.court.findUnique({ where: { id: courtId } });
     if (!court) throw new NotFoundException('Court not found');
     await this.assertVenue(user, court.venueId);
-    if (dto.name !== undefined && dto.name !== court.name) {
-      await this.assertCourtNameFree(court.venueId, dto.name, courtId);
+    // acknowledgeConflicts is a flow flag, not a court column — it
+    // must never reach the Prisma update (unknown-field throw).
+    const { acknowledgeConflicts, ...rest } = dto;
+    // Stored names are trimmed (Round 4, R-T5): a whitespace-only
+    // name must not store, and a padded name must not dodge the
+    // uniqueness check.
+    const name = rest.name !== undefined ? rest.name.trim() : undefined;
+    if (rest.name !== undefined && !name) {
+      throw new BadRequestException('Court name is required');
+    }
+    if (name !== undefined && name !== court.name) {
+      await this.assertCourtNameFree(court.venueId, name, courtId);
     }
     // Deactivation refuses upcoming bookings, like archiveVenue:
     // switching a court off with games still booked would strand
@@ -805,30 +824,74 @@ export class OwnerService {
         );
       }
     }
-    const data = { ...dto };
+    const data: Prisma.CourtUpdateInput = {
+      ...rest,
+      ...(name !== undefined ? { name } : {}),
+    };
+    // Effective headline hours after this save (normalized, so an
+    // overnight close stays comparable to the stored value).
+    let newOpen = court.openMinutes;
+    let newClose = court.closeMinutes;
     if (data.openMinutes != null || data.closeMinutes != null) {
-      data.closeMinutes = this.normalizeCourtHours(
-        data.openMinutes ?? court.openMinutes,
-        data.closeMinutes ?? court.closeMinutes,
+      newOpen = (data.openMinutes as number | undefined) ?? court.openMinutes;
+      newClose = this.normalizeCourtHours(
+        newOpen,
+        (data.closeMinutes as number | undefined) ?? court.closeMinutes,
       );
-      // Same guard the admin path has: shrinking hours must not strand
-      // confirmed upcoming bookings outside the court's day.
-      const newOpen = data.openMinutes ?? court.openMinutes;
-      const stranded = await this.prisma.booking.count({
+      data.closeMinutes = newClose;
+    }
+    // Shrink guard (Round 4, O-S4): pending AND confirmed upcoming
+    // bookings (the old guard counted confirmed only, so a pending
+    // booking could be stranded), measured against the EFFECTIVE
+    // windows for each booking's date — template if present, headline
+    // otherwise — not the headline alone. A save that does not
+    // actually change the hours never fires (grandfathered courts
+    // whose bookings predate a template stay editable).
+    if (newOpen !== court.openMinutes || newClose !== court.closeMinutes) {
+      const upcoming = await this.prisma.booking.findMany({
         where: {
           courtId,
-          status: 'confirmed',
           date: { gte: startOfToday() },
-          OR: [
-            { startMinutes: { lt: newOpen } },
-            { endMinutes: { gt: data.closeMinutes } },
-          ],
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
         },
+        select: { date: true, startMinutes: true, endMinutes: true },
       });
+      let stranded = 0;
+      for (const b of upcoming) {
+        const windows = await this.courtsSvc.windowsForDate(
+          { id: courtId, openMinutes: newOpen, closeMinutes: newClose },
+          b.date,
+        );
+        if (
+          !windows.some(
+            (w) => b.startMinutes >= w.startMinutes && b.endMinutes <= w.endMinutes,
+          )
+        ) {
+          stranded++;
+        }
+      }
       if (stranded > 0) {
         throw new ConflictException(
           `${stranded} upcoming booking(s) fall outside the new hours — move or cancel them first`,
         );
+      }
+    }
+    // Slot-length grid check (Round 4, O-S5): bookings whose start
+    // falls off the NEW grid are listed and the save is held until
+    // the owner acknowledges them — the same conflict-flow shape as
+    // weekly-hours. Misaligned bookings are kept as-is when
+    // acknowledged (grandfathered, like weekly-hours conflicts).
+    if (dto.slotMinutes !== undefined && dto.slotMinutes !== court.slotMinutes) {
+      const misaligned = await this.courtsSvc.findMisalignedBookings(
+        courtId,
+        dto.slotMinutes,
+        { openMinutes: newOpen, closeMinutes: newClose },
+      );
+      if (misaligned.length > 0 && !acknowledgeConflicts) {
+        return {
+          saved: false,
+          conflicts: misaligned.map((b) => this.conflictView(b)),
+        };
       }
     }
     // Editing a rejected court re-submits it for approval. An approved
@@ -850,41 +913,78 @@ export class OwnerService {
     // serializes against booking creation (which locks the same row),
     // so the recount sees any booking that landed after the pre-check.
     // Non-deactivation edits keep the plain update.
-    const updated =
-      dto.isActive === false && court.isActive
-        ? await this.prisma.$transaction(async (tx) => {
-            await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${courtId} FOR UPDATE`;
-            const upcoming = await tx.booking.count({
-              where: {
-                courtId,
-                date: { gte: startOfToday() },
-                status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
-              },
-            });
-            if (upcoming > 0) {
-              throw new ConflictException(
-                `${upcoming} upcoming booking(s) still sit on this court — move or cancel them first`,
-              );
-            }
-            return tx.court.update({
+    // Both writes map a raced P2002 to the same clean 409 as create
+    // (Round 4, R-S9): the case-insensitive pre-check can be raced
+    // by two simultaneous renames.
+    let updated;
+    try {
+      updated =
+        dto.isActive === false && court.isActive
+          ? await this.prisma.$transaction(async (tx) => {
+              await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${courtId} FOR UPDATE`;
+              const upcoming = await tx.booking.count({
+                where: {
+                  courtId,
+                  date: { gte: startOfToday() },
+                  status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+                },
+              });
+              if (upcoming > 0) {
+                throw new ConflictException(
+                  `${upcoming} upcoming booking(s) still sit on this court — move or cancel them first`,
+                );
+              }
+              return tx.court.update({
+                where: { id: courtId },
+                data: requeue ? { ...data, status: 'pending', rejectionReason: null } : data,
+              });
+            })
+          : await this.prisma.court.update({
               where: { id: courtId },
               data: requeue ? { ...data, status: 'pending', rejectionReason: null } : data,
             });
-          })
-        : await this.prisma.court.update({
-            where: { id: courtId },
-            data: requeue ? { ...data, status: 'pending', rejectionReason: null } : data,
-          });
+    } catch (e) {
+      if ((e as { code?: string })?.code === 'P2002') {
+        throw new ConflictException('A court with this name already exists at this arena');
+      }
+      throw e;
+    }
     if (dto.isActive === false && court.isActive) {
       // Deactivating the last active court must not leave a billing-
       // accruing, admin-visible, player-invisible zombie: drop sports
       // with no court left, and drop an approved venue that no longer
-      // meets the go-live checklist back to pending.
+      // meets the go-live checklist back to pending. A drop carries
+      // the same audit + owner notice as the updateVenue drop path
+      // (Round 4, R-S19) and surfaces backToPending in the response.
       await this.recomputeVenueSports(court.venueId);
-      await this.dropVenueIfUnready(court.venueId);
-    } else {
-      await this.syncVenueSports(court.venueId);
+      const dropped = await this.dropVenueIfUnready(court.venueId);
+      if (dropped) {
+        await this.prisma.auditLog.create({
+          data: {
+            actorId: user.id,
+            action: 'venue.readiness_drop',
+            entity: 'venue',
+            entityId: court.venueId,
+            details: 'approved → pending: go-live checklist no longer met after court deactivation',
+          },
+        });
+        const venue = await this.prisma.venue.findUnique({
+          where: { id: court.venueId },
+          select: { name: true, ownerId: true },
+        });
+        if (venue) {
+          await this.notifications
+            .pushToUser(venue.ownerId, {
+              title: 'Arena back in review',
+              body: `"${venue.name}" no longer meets the go-live checklist, so it is back in review until the gaps are fixed.`,
+              data: { type: 'venue_edited', venueId: court.venueId },
+            })
+            .catch(() => {});
+        }
+      }
+      return { ...updated, backToPending: dropped };
     }
+    await this.syncVenueSports(court.venueId);
     return updated;
   }
 
@@ -908,10 +1008,96 @@ export class OwnerService {
     if (dto.endMinutes <= dto.startMinutes) {
       throw new BadRequestException('endMinutes must be after startMinutes');
     }
+    // One-off blocks used to accept any range on any court (Round 4,
+    // O-S2): blocks outside court hours, on a switched-off court, or
+    // on top of existing bookings — which the recurring-block path
+    // reports as conflicts. Ranges are capped at the 06:00-next-day
+    // window end, like court windows themselves.
+    if (dto.startMinutes < 0 || dto.endMinutes > 1800) {
+      throw new BadRequestException('Block minutes must be within 0 – 1800');
+    }
+    if (!court.isActive) {
+      throw new BadRequestException('Court is not active');
+    }
+    const date = parseDateOnly(dto.date);
+    const windows = await this.courtsSvc.windowsForDate(court, date);
+    const overlapsHours = windows.some(
+      (w) => dto.startMinutes < w.endMinutes && dto.endMinutes > w.startMinutes,
+    );
+    if (!overlapsHours) {
+      throw new BadRequestException('Block is outside court hours for that day');
+    }
+    // Clashing bookings (this date + overnight spill both ways, like
+    // availability) and clashing blocks (one-off + recurring + spill)
+    // are rejected with their details, so the owner can move or
+    // cancel first instead of silently double-blocking a sold slot.
+    const prevDate = new Date(date);
+    prevDate.setDate(prevDate.getDate() - 1);
+    const nextDate = new Date(date);
+    nextDate.setDate(nextDate.getDate() + 1);
+    const [dayBookings, prevBookings, nextBookings, blocked] = await Promise.all([
+      this.prisma.booking.findMany({
+        where: {
+          courtId: dto.courtId,
+          date,
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        },
+        include: { user: { select: { name: true } } },
+      }),
+      this.prisma.booking.findMany({
+        where: {
+          courtId: dto.courtId,
+          date: prevDate,
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          endMinutes: { gt: 1440 },
+        },
+        include: { user: { select: { name: true } } },
+      }),
+      this.prisma.booking.findMany({
+        where: {
+          courtId: dto.courtId,
+          date: nextDate,
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          startMinutes: { lt: 360 },
+        },
+        include: { user: { select: { name: true } } },
+      }),
+      this.courtsSvc.blockedRangesForDate(dto.courtId, date),
+    ]);
+    const clashing = [
+      ...dayBookings.filter(
+        (b) => dto.startMinutes < b.endMinutes && dto.endMinutes > b.startMinutes,
+      ),
+      ...prevBookings.filter(
+        (b) =>
+          dto.startMinutes < b.endMinutes - 1440 && dto.endMinutes > b.startMinutes - 1440,
+      ),
+      ...nextBookings.filter(
+        (b) =>
+          dto.startMinutes < b.endMinutes + 1440 && dto.endMinutes > b.startMinutes + 1440,
+      ),
+    ];
+    const clashingBlocks = blocked.filter(
+      (r) => dto.startMinutes < r.endMinutes && dto.endMinutes > r.startMinutes,
+    );
+    if (clashing.length > 0 || clashingBlocks.length > 0) {
+      const bookingList = clashing
+        .map((b) => this.conflictView(b))
+        .map(
+          (c) => `${c.date} ${c.startMinutes}–${c.endMinutes} (${c.player})`,
+        )
+        .join(', ');
+      const blockList = clashingBlocks
+        .map((r) => `${r.startMinutes}–${r.endMinutes}`)
+        .join(', ');
+      throw new ConflictException(
+        `Block overlaps ${clashing.length > 0 ? `${clashing.length} booking(s): ${bookingList}` : ''}${clashing.length > 0 && clashingBlocks.length > 0 ? '; ' : ''}${clashingBlocks.length > 0 ? `${clashingBlocks.length} existing block(s): ${blockList}` : ''} — move or cancel them first`,
+      );
+    }
     return this.prisma.slotBlock.create({
       data: {
         courtId: dto.courtId,
-        date: parseDateOnly(dto.date),
+        date,
         startMinutes: dto.startMinutes,
         endMinutes: dto.endMinutes,
         reason: dto.reason,
@@ -982,6 +1168,7 @@ export class OwnerService {
     return {
       courtId,
       usesWeeklyTemplate: rows.length > 0,
+      weeklyHoursVersion: court.weeklyHoursVersion,
       defaultWindow: { startMinutes: court.openMinutes, endMinutes: court.closeMinutes },
       weekly,
       recurringBlocks: recurringBlocks.map((r) => ({
@@ -1072,6 +1259,18 @@ export class OwnerService {
    */
   async setWeeklyHours(user: AuthUser, courtId: string, dto: SetWeeklyHoursDto) {
     const court = await this.assertCourt(user, courtId);
+    // Optimistic concurrency (Round 4, O-S1): two tabs editing weekly
+    // hours used to last-write-win silently. A draft carrying a stale
+    // version is rejected with 409 — reload and re-apply — instead of
+    // overwriting the newer template.
+    if (
+      dto.expectedVersion !== undefined &&
+      dto.expectedVersion !== court.weeklyHoursVersion
+    ) {
+      throw new ConflictException(
+        'Weekly hours changed since you loaded them — reload and try again',
+      );
+    }
     // Duplicate weekday entries bypassed the overlap/conflict checks:
     // validation ran within each day entry only, and the conflict scan
     // used dto.days.find(...) (first entry wins), so two Tuesday
@@ -1164,7 +1363,7 @@ export class OwnerService {
       .map((b) => this.conflictView(b));
 
     if (conflicts.length > 0 && !dto.acknowledgeConflicts) {
-      return { saved: false, conflicts };
+      return { saved: false, conflicts, version: court.weeklyHoursVersion };
     }
 
     const flat = dto.days.flatMap((d) =>
@@ -1175,24 +1374,31 @@ export class OwnerService {
         endMinutes: w.endMinutes,
       })),
     );
-    await this.prisma.$transaction([
-      this.prisma.courtWeeklyWindow.deleteMany({ where: { courtId } }),
-      ...(flat.length > 0
-        ? [this.prisma.courtWeeklyWindow.createMany({ data: flat })]
-        : []),
-    ]);
-    // Keep the court's headline hours in sync (earliest open / latest
-    // close across the week) for dashboards and occupancy math.
-    if (flat.length > 0) {
-      await this.prisma.court.update({
+    // The window replace, the headline sync, and the version bump run
+    // in one transaction: a crash between them used to leave the
+    // template saved with a stale version, defeating the guard above.
+    const savedCourt = await this.prisma.$transaction(async (tx) => {
+      await tx.courtWeeklyWindow.deleteMany({ where: { courtId } });
+      if (flat.length > 0) {
+        await tx.courtWeeklyWindow.createMany({ data: flat });
+      }
+      // Keep the court's headline hours in sync (earliest open /
+      // latest close across the week) for dashboards and occupancy
+      // math — and bump the optimistic-concurrency version.
+      return tx.court.update({
         where: { id: courtId },
         data: {
-          openMinutes: Math.min(...flat.map((w) => w.startMinutes)),
-          closeMinutes: Math.max(...flat.map((w) => w.endMinutes)),
+          ...(flat.length > 0
+            ? {
+                openMinutes: Math.min(...flat.map((w) => w.startMinutes)),
+                closeMinutes: Math.max(...flat.map((w) => w.endMinutes)),
+              }
+            : {}),
+          weeklyHoursVersion: { increment: 1 },
         },
       });
-    }
-    return { saved: true, conflicts };
+    });
+    return { saved: true, conflicts, version: savedCourt.weeklyHoursVersion };
   }
 
   /**
@@ -1293,23 +1499,40 @@ export class OwnerService {
     const conflicts: (ReturnType<typeof this.conflictView> & { courtName: string })[] = [];
     for (const court of courts) {
       const windows = await this.courtsSvc.windowsForDate(court, date);
+      // Existing blocks for the day (one-off + recurring + overnight
+      // spill) are subtracted from each window (Round 4, O-S3): the
+      // old exact-match dedupe created a duplicate block whenever a
+      // partial block already covered part of the window, and the
+      // closure's own blocks were indistinguishable from pre-existing
+      // ones. Only the uncovered segments are created, so no two
+      // blocks ever overlap.
+      const blocked = await this.courtsSvc.blockedRangesForDate(court.id, date);
       for (const w of windows) {
-        const existing = await this.prisma.slotBlock.findFirst({
-          where: {
-            courtId: court.id,
-            date,
-            startMinutes: w.startMinutes,
-            endMinutes: w.endMinutes,
-          },
-          select: { id: true },
-        });
-        if (!existing) {
+        let segments = [{ startMinutes: w.startMinutes, endMinutes: w.endMinutes }];
+        for (const r of blocked) {
+          const next: typeof segments = [];
+          for (const s of segments) {
+            if (r.endMinutes <= s.startMinutes || r.startMinutes >= s.endMinutes) {
+              next.push(s);
+              continue;
+            }
+            if (r.startMinutes > s.startMinutes) {
+              next.push({ startMinutes: s.startMinutes, endMinutes: r.startMinutes });
+            }
+            if (r.endMinutes < s.endMinutes) {
+              next.push({ startMinutes: r.endMinutes, endMinutes: s.endMinutes });
+            }
+          }
+          segments = next;
+          if (segments.length === 0) break;
+        }
+        for (const s of segments) {
           await this.prisma.slotBlock.create({
             data: {
               courtId: court.id,
               date,
-              startMinutes: w.startMinutes,
-              endMinutes: w.endMinutes,
+              startMinutes: s.startMinutes,
+              endMinutes: s.endMinutes,
               reason: dto.reason ?? 'Closed',
             },
           });
@@ -1428,14 +1651,23 @@ export class OwnerService {
     // a future date used to be stamped checked-in weeks early, so the
     // real check-in on arrival day failed ("already checked in") and
     // attendance showed a check-in before the game existed.
+    // The follow-up update is status-conditioned (Round 4, R-S5): an
+    // unconditional update would resurrect a booking a cascade
+    // cancelled between creation and this write.
     const isToday = isSameDay(slotDate, now);
-    await this.prisma.booking.update({
-      where: { id: booking.id },
+    const claimed = await this.prisma.booking.updateMany({
+      where: {
+        id: booking.id,
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+      },
       data: {
         status: BookingStatus.confirmed,
         ...(isToday ? { checkedInAt: new Date() } : {}),
       },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException('The booking is no longer active');
+    }
     return this.prisma.booking.findUnique({ where: { id: booking.id } });
   }
 
@@ -1526,9 +1758,25 @@ export class OwnerService {
     // Alignment + the requested day's open windows (weekly template
     // or the court's default hours).
     const reqWindows = await this.courtsSvc.windowsForDate(court, req.requestedDate);
-    const reqWindow = reqWindows.find(
+    let reqWindow = reqWindows.find(
       (w) => startMinutes >= w.startMinutes && endMinutes <= w.endMinutes,
     );
+    // Early-morning requests must also match the previous evening's
+    // spill window (Round 4, O-S13 — the lookup side; the clash side
+    // is P-B4 below): a Sat 00:30 request is the tail of Fri's
+    // 18:00–02:00 window, not a Sat window, so looking only at the
+    // requested date's windows rejected every early-morning move.
+    if (!reqWindow && startMinutes < 360) {
+      const prevDate = new Date(req.requestedDate);
+      prevDate.setDate(prevDate.getDate() - 1);
+      const prevWindows = await this.courtsSvc.windowsForDate(court, prevDate);
+      const spill = prevWindows
+        .filter((w) => w.endMinutes > 1440)
+        .map((w) => ({ startMinutes: w.startMinutes - 1440, endMinutes: w.endMinutes - 1440 }));
+      reqWindow = spill.find(
+        (w) => startMinutes >= w.startMinutes && endMinutes <= w.endMinutes,
+      );
+    }
     if (!reqWindow || (startMinutes - reqWindow.startMinutes) % court.slotMinutes !== 0) {
       throw new BadRequestException('Requested slot is outside court hours');
     }
@@ -1657,6 +1905,15 @@ export class OwnerService {
     };
     try {
       validated = await this.validateRescheduleAccept(req);
+      // A legacy court with slotMinutes <= 0 (no longer creatable)
+      // would hang the re-price loop below stepping by slotMinutes.
+      // This guard lives INSIDE the auto-reject path (Round 4, L-S1):
+      // the old standalone check after the try threw without
+      // auto-rejecting, stranding the request pending forever and
+      // blocking the player from requesting again.
+      if (validated.court.slotMinutes <= 0) {
+        throw new BadRequestException('Court slot length is invalid');
+      }
     } catch (err) {
       if (
         err instanceof BadRequestException ||
@@ -1684,18 +1941,13 @@ export class OwnerService {
     }
     const { court, startMinutes, endMinutes } = validated;
 
-    // A legacy court with slotMinutes <= 0 (no longer creatable) would
-    // hang the re-price loop below stepping by slotMinutes — fail
-    // loudly instead of hanging the request.
-    if (court.slotMinutes <= 0) {
-      throw new BadRequestException('Court slot length is invalid');
-    }
-
     // Re-price at the new slot with the same per-slot engine as booking
     // creation (peak/off-peak windows on the requested date). Without
     // this the moved booking kept its old price — an off-peak booking
     // could move into peak hours, or a longer duration, for free.
-    // Post-midnight slots price from the morning's weekday windows.
+    // Post-midnight slots price from the morning's weekday windows
+    // first, falling back to the evening window covering the spill
+    // hour (O-S20), then the base rate.
     const priceWindows = await this.courtsSvc.priceWindowsForDateRange(
       court.id,
       req.requestedDate,
@@ -2200,7 +2452,15 @@ export class OwnerService {
   }
 
   async createMyPromo(user: AuthUser, dto: CreateMyPromoDto) {
-    await this.assertVenue(user, dto.venueId);
+    const venue = await this.assertVenue(user, dto.venueId);
+    // Promo creation requires venue OWNERSHIP (Round 4, O-S14): the
+    // old assertVenue let a venues.manage staffer create promos they
+    // could never update, delete, or even list (those paths are
+    // owner-only via assertMyPromo / the owner-scoped list), leaving
+    // staff-created promos unmanageable by their creator.
+    if (venue.ownerId !== user.id) {
+      throw new ForbiddenException('Only the venue owner can create promos');
+    }
     const code = dto.code.toUpperCase().trim();
     if (!code) throw new BadRequestException('Promo code is required');
     // Panel caps codes at 24 chars (Round 3 T5); the API enforces the

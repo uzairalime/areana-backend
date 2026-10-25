@@ -277,6 +277,11 @@ model Court {
   openMinutes  Int      @default(360) // 6:00 AM, minutes since midnight
   closeMinutes Int      @default(1380) // 11:00 PM
   slotMinutes  Int      @default(60)
+  /// Optimistic-concurrency version for the weekly-hours template
+  /// (Round 4, O-S1): every setWeeklyHours save bumps it, so a stale
+  /// draft (two tabs editing) is rejected with 409 instead of
+  /// silently overwriting the newer template.
+  weeklyHoursVersion Int @default(0)
   isActive     Boolean  @default(true)
   /// Super-admin approval for owner-created courts: approved | pending |
   /// rejected. Existing and admin-created courts are approved; a pending
@@ -432,7 +437,7 @@ model RescheduleRequest {
   requestedDate         DateTime @db.Date
   requestedStartMinutes Int
   requestedEndMinutes   Int
-  status                String   @default("pending") // pending | approved | rejected
+  status                String   @default("pending") // pending | approved | rejected | withdrawn
   reason                String?
   createdAt             DateTime @default(now())
   decidedAt             DateTime?
@@ -478,6 +483,11 @@ model SlotWaitlist {
   court        Court     @relation(fields: [courtId], references: [id], onDelete: Cascade)
   date         DateTime  @db.Date
   startMinutes Int
+  /// Slot length (minutes) at wait time (Round 4: waitlist pings must
+  /// use the waited slot size, not the court's current one). NULL for
+  /// entries created before this field existed — those fall back to
+  /// the court's current slotMinutes at ping time.
+  slotMinutes  Int?
   notifiedAt   DateTime?
   createdAt    DateTime  @default(now())
 
