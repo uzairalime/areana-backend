@@ -400,6 +400,40 @@ export class PlansService {
     if (!venue) throw new NotFoundException('Venue not found');
     this.assertBillableVenue(venue);
     if (restartBilling) {
+      // Round-4 R-B2 claim-guard: a restart wipes paidUntil, so a
+      // stale retry must never wipe a payment recorded AFTER the last
+      // restart. If money landed since the clock was last reset, the
+      // admin must void that payment first (explicit) rather than
+      // have a retried restart silently erase it. Rs 0 auto-settlements
+      // ('auto') are not money, so they never block. No payment since
+      // the last restart → the restart proceeds, so legitimate
+      // repeated restarts are unaffected.
+      if (venue.billingStartAt) {
+        const lastPayment = await this.prisma.venuePayment.findFirst({
+          // NULL method = a settlement recorded without a method:
+          // still money, so it blocks like any other payment.
+          where: {
+            venueId,
+            OR: [
+              { method: null },
+              { method: { notIn: ['void', 'auto'] } },
+            ],
+          },
+          orderBy: { createdAt: 'desc' },
+          select: { id: true, createdAt: true },
+        });
+        if (lastPayment && lastPayment.createdAt > venue.billingStartAt) {
+          const voided = await this.prisma.venuePayment.findFirst({
+            where: { venueId, method: 'void', note: `void:${lastPayment.id}` },
+            select: { id: true },
+          });
+          if (!voided) {
+            throw new BadRequestException(
+              'This arena has a payment recorded since its last billing restart — void that payment first, then restart billing.',
+            );
+          }
+        }
+      }
       return this.prisma.venue.update({
         where: { id: venueId },
         data: {

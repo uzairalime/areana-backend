@@ -553,6 +553,7 @@ export class AdminController {
 
   @ApiTags('admin · plans')
   @Post('venues/:id/billing/extend-free')
+  @UseInterceptors(IdempotencyInterceptor)
   extendVenueFree(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: ExtendFreeDto) {
     return this.admin.extendVenueFree(u.id, id, dto.months);
   }
