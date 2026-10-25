@@ -9,12 +9,21 @@ const venueSummary = {
   name: true,
   address: true,
   city: true,
+  lat: true,
+  lng: true,
   sports: true,
+  amenities: true,
   images: true,
   rating: true,
   ratingCount: true,
   status: true,
   photos: true,
+  autoAccept: true,
+  badges: {
+    select: { badge: { select: { name: true, tier: true } } },
+    orderBy: { badge: { tier: 'desc' } },
+  },
+  _count: { select: { courts: true } },
 } as const;
 
 @Injectable()
