@@ -253,34 +253,48 @@ export class PlansService {
     }
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
-    return this.prisma.$transaction(async (tx) => {
-      await tx.venuePayment.create({
-        data: {
-          venueId,
-          planId: payment.planId,
-          amount: -payment.amount,
-          method: 'void',
-          note: `void:${paymentId}`,
-          periodStart: payment.periodStart,
-          periodEnd: payment.periodEnd,
-          recordedById: actorId ?? null,
-        },
-      });
-      // Roll the paid flag back only when this payment is still the
-      // latest settlement (paidUntil within this period); otherwise a
-      // later settlement still governs and the flag stays.
-      if (
-        venue.billingPaidUntil &&
-        payment.periodEnd &&
-        venue.billingPaidUntil <= payment.periodEnd
-      ) {
-        await tx.venue.update({
-          where: { id: venueId },
-          data: { billingPaidUntil: payment.periodStart },
+    // The already-check above is fail-fast only: two concurrent voids
+    // both pass it, so the insert itself must be the backstop — the
+    // partial unique index on note WHERE method = 'void' turns the
+    // loser's insert into P2002, mapped here to the same 409 as the
+    // sequential path (never a raw 500, never a second reversal).
+    let result;
+    try {
+      result = await this.prisma.$transaction(async (tx) => {
+        await tx.venuePayment.create({
+          data: {
+            venueId,
+            planId: payment.planId,
+            amount: -payment.amount,
+            method: 'void',
+            note: `void:${paymentId}`,
+            periodStart: payment.periodStart,
+            periodEnd: payment.periodEnd,
+            recordedById: actorId ?? null,
+          },
         });
+        // Roll the paid flag back only when this payment is still the
+        // latest settlement (paidUntil within this period); otherwise a
+        // later settlement still governs and the flag stays.
+        if (
+          venue.billingPaidUntil &&
+          payment.periodEnd &&
+          venue.billingPaidUntil <= payment.periodEnd
+        ) {
+          await tx.venue.update({
+            where: { id: venueId },
+            data: { billingPaidUntil: payment.periodStart },
+          });
+        }
+        return { voided: true, paymentId, amount: payment.amount };
+      });
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        throw new BadRequestException('This payment was already voided');
       }
-      return { voided: true, paymentId, amount: payment.amount };
-    });
+      throw e;
+    }
+    return result;
   }
 
   async defaultPlan() {

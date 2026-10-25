@@ -88,6 +88,22 @@ export class OwnerService {
   }
 
   /**
+   * Photo writes are owner-only, exactly like venue settings edits
+   * (updateVenue/submitVenue): a venues.manage staffer must not be
+   * able to delist another owner's live arena through its gallery —
+   * each photo delete/untag runs dropVenueIfUnready, so gallery
+   * access alone used to drop a live venue to pending with no owner
+   * action and no notice.
+   */
+  private async assertVenueOwner(user: AuthUser, venueId: string) {
+    const venue = await this.assertVenue(user, venueId);
+    if (venue.ownerId !== user.id) {
+      throw new ForbiddenException('Only the venue owner can manage venue photos');
+    }
+    return venue;
+  }
+
+  /**
    * Billing/revenue visibility: a venue's owner always sees its money;
    * a staff-linked venue only when the caller holds billing.view.
    * Owners are covered by the ownership rule, so existing owner roles
@@ -122,11 +138,18 @@ export class OwnerService {
     const ids = venueId ? [(await this.assertVenue(user, venueId)).id] : await this.venueIds(user);
     const date = dateStr ? parseDateOnly(dateStr) : startOfToday();
     const monthStart = new Date(date.getFullYear(), date.getMonth(), 1);
+    const nextMonthStart = new Date(date.getFullYear(), date.getMonth() + 1, 1);
 
     // Revenue is masked to money-visible venues (owned, or linked +
     // billing.view); bookings and occupancy stay visible for all
     // in-scope venues.
     const moneyIds = new Set(await this.moneyVenueIds(user));
+    // Month revenue must be scoped to the REQUESTED venue(s) (masked
+    // by moneyIds) and bounded to the month: the old query used every
+    // money-visible venue with no month-end cap, so Venue A's "month"
+    // figure included Venue B's revenue plus December bookings opened
+    // from an October dashboard.
+    const revenueIds = ids.filter((id) => moneyIds.has(id));
     const [todayBookings, monthBookings, courts] = await Promise.all([
       this.prisma.booking.findMany({
         where: { venueId: { in: ids }, date },
@@ -138,8 +161,8 @@ export class OwnerService {
       }),
       this.prisma.booking.findMany({
         where: {
-          venueId: { in: [...moneyIds] },
-          date: { gte: monthStart },
+          venueId: { in: revenueIds },
+          date: { gte: monthStart, lt: nextMonthStart },
           status: { in: [BookingStatus.confirmed, BookingStatus.completed] },
         },
         select: { totalPrice: true },
@@ -419,7 +442,7 @@ export class OwnerService {
   }
 
   async addVenueImage(user: AuthUser, venueId: string, file: Express.Multer.File, sport?: string) {
-    await this.assertVenue(user, venueId);
+    await this.assertVenueOwner(user, venueId);
     const photo = await this.storage.saveVenueImage(venueId, file);
     // Photo arrays are read-modify-write: two concurrent uploads used
     // to both read the same array and each write back only their own
@@ -441,7 +464,7 @@ export class OwnerService {
   /** Tag (or untag) one photo with a sport — every sport a venue offers
    * needs at least one tagged photo before the venue can go live. */
   async tagVenueImage(user: AuthUser, venueId: string, url: string, sport: string | null) {
-    await this.assertVenue(user, venueId);
+    await this.assertVenueOwner(user, venueId);
     await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
       const fresh = await tx.venue.findUniqueOrThrow({ where: { id: venueId } });
@@ -586,17 +609,26 @@ export class OwnerService {
   }
 
   async removeVenueImage(user: AuthUser, venueId: string, url: string) {
-    await this.assertVenue(user, venueId);
-    await this.storage.deleteImage(url);
+    await this.assertVenueOwner(user, venueId);
+    // Membership is checked inside the transaction against fresh
+    // state, and the file is deleted only AFTER the commit. The old
+    // order (delete file first, no membership check) let a venues.manage
+    // holder at Venue A delete Venue B's public cover photo by passing
+    // its URL — Venue B's row kept listing a dead file (still counted
+    // toward the 4-photo readiness bar) with no record of who did it.
     await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
       const fresh = await tx.venue.findUniqueOrThrow({ where: { id: venueId } });
+      if (!fresh.images.includes(url)) {
+        throw new NotFoundException('Photo not found at this arena');
+      }
       const entries = photoEntriesOf(fresh).filter((e) => e.url !== url);
       await tx.venue.update({
         where: { id: venueId },
         data: { images: entries.map((e) => e.url), photos: entries },
       });
     });
+    await this.storage.deleteImage(url);
     // Removing a photo can drop an approved venue below 4 photos or
     // remove the only tagged photo for a sport.
     await this.dropVenueIfUnready(venueId);
@@ -605,7 +637,7 @@ export class OwnerService {
 
   /** Reorder a venue's photos (the first photo is the cover everywhere). */
   async reorderVenueImages(user: AuthUser, venueId: string, urls: string[]) {
-    await this.assertVenue(user, venueId);
+    await this.assertVenueOwner(user, venueId);
     // Same venue-row-lock pattern as the other photo writes: the
     // same-set guard must run against fresh state, or a concurrent
     // upload's photo is silently dropped from the order.
@@ -1052,6 +1084,23 @@ export class OwnerService {
         );
       }
       seenWeekdays.add(d.weekday);
+    }
+    // Closing all 7 days must be rejected, not stored: the save
+    // deletes every CourtWeeklyWindow row, and windowsForDate treats
+    // "no template rows at all" as "fall back to headline hours" —
+    // so an all-closed save silently REOPENS the court at its default
+    // hours and sells bookings on a court the owner believes is closed
+    // for renovation. (Closing 6 of 7 days works: the remaining rows
+    // keep the template alive, so closed weekdays stay closed.) This
+    // runs before any write, so a rejected save leaves the previous
+    // template intact.
+    if (
+      seenWeekdays.size === 7 &&
+      dto.days.every((d) => d.windows.length === 0)
+    ) {
+      throw new BadRequestException(
+        'A court closed all week must be deactivated instead — closing every day would reopen it at its headline hours',
+      );
     }
     // Split shifts (more than one window in a day) are a plan feature.
     if (dto.days.some((d) => d.windows.length > 1)) {
@@ -1504,6 +1553,51 @@ export class OwnerService {
       },
     });
     if (clash) throw new ConflictException('Requested slot is no longer available');
+    // Overnight spill, mirroring booking creation's assertNoOverlap:
+    // a move ending past midnight (endMinutes > 1440, stored on the
+    // evening's date) must not clash with early bookings stored on the
+    // next date — and an early-morning move must not clash with the
+    // previous evening's overnight booking. Without both, a Fri
+    // 23:00–01:00 move confirmed onto an existing Sat 00:30–01:30
+    // booking. The commit transaction re-runs the same checks under
+    // the court lock; these are the fail-fast copy.
+    if (endMinutes > 1440) {
+      const nextDate = new Date(req.requestedDate);
+      nextDate.setDate(nextDate.getDate() + 1);
+      const spillClash = await this.prisma.booking.findFirst({
+        where: {
+          id: { not: req.bookingId },
+          courtId: req.booking.courtId,
+          date: nextDate,
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          startMinutes: { lt: endMinutes - 1440 },
+          endMinutes: { gt: 0 },
+        },
+        select: { id: true },
+      });
+      if (spillClash) throw new ConflictException('Requested slot is no longer available');
+    }
+    if (startMinutes < 360) {
+      const prevDate = new Date(req.requestedDate);
+      prevDate.setDate(prevDate.getDate() - 1);
+      const prev = await this.prisma.booking.findMany({
+        where: {
+          id: { not: req.bookingId },
+          courtId: req.booking.courtId,
+          date: prevDate,
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          endMinutes: { gt: 1440 },
+        },
+        select: { startMinutes: true, endMinutes: true },
+      });
+      if (
+        prev.some(
+          (b) => b.startMinutes - 1440 < endMinutes && b.endMinutes - 1440 > startMinutes,
+        )
+      ) {
+        throw new ConflictException('Requested slot is no longer available');
+      }
+    }
     // Re-validate any promo the booking carries (expiry, venue scope,
     // per-user limit). The per-user count excludes this booking's own
     // redemption — otherwise a perUserLimit of 1 would always fail its
@@ -1666,6 +1760,46 @@ export class OwnerService {
           select: { id: true },
         });
         if (clash) throw new ConflictException('Requested slot is no longer available');
+        // Same overnight-spill checks as validation, re-run here under
+        // the court lock so a concurrent booking landing between
+        // validation and commit cannot double-book the spill hour.
+        if (endMinutes > 1440) {
+          const nextDate = new Date(req.requestedDate);
+          nextDate.setDate(nextDate.getDate() + 1);
+          const spillClash = await tx.booking.findFirst({
+            where: {
+              id: { not: req.bookingId },
+              courtId: req.booking.courtId,
+              date: nextDate,
+              status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+              startMinutes: { lt: endMinutes - 1440 },
+              endMinutes: { gt: 0 },
+            },
+            select: { id: true },
+          });
+          if (spillClash) throw new ConflictException('Requested slot is no longer available');
+        }
+        if (startMinutes < 360) {
+          const prevDate = new Date(req.requestedDate);
+          prevDate.setDate(prevDate.getDate() - 1);
+          const prev = await tx.booking.findMany({
+            where: {
+              id: { not: req.bookingId },
+              courtId: req.booking.courtId,
+              date: prevDate,
+              status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+              endMinutes: { gt: 1440 },
+            },
+            select: { startMinutes: true, endMinutes: true },
+          });
+          if (
+            prev.some(
+              (b) => b.startMinutes - 1440 < endMinutes && b.endMinutes - 1440 > startMinutes,
+            )
+          ) {
+            throw new ConflictException('Requested slot is no longer available');
+          }
+        }
         const reqClaimed = await tx.rescheduleRequest.updateMany({
           where: { id: requestId, status: 'pending' },
           data: { status: 'approved', decidedAt: new Date() },

@@ -4,7 +4,7 @@ import sharp from 'sharp';
 import { ConfigService } from '@nestjs/config';
 import { randomBytes } from 'crypto';
 import { promises as fs } from 'fs';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 
 const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const MAX_BYTES = 5 * 1024 * 1024;
@@ -125,7 +125,16 @@ export class StorageService {
   async deleteImage(url: string): Promise<void> {
     try {
       if (url.startsWith('/uploads/')) {
-        await fs.unlink(join(this.config.get('storage.dir'), url.replace('/uploads/', '')));
+        // Confine the resolved path to the storage directory: the old
+        // join() let a `..` segment escape it (e.g. a caller-supplied
+        // URL deleting files outside uploads). Refuse, don't delete.
+        const dir = resolve(this.config.get('storage.dir'));
+        const target = resolve(dir, url.replace('/uploads/', ''));
+        if (target !== dir && !target.startsWith(dir + sep)) {
+          this.logger.warn(`Refusing to delete image outside storage dir: ${url}`);
+          return;
+        }
+        await fs.unlink(target);
       } else if (this.config.get('storage.driver') === 's3') {
         await this.deleteFromS3(url);
       }

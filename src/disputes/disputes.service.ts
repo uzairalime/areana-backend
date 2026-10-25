@@ -131,6 +131,12 @@ export class DisputesService {
       if (dispute.booking.checkedInAt) {
         throw new BadRequestException('A checked-in booking cannot be confirmed as a no-show');
       }
+      // Same empty-window guard as markNoShow: an inverted stored
+      // booking must never collect a strike through the dispute path
+      // either.
+      if (dispute.booking.endMinutes <= dispute.booking.startMinutes) {
+        throw new BadRequestException('This booking has an invalid slot and cannot be confirmed as a no-show');
+      }
     }
 
     let strikeUserId: string | null = null;

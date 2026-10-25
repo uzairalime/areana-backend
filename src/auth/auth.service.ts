@@ -9,7 +9,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import { User, UserStatus } from '@prisma/client';
+import { Prisma, User, UserStatus } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { createHash } from 'crypto';
 import { PrismaService } from '../common/prisma';
@@ -130,17 +130,30 @@ export class AuthService {
       if (!dto.name || !dto.phone) {
         throw new BadRequestException('Name and phone are required to create your account');
       }
-      user = await this.prisma.user.create({
-        data: {
-          email,
-          name: dto.name,
-          phone: dto.phone,
-          city: dto.city,
-          roleId: playerRole.id,
-          referralCode: randomCode('AREANA'),
-          status: UserStatus.active,
-        },
-      });
+      // Double-submit race: two concurrent first verifications both
+      // pass the findUnique above, then the loser's insert hits the
+      // unique-email constraint. That must read as "account already
+      // created — please sign in", never a raw 500 — and the winner's
+      // code is already consumed by then, so the loser cannot retry
+      // this code either way.
+      try {
+        user = await this.prisma.user.create({
+          data: {
+            email,
+            name: dto.name,
+            phone: dto.phone,
+            city: dto.city,
+            roleId: playerRole.id,
+            referralCode: randomCode('AREANA'),
+            status: UserStatus.active,
+          },
+        });
+      } catch (e) {
+        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+          throw new ConflictException('Account already created — please sign in');
+        }
+        throw e;
+      }
       welcomePromoCode = dto.referralCode
         ? ((await this.referrals.handleSignupReferral(user.id, dto.referralCode))?.promo.code ?? null)
         : null;

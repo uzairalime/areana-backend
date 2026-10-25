@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { BookingStatus, Prisma, UserStatus } from '@prisma/client';
@@ -39,6 +40,8 @@ function shortCode(len: number): string {
 
 @Injectable()
 export class BookingsService {
+  private readonly logger = new Logger(BookingsService.name);
+
   constructor(
     private prisma: PrismaService,
     private courts: CourtsService,
@@ -544,7 +547,11 @@ export class BookingsService {
         })
         .catch(() => {});
     }
-    await this.prisma.gamePost.delete({ where: { id: post.id } });
+    // deleteMany, not findUnique-then-delete: a host deleting their
+    // post between the read and the delete used to throw P2025 here,
+    // aborting the whole venue cascade mid-loop. Deleting zero rows
+    // when the post is already gone is the correct outcome.
+    await this.prisma.gamePost.deleteMany({ where: { bookingId } });
   }
 
   /**
@@ -942,6 +949,17 @@ export class BookingsService {
     if (booking.checkedInAt) {
       throw new BadRequestException('A checked-in booking cannot be marked as no-show');
     }
+    // A stored inverted booking (endMinutes <= startMinutes, minted
+    // by legacy slotMinutes <= 0 courts) has an EMPTY check-in window
+    // [start−30, end]: it can never be checked into, never occupies
+    // its hour, and must never collect a strike — the nightly sweep
+    // routes through here too, so without this guard it would strike
+    // the player, suspend at 3 strikes, and cancel all future bookings
+    // for a game that was never playable. The backfill cancelling such
+    // bookings is a separate data round; this guard stops new strikes.
+    if (booking.endMinutes <= booking.startMinutes) {
+      throw new BadRequestException('This booking has an invalid slot and cannot be marked as no-show');
+    }
     // A no-show can only be recorded once the slot has actually ended —
     // end instant, not play date, so an overnight game is never struck
     // mid-game after midnight.
@@ -1078,7 +1096,18 @@ export class BookingsService {
       });
       if (claimed.count === 0) continue;
       cancelled++;
-      await this.finalizeCascadeCancel(b, venue?.name, venueId, reason);
+      // One booking's failing wake must never abort the whole cascade:
+      // a game post deleted between findUnique and delete used to throw
+      // P2025 here, skipping every remaining booking while the caller
+      // reported success. Log the failure and continue — the booking
+      // itself is already cancelled; only its wake is partial.
+      try {
+        await this.finalizeCascadeCancel(b, venue?.name, venueId, reason);
+      } catch (err) {
+        this.logger.error(
+          `Cascade finalize failed for booking ${b.id}: ${(err as Error).message}`,
+        );
+      }
     }
     // Drain: a booking inserting while the cascade snapshots can
     // survive at a suspended venue. Venue-row flips (suspendVenue,
@@ -1134,7 +1163,13 @@ export class BookingsService {
       if (claimed.length === 0) break;
       cancelled += claimed.length;
       for (const b of claimed) {
-        await this.finalizeCascadeCancel(b, venue?.name, venueId, reason);
+        try {
+          await this.finalizeCascadeCancel(b, venue?.name, venueId, reason);
+        } catch (err) {
+          this.logger.error(
+            `Cascade finalize failed for booking ${b.id}: ${(err as Error).message}`,
+          );
+        }
       }
     }
     return cancelled;

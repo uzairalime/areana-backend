@@ -2788,16 +2788,22 @@ export class AdminService {
     const venue = await this.prisma.venue.findUnique({ where: { id: venueId } });
     if (!venue) throw new NotFoundException('Venue not found');
     this.assertImageScope(venue, actor);
-    await this.storage.deleteImage(url);
+    // Same shape as the owner path: membership checked inside the
+    // transaction against fresh state, file deleted only after commit —
+    // never delete a file this venue does not list.
     await this.prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
       const fresh = await tx.venue.findUniqueOrThrow({ where: { id: venueId } });
+      if (!fresh.images.includes(url)) {
+        throw new NotFoundException('Photo not found at this arena');
+      }
       const entries = photoEntriesOf(fresh).filter((e) => e.url !== url);
       await tx.venue.update({
         where: { id: venueId },
         data: { images: entries.map((e) => e.url), photos: entries },
       });
     });
+    await this.storage.deleteImage(url);
     // Removing a photo can drop an approved venue below 4 photos or
     // remove the only tagged photo for a sport.
     const { venue: final } = await this.dropVenueIfUnready(venueId);

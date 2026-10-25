@@ -29,7 +29,7 @@ export class DeeplinkController {
     } catch {
       /* fall through with generic title */
     }
-    return this.page(title, `areana://v/${id}`, `Open the Areana app to view this arena.`);
+    return this.page(title, `areana://v/${encodeURIComponent(id)}`, `Open the Areana app to view this arena.`);
   }
 
   @Get('join/:code')
@@ -44,17 +44,39 @@ export class DeeplinkController {
     } catch {
       /* fall through */
     }
-    return this.page(title, `areana://join/${code}`, desc);
+    return this.page(title, `areana://join/${encodeURIComponent(code)}`, desc);
+  }
+
+  /**
+   * HTML-escape for text AND double-quoted attribute contexts. Venue
+   * names, sports, and dates are user-controlled strings interpolated
+   * into this page — without escaping, a crafted venue name breaks out
+   * of <title>/<h1> (stored XSS on a trusted page). The deep link
+   * itself is built from encodeURIComponent'd path params (so quotes,
+   * backslashes, and </script> cannot survive in it) and escaped here
+   * as defence in depth before it lands in href="..." and the JS
+   * string below.
+   */
+  private esc(s: string): string {
+    return s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   private page(title: string, deepLink: string, desc: string): string {
+    const t = this.esc(title);
+    const d = this.esc(desc);
+    const l = this.esc(deepLink);
     return `<!doctype html><html><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>${title}</title></head>
+<title>${t}</title></head>
 <body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:#fff;text-align:center;padding:24px">
-<div><h1 style="font-size:22px">${title}</h1><p style="color:#94a3b8">${desc}</p>
-<a href="${deepLink}" style="display:inline-block;margin-top:16px;padding:12px 28px;background:#22c55e;color:#04120a;border-radius:10px;text-decoration:none;font-weight:700">Open in Areana app</a></div>
-<script>setTimeout(()=>{window.location.href="${deepLink}"},800);</script>
+<div><h1 style="font-size:22px">${t}</h1><p style="color:#94a3b8">${d}</p>
+<a href="${l}" style="display:inline-block;margin-top:16px;padding:12px 28px;background:#22c55e;color:#04120a;border-radius:10px;text-decoration:none;font-weight:700">Open in Areana app</a></div>
+<script>setTimeout(()=>{window.location.href="${l}"},800);</script>
 </body></html>`;
   }
 }

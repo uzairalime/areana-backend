@@ -366,6 +366,15 @@ export class CourtsService {
     if (!court || (await this.isBillingOverdue(court.venue))) {
       throw new NotFoundException('Court not found');
     }
+    // Legacy courts with slotMinutes <= 0 are no longer creatable,
+    // but stored ones must not sell: a negative slot length mints free
+    // bookings with end < start (the grid/overlap checks both pass on
+    // inverted ranges), and a zero length hangs every stepping loop.
+    // Reject at this choke point, so booking creation, availability,
+    // walk-ins, and reschedule accept all refuse the court instead.
+    if (court.slotMinutes <= 0) {
+      throw new BadRequestException('Court slot length is invalid');
+    }
     return court;
   }
 
@@ -388,6 +397,11 @@ export class CourtsService {
     });
     if (!court || (await this.isBillingOverdue(court.venue))) {
       throw new NotFoundException('Court not found');
+    }
+    // Same legacy slotMinutes guard as getActiveCourt, re-run inside
+    // the transaction so a court edited mid-flight cannot sell.
+    if (court.slotMinutes <= 0) {
+      throw new BadRequestException('Court slot length is invalid');
     }
   }
 }

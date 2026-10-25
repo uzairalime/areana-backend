@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { BookingStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
 import { CourtsService } from '../courts/courts.service';
@@ -36,6 +36,14 @@ export class AvailabilityService {
    */
   async getAvailability(courtId: string, dateStr: string) {
     const court = await this.courts.getActiveCourt(courtId);
+    // Same guard as notifyWaitlist: stepping by a zero/negative slot
+    // length below would loop forever (start never advances, or walks
+    // backwards) while pushing slots into an unbounded array until the
+    // worker is killed. getActiveCourt already rejects such courts;
+    // this is the explicit second layer at the loop itself.
+    if (court.slotMinutes <= 0) {
+      throw new BadRequestException('Court slot length is invalid');
+    }
     const date = parseDateOnly(dateStr);
 
     const prevDay = new Date(date);
