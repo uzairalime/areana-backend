@@ -115,6 +115,32 @@ services:
     # The Dockerfile CMD runs `prisma migrate deploy && node dist/main`.
     # On a fresh DB that is NOT the install path (see header note).
 
+  # Panels (owner + admin). NEXT_PUBLIC_* is baked at build time, so
+  # these args come from the project .env and changing one later
+  # means rebuilding this image, not just restarting.
+  panels:
+    build:
+      context: ../areana-web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL is required}
+        NEXT_PUBLIC_PLAYER_URL: ${NEXT_PUBLIC_PLAYER_URL:-}
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+
+  # Player web. Same build-time NEXT_PUBLIC_* rule as panels.
+  player:
+    build:
+      context: ../areana-user-web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL is required}
+        NEXT_PUBLIC_PANELS_URL: ${NEXT_PUBLIC_PANELS_URL:-}
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-}
+        NEXT_PUBLIC_GOOGLE_PLACES_API_KEY: ${NEXT_PUBLIC_GOOGLE_PLACES_API_KEY:-}
+    restart: unless-stopped
+    ports:
+      - "3002:3002"
+
 volumes:
   pgdata_prod:
   uploads:
