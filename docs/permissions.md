@@ -27,7 +27,15 @@ the DB. `GET /admin/permissions` returns this list for the panel UI.
 | `schedule.manage` | Opening hours and slot blocks |
 | `customers.read` | View customer list |
 | `staff.manage` | Create and manage team logins |
+| `billing.view` | View billing and revenue (staff without it see bookings and occupancy, but not money) |
+| `venues.onboard` | Onboard arenas from the admin panel (create owner, venue and courts) and view all venues |
 | `*` | All permissions (super_admin only) |
+
+Owner-grantable keys (`ARENA_ROLE_PERMISSIONS` — the only keys an
+owner's own roles may carry): `venues.manage`, `courts.manage`,
+`bookings.review`, `bookings.manage`, `blocks.manage`, `schedule.manage`,
+`customers.read`, `staff.manage`, `reviews.reply`, `billing.view`.
+Platform keys (`venues.onboard`) and `*` are never owner-grantable.
 
 ## Seeded roles
 
@@ -53,6 +61,10 @@ Every request passes two global guards:
    - `@RequireAnyPerm('a', 'b')` — needs **at least one**.
    - No decorator — any authenticated user.
    - `'*'` in the user's permissions passes everything.
+   - A method-level `@RequirePerm` **overrides** a class-level one — this
+     is how `venues.onboard` works on the otherwise wildcard-gated admin
+     controller: any role granted that key can onboard, not just
+     `super_admin`.
 
 Data scoping (which *venues* a user may touch) is separate from permissions and
 lives in the services: owners see venues they own (`ownerId`), staff see venues
@@ -78,3 +90,12 @@ The super admin decides **per arena** how much power its owner may delegate:
 
 Removing a team member = `DELETE /owner/staff/:id` (deletes the venue link;
 the user row stays for audit).
+
+## Owner-created roles
+
+Owners can create roles for their own team (`Role.ownerId`, name unique
+per owner) through `GET/POST/PATCH/DELETE /owner/roles` (perm
+`staff.manage`). Keys are limited to the 10 arena-grantable keys above;
+a disabled role (`isActive: false`) grants zero permissions. Admins can
+only disable owner roles, never edit them; system-role lookups filter
+`ownerId: null`.

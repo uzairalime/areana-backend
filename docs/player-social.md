@@ -8,9 +8,13 @@ Everything that makes Areana social and retentive beyond the booking itself.
 ```json
 // POST /favorites
 { "venueId": "cm3x..." }
-// GET /favorites → [{ venueId, venue: { id, name, city, rating, images } }]
+// GET /favorites → CursorPage of venues (tie-break venueId)
 ```
-Add is idempotent (upsert). Powers the app's "Saved" tab.
+Add is idempotent (upsert). Powers the app's "Saved" tab. The favorites
+select carries lat/lng, amenities, badges, and court count — but
+`fromPrice` is computed only in the browse list, so the rate band here
+shows court count. `GET /favorites/check?venueId=` returns the favorited
+boolean for one venue.
 
 ## Reviews
 
@@ -26,13 +30,17 @@ One review per completed booking — enforced by a unique constraint on `booking
 are recomputed atomically.
 
 ### `GET /venues/:id/reviews` — public
-Newest first, with reviewer name and any `ownerReply`.
+Newest first (`CursorPage` with `total`), with reviewer name and any `ownerReply`.
+
+### `GET /courts/:courtId/reviews` — public
+Same shape as venue reviews. Reviews carry no court column — this filters
+through `booking.courtId`, no migration.
 
 ### Owner replies — `POST /owner/reviews/:id/reply` (perm `reviews.reply`)
 ```json
 { "reply": "Thanks for playing with us!" }
 ```
-Sets `ownerReply` + `repliedAt`. Super admin can delete any review
+Sets `ownerReply` + `repliedAt` and appends to `ownerReplyHistory`. Super admin can delete any review
 (`DELETE /admin/reviews/:id`, rating recomputed).
 
 ## Find players / opponents board
@@ -40,6 +48,10 @@ Sets `ownerReply` + `repliedAt`. Super admin can delete any review
 ### `GET /game-posts?sport=&city=&date=` — public
 Open games only, upcoming first, **curated games first**. Includes participant
 count. This is the retention engine (Playo-style): *"you can't play sports alone"*.
+Listings are two-phase (candidates → overdue dropped → total → page) and
+accept `lat`/`lng` + `sort=distance` like venues. A post is public only
+while its venue is visible (approved, not archived, billing unpaused,
+unmoderated, owner active).
 
 ### `POST /game-posts` — perm `games.manage`
 ```json
@@ -48,6 +60,10 @@ count. This is the retention engine (Playo-style): *"you can't play sports alone
   "playersNeeded": 10, "note": "Need a keeper!" }
 // venueId optional — street games welcome
 ```
+Player posts are **booking-linked**: a player posts only from their own
+confirmed booking (admin curated posts are the exception). Cancelling the
+booking removes its game post. Expired posts are closed by the scheduler
+sweep.
 
 ### `POST /game-posts/:id/join` — perm `games.manage`
 ```json
@@ -56,6 +72,10 @@ count. This is the retention engine (Playo-style): *"you can't play sports alone
 Rejects full/closed/past games and double-joins (`409`). Flips the post to
 `full` when `playersNeeded` is reached; the creator gets a push notification.
 `POST /game-posts/:id/leave` reopens it. `DELETE /game-posts/:id` — creator only.
+Join states: curated posts join instantly (`joined`); player-hosted posts
+go `pending` until the host approves. Booking-linked posts show
+per-player price transparency (`courtFee`, `pricePerPlayer`, `hostShare`):
+joiners split the fee, the host absorbs the remainder.
 
 ### Curated games (super admin)
 `PATCH /admin/game-posts/:id/curate` marks a post as platform-curated
@@ -65,14 +85,17 @@ hours with guaranteed games.
 ## Promos & referrals
 
 ### Promo codes
-`code` (unique, uppercase), `kind` = `percent` | `flat`, `value`,
-`maxDiscount` (percent cap), `maxUses`, `perUserLimit`, `validFrom/validTo`,
+`code` (unique, uppercase, max 24 chars), `kind` = `percent` | `flat`, `value`,
+`maxDiscount` (percent cap — `0` is rejected), `maxUses`, `perUserLimit`, `validFrom/validTo`,
 `isActive`. Applied at booking checkout (`POST /bookings` → `promoCode`);
 `GET /bookings/validate-promo` previews the discount. Usage is recorded in
 `promo_redemptions` and `usedCount` increments **inside the booking transaction**.
 
 Admin: `GET/POST /admin/promos`, `PATCH /admin/promos/:id` (toggle active).
-Code auto-generated (`PROMO-XXXXXX`) if not supplied.
+Code auto-generated (`PROMO-XXXXXX`) if not supplied. The admin list shows
+Scope: platform vs venue. Owners manage their own venue-scoped promos
+(`GET/POST/PATCH/DELETE /owner/promos`, perm `venues.manage`); admin
+editing is activate/deactivate only.
 
 ### Referrals — the loop
 1. Every player has a `referralCode` (`AREANA-XXXXXX`).
@@ -90,12 +113,26 @@ Code auto-generated (`PROMO-XXXXXX`) if not supplied.
 ### `POST /disputes` — perm `bookings.read`
 ```json
 { "bookingId": "cm4y...", "reason": "Charged for a slot the arena cancelled" }
-// one open dispute per booking; booking must be yours
+// one dispute per booking ever after a terminal resolution; booking must be yours
 ```
 ### `GET /disputes/me` — your dispute history.
 Super admin resolves: `POST /admin/disputes/:id/resolve`
-`{ action: "confirm_no_show" | "dismiss" | "credit", resolution }` —
+`{ action: "confirm_no_show" | "dismiss", resolution }` —
 `confirm_no_show` flips the booking and strikes the player in one transaction.
+There is no `credit` action.
+
+## Report this arena
+
+### `POST /venues/:id/report` — authenticated
+```json
+{ "category": "fake_listing", "details": "..." }
+// category: fake_listing|wrong_info|closed|misconduct|unsafe|other; details max 500 chars
+// one open report per player per arena (409 otherwise); anonymous to the owner
+```
+`GET /venues/:id/report/me` returns the player's own latest report for the
+arena. Admin triages at `GET /admin/venue-reports` and resolves via
+`POST /admin/venue-reports/:id/resolve` (`reviewed|actioned|dismissed`);
+an `actioned` `fake_listing`/`unsafe` report auto-pauses the venue.
 
 ## Suggest a turf
 

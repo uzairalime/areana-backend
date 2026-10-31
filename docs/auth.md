@@ -1,12 +1,15 @@
 # Auth
 
-Two login worlds: **passwordless email OTP** for players (mobile app),
+Two login worlds: **passwordless email OTP** for players (player web app;
+the Flutter app is planned, not built),
 **email + password** for owners, staff, and super admins (web panels).
 
 ## Player: email OTP
 
 ### `POST /auth/request-otp` — public
-Sends a 6-digit code. Rate limited: 5 codes/hour per email, 5 attempts per code.
+Sends a fresh random 6-digit code. Rate limited: 5 codes/hour per email
+(+ a per-IP cap), 5 attempts per code. Only **one** code is live at a time
+— requesting a new one replaces the old. There are no fixed test codes.
 
 ```json
 // request
@@ -59,6 +62,24 @@ Errors: `401` wrong/expired code, `400` missing name/phone on signup,
 { "refreshToken": "eyJ..." }
 // response — same shape as verify-otp (without welcomePromoCode)
 ```
+Refresh tokens **rotate**: each refresh returns a new refresh token and
+revokes the old one. Rotation keeps a grace window via
+`RefreshSession.replacedById`, so a lost-response retry proves it is a
+retry of the same rotation instead of theft; a reused revoked token
+(reuse detection) revokes the whole session family. Clients refresh
+single-flight (one in-flight refresh per session).
+
+### `POST /auth/logout` — public (present the refresh token)
+Revokes that refresh session (and its device token).
+
+### `POST /auth/logout-all` — authenticated
+Revokes **all** of the caller's refresh sessions (change-password also
+signs out everywhere). Access tokens are stateless, so revocation takes
+effect at the next refresh, not instantly.
+
+### `GET /auth/sessions` — authenticated
+The caller's live refresh sessions (device, last use) — the panel's
+session list. There is no per-session revoke endpoint; use `logout-all`.
 
 ## Owner & staff: password login
 
@@ -100,7 +121,8 @@ Registers an FCM token so the user receives push notifications.
 { "token": "fcm:APA91...", "platform": "android" }
 ```
 Upserts by token (re-installs don't duplicate). Dead tokens are pruned
-automatically when FCM reports them invalid.
+automatically when FCM reports them invalid. Tokens are revocable on
+logout and on password change.
 
 ## Token model
 

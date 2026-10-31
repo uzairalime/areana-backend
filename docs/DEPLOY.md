@@ -230,8 +230,11 @@ Notes:
   the cluster's setting. Fix a wrong cluster with
   `ALTER DATABASE areana SET timezone = 'Asia/Karachi';` (then
   reconnect) or re-initialise the volume. The boot check runs
-  `SHOW timezone`; a DB that is down at boot only warns (`/api/health`
-  reports it and the orchestrator restarts).
+  `SHOW timezone`; a DB that is down at boot means the timezone check
+  can't run (it warns) — but note the process still exits, because
+  `PrismaService.onModuleInit` connects eagerly and throws P1001
+  without a database. A DB that dies *after* boot is what surfaces as
+  `/api/health` 503.
 - **Swagger**: `/api/docs` is served only when `SWAGGER_ENABLED`
   allows it — on by default outside production, off in production
   unless explicitly set to `'true'`. An unrecognised `NODE_ENV`

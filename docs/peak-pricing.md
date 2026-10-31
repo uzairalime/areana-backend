@@ -37,7 +37,7 @@ less off-peak, instead of one flat rate per court.
 - The final price is snapshotted onto the booking, exactly as today —
   changing rates later never alters existing bookings.
 
-## Owner UI (planned)
+## Owner UI (built Oct 18)
 
 - A "Peak pricing" section inside **Courts → Timings & availability**,
   next to weekly timings and recurring breaks:
@@ -45,11 +45,13 @@ less off-peak, instead of one flat rate per court.
 - Same conflict-protection pattern as the availability manager: saving
   is safe by construction because existing bookings keep their price.
 
-## Player UI (planned)
+## Player UI (built Oct 18)
 
-- Slot chips already show per-slot prices; peak slots get a subtle
-  "Peak" tag so a higher price never surprises at checkout.
+- Slot chips show per-slot prices; peak slots get a "Peak" tag and
+  below-base slots an "Off-peak deal" tag, so a higher price never
+  surprises at checkout.
 - Venue cards show "from Rs X/hr" using the day's minimum slot price.
+- Reschedule-accept re-prices the booking on the new slot.
 
 ## Edge cases
 

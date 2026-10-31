@@ -10,8 +10,10 @@ pending → confirmed → completed
    ↓          ↓
 cancelled   no_show
 ```
-- `pending` — waiting on the arena; holds the slot; auto-expires after
-  `pendingExpiryHours` (setting, default 2) via the scheduler.
+- `pending` — waiting on the arena; holds the slot; auto-expires
+  slot-relative via the scheduler: `min(slotStart, max(createdAt +
+  pendingExpiryHours, slotStart − 24h))` (setting `pendingExpiryHours`,
+  default 2).
 - `confirmed` — accepted by the arena (or auto-accepted, or walk-in).
 - `completed` — nightly job flips past `confirmed` bookings; unlocks reviews.
 - `cancelled` — by player, arena, expiry, or super admin.
@@ -34,7 +36,9 @@ cancelled   no_show
 }
 ```
 Validation layers, in order:
-1. Court active, venue approved.
+1. Court active + approved and venue visible (approved, not archived,
+   not billing-paused, unmoderated, owner active) — one choke point
+   (`getActiveCourt`), plus a `slotMinutes > 0` guard.
 2. `startMinutes` aligned to the court's grid, `endMinutes ≤ closeMinutes`.
 3. Venue booking window: not sooner than `minAdvanceMinutes`, not later than `maxAdvanceDays`; not in the past.
 4. **Overlap check across the full range** (`slotCount` slots) against
@@ -43,8 +47,13 @@ Validation layers, in order:
 6. `@@unique(courtId, date, startMinutes)` as the final backstop under races.
 
 On success the arena owner gets an email; the player gets a push on accept/reject.
-`totalPrice` = `pricePerHour × hours − discount`. `checkInCode` is the QR the
-app displays; `shareCode` powers group join links.
+`totalPrice` = `pricePerHour × hours − discount`. Each slot is priced by
+the price window covering its start (else base) and the result is
+snapshotted onto the booking — later rate changes never alter it.
+`checkInCode` is the QR the
+app displays; `shareCode` powers group join links. Note: booking create
+has **no idempotency key** (the idempotency interceptor covers 7 admin
+mutations only) — clients must guard double-submit (double-tap) themselves.
 
 Errors: `400` misaligned/outside hours/window, `409` overlap ("Slot overlaps an
 existing booking") or fully-used promo, `404` court not found.
@@ -96,6 +105,7 @@ acceptance re-checks conflicts atomically. One pending request per booking.
 
 ### `POST /bookings/:id/share` — perm `bookings.read`
 `{ "shareCode": "K7P2M9QZ", "joinUrl": "/join/K7P2M9QZ" }` — idempotent.
+Join links work until the slot **starts**.
 
 ### `GET /bookings/shared/:shareCode` — public
 What a friend sees: court, venue, date/time, price, participant list
@@ -115,4 +125,5 @@ player's `noShowCount` increments. At the `noShowStrikeLimit` setting (default
 
 `bookings` (the row: court+date+start/end, price, discount, status, share/check-in
 codes, recurrence), `booking_participants`, `reschedule_requests`, `slot_blocks`,
-`promo_codes` + `promo_redemptions`. Full field reference: [models.md](models.md).
+`slot_waitlists`, `court_price_windows`, `promo_codes` + `promo_redemptions`.
+Full field reference: [models.md](models.md).
