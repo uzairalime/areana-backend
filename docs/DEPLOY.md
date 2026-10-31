@@ -260,16 +260,21 @@ Notes:
 ## 7. Production Compose (P-S14)
 
 `docker-compose.prod.yml` (versioned in this repo) is the production
-shape: `api` service + `db` with healthchecks,
+shape: `api` + `db` with healthchecks,
 `depends_on: db: condition: service_healthy`,
 `restart: unless-stopped`, and the API healthcheck on `/api/health`
 (which now returns 503 when the DB is down, so the healthy gate can
-actually fail). The dev `docker-compose.yml` (db + mailpit only) is
+actually fail). Since Oct 31 it also carries the `panels`
+(`areana-web`, :3001) and `player` (`areana-user-web`, :3002) services,
+built with `NEXT_PUBLIC_*` build args — a `NEXT_PUBLIC_*` change needs
+a rebuild, not a restart. The dev `docker-compose.yml` (db + mailpit only) is
 NOT a production file — the old "real prod Compose" was unversioned
 and unverifiable from this repo. Every API restart is full downtime
 (single container); a restart spanning a tick relies on the startup
 catch-ups (billing sweep + reminders + nightly-if-missed, all in
-`SchedulerService.onModuleInit`).
+`SchedulerService.onModuleInit`). Staging on Oracle Cloud Always Free
+uses this same Compose file — see `ORACLE-DEPLOY.md` (paused Oct 31:
+no VM was ever created).
 
 **Production Compose rules (Round 5, R2):**
 

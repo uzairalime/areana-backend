@@ -22,6 +22,18 @@ and how the pieces are used together.
 
 Interactive explorer: `http://localhost:3000/api/docs` (Swagger, auto-generated).
 
+> **Post-v1 additions (not yet in these pages, Oct 31, 2026):** yearly
+> venue-subscription billing (Basic Rs 18,000 / Normal Rs 36,000 default /
+> Premium Rs 60,000, 3 months free, no commission); Super Admin v2 (venue
+> view/click events, moderation states, court approval, owner roles,
+> owner promos, venue reports, venue/court charts); common pagination
+> (`CursorPage` / `OffsetPage`); venue go-live readiness enforcement;
+> admin onboarding; courts as a first-class listing (`GET /courts`) with
+> court reviews; location search (`lat`/`lng` + `sort=distance`); deploy
+> runbooks `DEPLOY.md` (all databases) and `ORACLE-DEPLOY.md` (staging,
+> paused). Swagger at `/api/docs` is the live shape reference for all of
+> it.
+
 ## Swagger UI
 
 Every endpoint below is also live in Swagger at `/api/docs`, generated from the

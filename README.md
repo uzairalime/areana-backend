@@ -9,10 +9,18 @@ Implements the full v1 plan (`~/workspace/areana/PLAN.md`).
 cp .env.example .env          # then set JWT secrets + ADMIN_PASSWORD
 docker compose up -d          # postgres + mailpit (email catcher)
 npm install
-npx prisma migrate dev --name init
 npm run db:seed               # roles, badges, settings + super admin from ADMIN_EMAIL/ADMIN_PASSWORD
 npm run start:dev
 ```
+
+> First install on an **empty** database: do NOT run `migrate dev`
+> here — `prisma/migrations/` holds only 12 hand-written folders, not
+> a full baseline, so `migrate deploy` on an empty DB builds a partial
+> schema and the API crashes. Follow `docs/DEPLOY.md` §1 instead
+> (`db push` first, then `resolve --applied` for the 7 Prisma-declared
+> migrations, then `migrate deploy`). The same doc covers deploys onto
+> databases that already have data. Staging deploys (Oracle, paused):
+> see `docs/ORACLE-DEPLOY.md`.
 
 - API: http://localhost:3000/api
 - Swagger docs: http://localhost:3000/api/docs
@@ -24,7 +32,7 @@ npm run start:dev
 
 | Who | How |
 |---|---|
-| Players (Flutter app) | Passwordless: `POST /auth/request-otp` → 6-digit code by email → `POST /auth/verify-otp` (first verify with `name` + `phone` + `city` = signup; optional `referralCode`) |
+| Players (player web app; Flutter app planned) | Passwordless: `POST /auth/request-otp` → 6-digit code by email → `POST /auth/verify-otp` (first verify with `name` + `phone` + `city` = signup; optional `referralCode`) |
 | Owners (web) | `POST /auth/owner/register` (needs super-admin approval) → `POST /auth/staff/login` |
 | Staff / super admin (web) | `POST /auth/staff/login` (email + password) |
 
