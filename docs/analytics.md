@@ -2,7 +2,8 @@
 
 Layered from platform KPIs down to single-user drill-downs. All under
 `/admin/analytics/*` (super admin only). Money = `confirmed` + `completed`
-bookings; GMV in PKR.
+bookings only, and cancelled bookings are excluded everywhere; GMV in PKR.
+Since Super Admin v2 the analytics split is Overview | Trends & insights.
 
 ## 1. Platform KPIs — `GET /admin/analytics/overview`
 
@@ -21,7 +22,10 @@ bookings; GMV in PKR.
 }
 ```
 `accruedCommission` = GMV × `commissionPct` setting. This is the panel's
-top strip.
+top strip. The overview also carries `activeBookings`,
+`currentSubscriptions`, `subscriptionRevenue` (the launch revenue —
+yearly venue fees, not commission), `totalViews`, `totalClicks`, and
+pending approvals now include courts.
 
 ## 2. Trends — `GET /admin/analytics/trends?days=30&granularity=day|week|month`
 
@@ -44,7 +48,7 @@ booking-count and GMV graphs.
 
 ## 4. Arena leaderboard — `GET /admin/analytics/venues`
 
-One row per approved arena, sorted by revenue:
+One row per approved arena, sorted by revenue (`OffsetPage`):
 ```json
 [ {
   "venueId": "...", "name": "Champions Turf", "city": "Lahore",
@@ -70,10 +74,23 @@ bookings; last 50 reviews.
 `{ bookings, completed, noShows, cancelled, referralsMade, promoRedemptions, disputes }`
 plus last 100 bookings. The support view for "why was this user suspended?".
 
+## 6. Venue & court charts
+
+Daily stacked bars by play date (Asia/Karachi): bookings by state (with
+toggle chips), revenue, traffic. Presets `7d|30d|90d` + custom From–To
+(inclusive, reversed ranges swapped, 366d cap).
+
+- `GET /admin/venues/:id/series` — venue chart series.
+- `GET /admin/courts/:id/detail` — court detail (totals, chart, spec,
+  recent bookings). The venue detail stats band shows GMV, seats
+  used/allowed (= plan `maxStaff` per venue), and per-court stats.
+
 ## Notes for the panel
 
 - All endpoints are read-only aggregates; nothing here mutates data.
 - The leaderboard and trends are computed live — fine for 10 venues; add
   caching (or materialized rollups) when venue count grows.
 - Commission is *accrued* (computed), not settled — the settlement ledger is
-  phase 2.
+  phase 2. Commission is a settings lever (default 0), not the launch
+  model; launch revenue is subscription fees (see `admin.md` Plans &
+  billing).

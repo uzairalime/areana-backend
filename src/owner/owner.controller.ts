@@ -6,6 +6,7 @@ import {
   Param,
   Patch,
   Post,
+  Put,
   Query,
   UploadedFile,
   UseInterceptors,
@@ -14,11 +15,16 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser, RequireAnyPerm, RequirePerm } from '../common/auth';
 import { OwnerService } from './owner.service';
+import { CursorQueryDto, OffsetQueryDto, wrapList } from '../common/pagination';
 import {
   BookingsQueryDto,
   CheckInScanDto,
   CreateBlockDto,
+  CreateClosureDto,
   CreateCourtDto,
+  CreatePriceWindowDto,
+  CreateRecurringBlockDto,
+  SetWeeklyHoursDto,
   CreateStaffDto,
   CreateVenueDto,
   RejectDto,
@@ -26,15 +32,20 @@ import {
   UpdateCourtDto,
   UpdateVenueDto,
   WalkInDto,
+  CreateMyRoleDto,
+  UpdateMyRoleDto,
+  CreateMyPromoDto,
+  UpdateMyPromoDto,
+  ResetPasswordDto,
 } from './dto';
 
-@ApiTags('owner')
 @ApiBearerAuth()
 @Controller('owner')
 export class OwnerController {
   constructor(private owner: OwnerService) {}
 
   // ------------------------------------------------------------- dashboard
+  @ApiTags('owner · dashboard')
   @Get('dashboard')
   dashboard(
     @CurrentUser() user: AuthUser,
@@ -44,31 +55,67 @@ export class OwnerController {
     return this.owner.dashboard(user, venueId, date);
   }
 
+  @ApiTags('owner · billing')
+  @Get('billing')
+  async billing(@CurrentUser() user: AuthUser, @Query() query?: OffsetQueryDto) {
+    return wrapList(await this.owner.billing(user, query?.page ?? 1, query?.limit));
+  }
+
   // ---------------------------------------------------------------- venues
+  @ApiTags('owner · venues & courts')
+  @Get('venues/check-duplicate')
+  @RequirePerm('venues.manage')
+  duplicateVenueCheck(
+    @CurrentUser() user: AuthUser,
+    @Query('name') name?: string,
+    @Query('city') city?: string,
+    @Query('excludeId') excludeId?: string,
+  ) {
+    return this.owner.duplicateVenueCheck(user, name, city, excludeId);
+  }
+
   @Get('venues')
-  myVenues(@CurrentUser() user: AuthUser) {
-    return this.owner.listMyVenues(user);
+  myVenues(@CurrentUser() user: AuthUser, @Query() query: CursorQueryDto) {
+    return this.owner.listMyVenues(user, query.cursor, query.limit);
   }
 
   @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
   @Post('venues')
   createVenue(@CurrentUser() user: AuthUser, @Body() dto: CreateVenueDto) {
     return this.owner.createVenue(user, dto);
   }
 
   @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
   @Patch('venues/:id')
   updateVenue(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdateVenueDto) {
     return this.owner.updateVenue(user, id, dto);
   }
 
   @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
+  @Post('venues/:id/archive')
+  archiveVenue(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.archiveVenue(user, id);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
+  @Post('venues/:id/unarchive')
+  unarchiveVenue(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.unarchiveVenue(user, id);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
   @Post('venues/:id/submit')
   submitVenue(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.submitVenue(user, id);
   }
 
   @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
   @Post('venues/:id/images')
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(FileInterceptor('image'))
@@ -76,11 +123,36 @@ export class OwnerController {
     @CurrentUser() user: AuthUser,
     @Param('id') id: string,
     @UploadedFile() file: Express.Multer.File,
+    @Body('sport') sport?: string,
   ) {
-    return this.owner.addVenueImage(user, id, file);
+    return this.owner.addVenueImage(user, id, file, sport);
   }
 
   @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
+  @Patch('venues/:id/images/tag')
+  tagImage(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body('url') url: string,
+    @Body('sport') sport: string | null,
+  ) {
+    return this.owner.tagVenueImage(user, id, url, sport ?? null);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
+  @Patch('venues/:id/images/order')
+  reorderImages(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body('urls') urls: string[],
+  ) {
+    return this.owner.reorderVenueImages(user, id, urls);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · venues & courts')
   @Delete('venues/:id/images')
   removeImage(
     @CurrentUser() user: AuthUser,
@@ -92,12 +164,14 @@ export class OwnerController {
 
   // ---------------------------------------------------------------- courts
   @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
   @Get('venues/:venueId/courts')
-  courts(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
-    return this.owner.courts(user, venueId);
+  async courts(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
+    return wrapList(await this.owner.courts(user, venueId));
   }
 
   @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
   @Post('venues/:venueId/courts')
   createCourt(
     @CurrentUser() user: AuthUser,
@@ -108,6 +182,7 @@ export class OwnerController {
   }
 
   @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
   @Patch('courts/:id')
   updateCourt(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: UpdateCourtDto) {
     return this.owner.updateCourt(user, id, dto);
@@ -115,47 +190,120 @@ export class OwnerController {
 
   // ---------------------------------------------------------------- blocks
   @RequireAnyPerm('blocks.manage', 'schedule.manage')
+  @ApiTags('owner · calendar blocks')
   @Get('venues/:venueId/blocks')
-  blocks(
+  async blocks(
     @CurrentUser() user: AuthUser,
     @Param('venueId') venueId: string,
     @Query('date') date?: string,
   ) {
-    return this.owner.blocks(user, venueId, date);
+    return wrapList(await this.owner.blocks(user, venueId, date));
   }
 
   @RequireAnyPerm('blocks.manage', 'schedule.manage')
+  @ApiTags('owner · calendar blocks')
   @Post('blocks')
   createBlock(@CurrentUser() user: AuthUser, @Body() dto: CreateBlockDto) {
     return this.owner.createBlock(user, dto);
   }
 
   @RequireAnyPerm('blocks.manage', 'schedule.manage')
+  @ApiTags('owner · calendar blocks')
   @Delete('blocks/:id')
   deleteBlock(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.deleteBlock(user, id);
   }
 
+  // ------------------------------------------------- availability manager
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Get('courts/:courtId/availability')
+  courtAvailability(@CurrentUser() user: AuthUser, @Param('courtId') courtId: string) {
+    return this.owner.courtAvailabilityRules(user, courtId);
+  }
+
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Put('courts/:courtId/weekly-hours')
+  setWeeklyHours(
+    @CurrentUser() user: AuthUser,
+    @Param('courtId') courtId: string,
+    @Body() dto: SetWeeklyHoursDto,
+  ) {
+    return this.owner.setWeeklyHours(user, courtId, dto);
+  }
+
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Post('courts/:courtId/recurring-blocks')
+  createRecurringBlock(
+    @CurrentUser() user: AuthUser,
+    @Param('courtId') courtId: string,
+    @Body() dto: CreateRecurringBlockDto,
+  ) {
+    return this.owner.createRecurringBlock(user, courtId, dto);
+  }
+
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Post('courts/:courtId/price-windows')
+  createPriceWindow(
+    @CurrentUser() user: AuthUser,
+    @Param('courtId') courtId: string,
+    @Body() dto: CreatePriceWindowDto,
+  ) {
+    return this.owner.createPriceWindow(user, courtId, dto);
+  }
+
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Delete('price-windows/:id')
+  deletePriceWindow(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.deletePriceWindow(user, id);
+  }
+
+  @RequirePerm('courts.manage')
+  @ApiTags('owner · venues & courts')
+  @Delete('recurring-blocks/:id')
+  deleteRecurringBlock(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.deleteRecurringBlock(user, id);
+  }
+
+  @RequireAnyPerm('blocks.manage', 'schedule.manage')
+  @ApiTags('owner · calendar blocks')
+  @Post('venues/:venueId/closures')
+  createClosure(
+    @CurrentUser() user: AuthUser,
+    @Param('venueId') venueId: string,
+    @Body() dto: CreateClosureDto,
+  ) {
+    return this.owner.createClosure(user, venueId, dto);
+  }
+
   // --------------------------------------------------------------- bookings
   @RequireAnyPerm('bookings.manage', 'bookings.review')
+  @ApiTags('owner · bookings')
   @Get('bookings')
   bookings(@CurrentUser() user: AuthUser, @Query() query: BookingsQueryDto) {
     return this.owner.bookings(user, query);
   }
 
   @RequirePerm('bookings.review')
+  @ApiTags('owner · bookings')
   @Patch('bookings/:id/accept')
   accept(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.acceptBooking(user, id);
   }
 
   @RequirePerm('bookings.review')
+  @ApiTags('owner · bookings')
   @Patch('bookings/:id/reject')
   reject(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: RejectDto) {
     return this.owner.rejectBooking(user, id, dto.reason);
   }
 
   @RequirePerm('bookings.review')
+  @ApiTags('owner · bookings')
   @Post('bookings/recurring/:recurrenceId/accept')
   acceptSeries(
     @CurrentUser() user: AuthUser,
@@ -166,30 +314,35 @@ export class OwnerController {
   }
 
   @RequirePerm('bookings.manage')
+  @ApiTags('owner · bookings')
   @Patch('bookings/:id/cancel')
   cancel(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.cancelBooking(user, id);
   }
 
   @RequirePerm('bookings.manage')
+  @ApiTags('owner · bookings')
   @Post('bookings/walk-in')
   walkIn(@CurrentUser() user: AuthUser, @Body() dto: WalkInDto) {
     return this.owner.walkIn(user, dto);
   }
 
   @RequirePerm('bookings.manage')
+  @ApiTags('owner · bookings')
   @Post('bookings/check-in-scan')
   checkInScan(@CurrentUser() user: AuthUser, @Body() dto: CheckInScanDto) {
     return this.owner.checkInScan(user, dto.venueId, dto.code);
   }
 
   @RequirePerm('bookings.manage')
+  @ApiTags('owner · bookings')
   @Patch('bookings/:id/check-in')
   checkIn(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.checkIn(user, id);
   }
 
   @RequirePerm('bookings.manage')
+  @ApiTags('owner · bookings')
   @Patch('bookings/:id/no-show')
   noShow(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.markNoShow(user, id);
@@ -197,36 +350,112 @@ export class OwnerController {
 
   // ------------------------------------------------------------- reschedules
   @RequireAnyPerm('bookings.manage', 'bookings.review')
+  @ApiTags('owner · reschedules')
   @Get('reschedules')
-  reschedules(@CurrentUser() user: AuthUser, @Query('status') status?: string) {
-    return this.owner.reschedules(user, status);
+  reschedules(
+    @CurrentUser() user: AuthUser,
+    @Query('status') status?: string,
+    @Query() query?: CursorQueryDto,
+  ) {
+    return this.owner.reschedules(user, status, query?.cursor, query?.limit);
   }
 
   @RequirePerm('bookings.review')
+  @ApiTags('owner · reschedules')
   @Patch('reschedules/:id/accept')
   acceptReschedule(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.acceptReschedule(user, id);
   }
 
   @RequirePerm('bookings.review')
+  @ApiTags('owner · reschedules')
   @Patch('reschedules/:id/reject')
   rejectReschedule(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: RejectDto) {
     return this.owner.rejectReschedule(user, id, dto.reason);
   }
 
+  // ------------------------------------------------------------ own promos
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · promos')
+  @Get('promos')
+  async listMyPromos(@CurrentUser() user: AuthUser) {
+    return wrapList(await this.owner.listMyPromos(user));
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · promos')
+  @Post('promos')
+  createMyPromo(@CurrentUser() user: AuthUser, @Body() dto: CreateMyPromoDto) {
+    return this.owner.createMyPromo(user, dto);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · promos')
+  @Patch('promos/:id')
+  updateMyPromo(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: UpdateMyPromoDto,
+  ) {
+    return this.owner.updateMyPromo(user, id, dto);
+  }
+
+  @RequirePerm('venues.manage')
+  @ApiTags('owner · promos')
+  @Delete('promos/:id')
+  deleteMyPromo(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.deleteMyPromo(user, id);
+  }
+
+  // ------------------------------------------------------------- own roles
+  @RequirePerm('staff.manage')
+  @ApiTags('owner · roles')
+  @Get('roles')
+  listMyRoles(@CurrentUser() user: AuthUser) {
+    return this.owner.listMyRoles(user);
+  }
+
+  @RequirePerm('staff.manage')
+  @ApiTags('owner · roles')
+  @Post('roles')
+  createMyRole(@CurrentUser() user: AuthUser, @Body() dto: CreateMyRoleDto) {
+    return this.owner.createMyRole(user, dto);
+  }
+
+  @RequirePerm('staff.manage')
+  @ApiTags('owner · roles')
+  @Patch('roles/:id')
+  updateMyRole(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: UpdateMyRoleDto,
+  ) {
+    return this.owner.updateMyRole(user, id, dto);
+  }
+
+  @RequirePerm('staff.manage')
+  @ApiTags('owner · roles')
+  @Delete('roles/:id')
+  deleteMyRole(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.owner.deleteMyRole(user, id);
+  }
+
   // ------------------------------------------------------------------ staff
+  @ApiTags('owner · staff')
   @Get('venues/:venueId/allowed-roles')
-  allowedRoles(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
-    return this.owner.allowedRoles(user, venueId);
+  async allowedRoles(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
+    return wrapList(await this.owner.allowedRoles(user, venueId));
   }
 
   @RequirePerm('staff.manage')
+  @ApiTags('owner · staff')
   @Get('venues/:venueId/staff')
-  staffList(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
-    return this.owner.staffList(user, venueId);
+  async staffList(@CurrentUser() user: AuthUser, @Param('venueId') venueId: string) {
+    return wrapList(await this.owner.staffList(user, venueId));
   }
 
   @RequirePerm('staff.manage')
+  @ApiTags('owner · staff')
   @Post('venues/:venueId/staff')
   createStaff(
     @CurrentUser() user: AuthUser,
@@ -237,26 +466,49 @@ export class OwnerController {
   }
 
   @RequirePerm('staff.manage')
+  @ApiTags('owner · staff')
   @Delete('staff/:id')
   removeStaff(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     return this.owner.removeStaff(user, id);
   }
 
+  @RequirePerm('staff.manage')
+  @ApiTags('owner · staff')
+  @Post('staff/:id/reset-password')
+  resetStaffPassword(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: ResetPasswordDto,
+  ) {
+    return this.owner.resetStaffPassword(user, id, dto.newPassword);
+  }
+
   // --------------------------------------------------------------- customers
   @RequirePerm('customers.read')
+  @ApiTags('owner · customers')
   @Get('customers')
-  customers(@CurrentUser() user: AuthUser, @Query('venueId') venueId?: string) {
-    return this.owner.customers(user, venueId);
+  customers(
+    @CurrentUser() user: AuthUser,
+    @Query('venueId') venueId?: string,
+    @Query() query?: OffsetQueryDto,
+  ) {
+    return this.owner.customers(user, venueId, query?.page ?? 1, query?.limit);
   }
 
   // ---------------------------------------------------------------- reviews
   @RequirePerm('reviews.reply')
+  @ApiTags('owner · reviews')
   @Get('reviews')
-  reviews(@CurrentUser() user: AuthUser, @Query('venueId') venueId?: string) {
-    return this.owner.reviews(user, venueId);
+  reviews(
+    @CurrentUser() user: AuthUser,
+    @Query('venueId') venueId?: string,
+    @Query() query?: CursorQueryDto,
+  ) {
+    return this.owner.reviews(user, venueId, query?.cursor, query?.limit);
   }
 
   @RequirePerm('reviews.reply')
+  @ApiTags('owner · reviews')
   @Post('reviews/:id/reply')
   replyReview(@CurrentUser() user: AuthUser, @Param('id') id: string, @Body() dto: ReplyReviewDto) {
     return this.owner.replyReview(user, id, dto.reply);

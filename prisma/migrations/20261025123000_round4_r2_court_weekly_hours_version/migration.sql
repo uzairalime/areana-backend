@@ -1,0 +1,14 @@
+-- Round 4, Round 2 (O-S1): optimistic concurrency for weekly hours.
+-- Court.weeklyHoursVersion bumps on every setWeeklyHours save; a save
+-- carrying a stale expectedVersion is rejected with 409 instead of
+-- silently overwriting a newer template edited in another tab.
+--
+-- R-S12 dedupe pre-checks (run BEFORE applying; the new unique index
+-- in 20261025123100 fails if duplicates exist):
+--   Duplicate system role names (case-insensitive):
+--   SELECT name, COUNT(*) FROM "Role" WHERE "ownerId" IS NULL GROUP BY name HAVING COUNT(*) > 1;
+--   (case-insensitive variant for the new lower(name) index):
+--   SELECT lower("name"), COUNT(*) FROM "Role" WHERE "ownerId" IS NULL GROUP BY lower("name") HAVING COUNT(*) > 1;
+--   Duplicate court names within one venue (case-insensitive):
+--   SELECT "venueId", lower("name"), COUNT(*) FROM "Court" GROUP BY 1, 2 HAVING COUNT(*) > 1;
+ALTER TABLE "Court" ADD COLUMN IF NOT EXISTS "weeklyHoursVersion" INTEGER NOT NULL DEFAULT 0;

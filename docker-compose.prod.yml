@@ -1,0 +1,146 @@
+# Production Compose (Round 4, P-S14; Round 5, R2) — versioned in the repo.
+#
+# The dev docker-compose.yml (db + mailpit only) is NOT a production
+# file: the old "real prod Compose" was unversioned, had no api
+# service, no healthchecks and no depends_on, so an API starting before
+# Postgres was ready failed `migrate deploy` and stayed down. This
+# file is the production shape: api + db with healthchecks, the api
+# gated on a HEALTHY db, and restart policies on everything.
+#
+# First install on an EMPTY database is NOT `migrate deploy` (the
+# migrations folder is not a full baseline — see docs/DEPLOY.md §1):
+# run `npx prisma db push` once, verify + resolve the hand-written
+# migrations, and only then let this Compose file's CMD run deploy.
+#
+# Required env (via environment below — note the precedence rule in
+# docs/DEPLOY.md §6: this file declares NO env_file:, so the project
+# .env only feeds interpolation of the listed environment: entries; a
+# value set under environment: wins over any .env edit):
+#   DATABASE_URL, JWT_ACCESS_SECRET, JWT_REFRESH_SECRET,
+#   SMTP_HOST (real host — never localhost in prod), CORS_ORIGIN
+#   (explicit origins, never *), TRUST_PROXY=1, TZ=Asia/Karachi.
+#
+# DATABASE_URL MUST point at the Compose `db` service (host `db`,
+# with the POSTGRES_USER / POSTGRES_DB credentials below). Nothing
+# validates this: a localhost:5432 (or stale-host) URL runs migrate
+# deploy and the app against the wrong database while the
+# healthcheck gate (which only waits on the local `db`) passes.
+#
+# Healthcheck failure does NOT restart the container: Docker marks a
+# container unhealthy but never restarts it on health failure, so a
+# pool-wedged API (health 503) stays up indefinitely unless something
+# external acts — run a watchdog or alerting on /api/health. Likewise
+# a failed migration restart-loops (CMD exits non-zero, unless-stopped
+# restarts it, deploy fails again on the failed _prisma_migrations
+# row) until someone runs `migrate resolve` manually (DEPLOY §4) —
+# alert on repeated migrate failures, do not let the loop run silent.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-areana}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-areana}
+      TZ: Asia/Karachi
+    volumes:
+      # Round 5, D5-S44: deliberately NOT `pgdata` — dev and prod
+      # Compose files in one directory share the default project
+      # name and therefore the same named volume, so a dev-
+      # initialised volume used to leak into prod (POSTGRES_PASSWORD
+      # ignored on an existing volume → prod password fails auth,
+      # dev/demo data appears in prod). An existing prod install on
+      # `pgdata` must move its data deliberately, never just rename
+      # and boot empty.
+      - pgdata_prod:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready is the readiness signal depends_on waits on. NOTE:
+      # changing TZ here does NOT change an existing cluster's
+      # timezone (baked at initdb) — see docs/DEPLOY.md §6.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-areana} -d ${POSTGRES_DB:-areana}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  api:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      TZ: Asia/Karachi
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      PORT: "3000"
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?JWT_ACCESS_SECRET is required}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?JWT_REFRESH_SECRET is required}
+      CORS_ORIGIN: ${CORS_ORIGIN:?CORS_ORIGIN must list explicit origins in production}
+      SMTP_HOST: ${SMTP_HOST:?SMTP_HOST must be a real host in production}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-Areana <no-reply@areana.pk>}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      # Round 5, D5-S42: ADMIN_EMAIL alone seeds nothing (the admin
+      # block requires both email and password) — pass the password
+      # via secret, and the seed now warns when it is missing.
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      FCM_ENABLED: ${FCM_ENABLED:-false}
+      FCM_SERVICE_ACCOUNT: ${FCM_SERVICE_ACCOUNT:-}
+      STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+      # Round 5, D5-S42: required whenever STORAGE_DRIVER=s3 (the
+      # boot guard fails/warns when the set is incomplete) — setting
+      # STORAGE_DRIVER=s3 without these used to boot fine and fail
+      # only at first upload.
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+      STORAGE_DIR: ./uploads
+    ports:
+      - "3000:3000"
+    volumes:
+      - uploads:/app/uploads
+    healthcheck:
+      # /api/health returns 503 when the DB is down (Round 4, P-S16),
+      # so this gate can actually fail — a 200-only check could not.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    # The Dockerfile CMD runs `prisma migrate deploy && node dist/main`.
+    # On a fresh DB that is NOT the install path (see header note).
+
+  # Panels (owner + admin). NEXT_PUBLIC_* is baked at build time, so
+  # these args come from the project .env and changing one later
+  # means rebuilding this image, not just restarting.
+  panels:
+    build:
+      context: ../areana-web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL is required}
+        NEXT_PUBLIC_PLAYER_URL: ${NEXT_PUBLIC_PLAYER_URL:-}
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+
+  # Player web. Same build-time NEXT_PUBLIC_* rule as panels.
+  player:
+    build:
+      context: ../areana-user-web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:?NEXT_PUBLIC_API_URL is required}
+        NEXT_PUBLIC_PANELS_URL: ${NEXT_PUBLIC_PANELS_URL:-}
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL:-}
+        NEXT_PUBLIC_GOOGLE_PLACES_API_KEY: ${NEXT_PUBLIC_GOOGLE_PLACES_API_KEY:-}
+    restart: unless-stopped
+    ports:
+      - "3002:3002"
+
+volumes:
+  pgdata_prod:
+  uploads:

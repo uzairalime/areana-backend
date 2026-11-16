@@ -1,0 +1,14 @@
+-- Round 4, Round 2 (R-S10): system role names must be unique
+-- case-insensitively. The existing Role_system_name_key index
+-- (20261025034800) is case-sensitive, so "Manager" and "manager" could
+-- both exist as system roles and confuse name-based lookups. This
+-- partial unique index on lower(name) WHERE ownerId IS NULL is the
+-- backstop; createRole's case-insensitive pre-check + P2002 mapping
+-- surface it as a clean 409.
+--
+-- R-S12 dedupe pre-checks (run BEFORE applying; this index FAILS if
+-- case-insensitive duplicate system role names already exist):
+--   SELECT lower("name"), COUNT(*) FROM "Role" WHERE "ownerId" IS NULL GROUP BY lower("name") HAVING COUNT(*) > 1;
+--   Duplicate court names within one venue (case-insensitive):
+--   SELECT "venueId", lower("name"), COUNT(*) FROM "Court" GROUP BY 1, 2 HAVING COUNT(*) > 1;
+CREATE UNIQUE INDEX IF NOT EXISTS "Role_system_name_ci_key" ON "Role"((lower("name"))) WHERE "ownerId" IS NULL;

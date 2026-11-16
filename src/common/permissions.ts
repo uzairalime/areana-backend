@@ -21,11 +21,35 @@ export const PERMISSIONS = {
   'customers.read': 'View customer list',
   'staff.manage': 'Create and manage team logins',
   'reviews.reply': 'Reply to reviews',
+  // Billing and revenue figures (owner Billing page + the revenue
+  // lines of the owner dashboard). Staff without this key still see
+  // bookings and occupancy, just not money.
+  'billing.view': 'View billing and revenue',
+  // platform operations
+  'venues.onboard': 'Onboard arenas from the admin panel (create owner, venue and courts) and view all venues',
   // super admin (wildcard)
   '*': 'All permissions',
 } as const;
 
 export type PermissionKey = keyof typeof PERMISSIONS;
+
+/**
+ * Permissions an arena owner may grant through roles they create for
+ * their own team (Manager, Salesperson, …). Arena-scope only — platform
+ * keys and '*' are never owner-grantable.
+ */
+export const ARENA_ROLE_PERMISSIONS = [
+  'venues.manage',
+  'courts.manage',
+  'bookings.review',
+  'bookings.manage',
+  'blocks.manage',
+  'schedule.manage',
+  'customers.read',
+  'staff.manage',
+  'reviews.reply',
+  'billing.view',
+] as const;
 
 export const PERMISSION_LIST = Object.entries(PERMISSIONS).map(([key, description]) => ({
   key,

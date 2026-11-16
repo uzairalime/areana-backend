@@ -5,12 +5,23 @@ Everything a player sees before booking. All read endpoints here are **public**.
 ## Venues
 
 ### `GET /venues` — public
-Only `approved` venues. Filters: `q` (name/address), `city`, `sport`.
+Only venues passing the **visibility filter**: `approved`, not archived,
+not `billingPaused`, `moderationStatus: 'none'`, owner `active`, with ≥ 1
+active + approved court, and not live-overdue. Filters: `q` (name/address),
+`city`, `sport`, `surface` (matches an active court), `sort` (`rating`
+default | `price_asc` | `price_desc` | `name` | `distance`), `lat` + `lng`
+(must be sent together). Listings are an `OffsetPage`
+(`{ items, total, page, limit, totalPages, hasMore }`), and when `lat`+`lng`
+are sent every row also carries `distanceKm` (1-decimal, null without
+coordinates). `sort=distance` is pure nearest-first — featured venues do
+NOT float first under it, and venues without coordinates sort last
+(distance sort pages in memory, 500-row cap). A lone `lat` or `lng` is a
+400.
 ```json
 // GET /venues?city=Lahore&sport=Football&page=1&limit=20
 {
-  "total": 8, "page": 1, "limit": 20,
-  "data": [
+  "total": 8, "page": 1, "limit": 20, "totalPages": 1, "hasMore": false,
+  "items": [
     {
       "id": "cm3x...", "name": "Champions Turf", "address": "DHA Phase 5",
       "city": "Lahore", "lat": 31.46, "lng": 74.39,
@@ -25,14 +36,24 @@ Only `approved` venues. Filters: `q` (name/address), `city`, `sport`.
 ```
 
 ### `GET /venues/:id` — public
-Full detail: venue + its active courts (cheapest first) + badges.
-`404` if the venue isn't approved.
+Full detail: venue + its active + approved courts (cheapest first) +
+badges. `404` unless the venue passes the visibility filter above.
 
 ## Courts
 
 ### `GET /venues/:venueId/courts` — public
-Active courts of an approved venue: `id, name, sport, size ("7v7"),
-surface, indoor, pricePerHour, openMinutes, closeMinutes, slotMinutes`.
+Active + approved courts of a visible venue: `id, name, sport, size
+("7v7"), surface, indoor, pricePerHour, openMinutes, closeMinutes,
+slotMinutes`.
+
+### `GET /courts` — public
+Courts as a first-class listing (the player app's Courts tab). Filters:
+`q`, `city`, `sport`, `surface`, `sort` (`price_asc` default |
+`price_desc` | `distance` | `name` — courts have no rating, so there is
+no `rating` sort), `lat` + `lng`. `OffsetPage`; distance behaves exactly
+like the venues list. Owner courts start `pending` and are invisible /
+unbookable until an admin approves them (rejected courts re-queue on
+edit), so only approved courts ever appear here.
 
 ## Availability engine
 
@@ -45,18 +66,26 @@ The server-side source of truth. Slots are **computed per request**, never store
   "courtId": "cm3x...", "venueId": "cm3y...", "date": "2026-10-08",
   "currency": "PKR", "slotMinutes": 60,
   "slots": [
-    { "startMinutes": 360, "endMinutes": 420, "available": false, "price": 2500 },
-    { "startMinutes": 1080, "endMinutes": 1140, "available": true, "price": 2500 }
+    { "startMinutes": 360, "endMinutes": 420, "available": false, "price": 2500, "reason": "booked" },
+    { "startMinutes": 1080, "endMinutes": 1140, "available": true, "price": 2500, "peak": true }
   ]
 }
 ```
 A slot is `available: false` when it overlaps a `pending`/`confirmed` booking
 or an owner slot block, is in the past, is sooner than the venue's
-`minAdvanceMinutes`, or the date is beyond `maxAdvanceDays`.
+`minAdvanceMinutes`, or the date is beyond `maxAdvanceDays`. `reason` is
+one of `booked|past|too_late|not_open_yet|blocked|available`; `peak` marks
+a price-window rate above base, `deal` a rate below base.
 
 **Model note.** Courts carry `openMinutes`/`closeMinutes` (default 6 AM–11 PM),
-`slotMinutes` (default 60), and `pricePerHour`. `slot_blocks` carve out
-maintenance/private time. Nothing else is needed — no stored slot rows.
+`slotMinutes` (default 60), and `pricePerHour` — but those are the fallback.
+The availability manager feeds the engine: per-weekday windows
+(`CourtWeeklyWindow`, split shifts; a court with a template is closed on
+weekdays with no row), recurring blocks (`RecurringBlock`), full-day
+closures, and price windows (`CourtPriceWindow` — a slot is priced by the
+window covering its start, else base; overnight courts supported, max
+20h/day). `slot_blocks` carve out maintenance/private time. Slots are
+computed per request, never stored; prices snapshot onto the booking.
 
 ## Slot search
 
@@ -81,7 +110,9 @@ Availability-first discovery: *"football tonight near DHA"*.
 }
 ```
 Only courts with ≥1 free slot are returned (max 50 venues scanned), sorted by
-most availability first.
+most availability first. Courts that fail validation are skipped, not
+fatal. Known gap: slot search has no live-overdue guard, so one
+live-overdue venue fails the entire request instead of being dropped.
 
 ## Banners & deep links
 

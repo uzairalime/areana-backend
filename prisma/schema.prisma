@@ -39,21 +39,37 @@ enum BookingStatus {
 
 model Role {
   id          String    @id @default(cuid())
-  name        String    @unique
+  // No longer globally unique: an owner-created role only needs a unique
+  // name within that owner's roles (@@unique below); system role names
+  // are kept unique by the partial index in migration
+  // 20261025034800_system_role_name_unique (name WHERE ownerId IS NULL)
+  // plus the createRole pre-check + P2002 mapping — Postgres treats
+  // NULLs as distinct in @@unique, so the index is the real backstop.
+  name        String
   scope       RoleScope @default(arena)
   description String?
   permissions String[] // permission keys, e.g. "bookings.approve"
   isSystem    Boolean   @default(false)
+  /// Set when an arena owner created this role for their own team. Null =
+  /// a platform role managed by the super admin.
+  ownerId     String?
+  owner       User?     @relation("RoleOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  /// Super admin can disable an owner-created role; its permissions stop
+  /// applying to everyone holding it.
+  isActive    Boolean   @default(true)
   createdAt   DateTime  @default(now())
 
   users        User[]
   venueAllowed VenueAllowedRole[]
+
+  @@unique([ownerId, name])
 }
 
 model User {
   id           String     @id @default(cuid())
   email        String     @unique
   name         String?
+  avatarUrl    String?
   phone        String?
   city         String?
   passwordHash String? // staff only (owner/staff/super_admin). Players are OTP-only.
@@ -61,7 +77,11 @@ model User {
   role         Role       @relation(fields: [roleId], references: [id])
   referralCode String?    @unique
   noShowCount  Int        @default(0)
+  /// Reason given when a pending signup is rejected (admin reject flow).
+  /// Cleared when the account is approved/reactivated.
+  rejectionReason String?
   status       UserStatus @default(active)
+  deletedAt    DateTime?
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
 
@@ -71,16 +91,24 @@ model User {
   reviews           Review[]
   gamePosts         GamePost[]
   deviceTokens      DeviceToken[]
+  notifications     Notification[]
+  waitlistEntries   SlotWaitlist[]
   promoRedemptions  PromoRedemption[]
   staffVenues       VenueStaff[]
   suggestions       VenueSuggestion[]
   auditLogs         AuditLog[]       @relation("ActorLogs")
   disputesRaised    Dispute[]        @relation("RaisedDisputes")
+  venueReportsRaised   VenueReport[]    @relation("RaisedVenueReports")
+  venueReportsResolved VenueReport[]    @relation("ResolvedVenueReports")
   disputesResolved  Dispute[]        @relation("ResolvedDisputes")
   grantedBadges     VenueBadge[]
   curatedPosts      GamePost[]       @relation("CuratedPosts")
   referralsMade     Referral[]       @relation("Referrer")
   referralsReceived Referral[]       @relation("Referee")
+  refreshSessions RefreshSession[]
+  rolesOwned      Role[]           @relation("RoleOwner")
+  venuePayments   VenuePayment[]   @relation("PaymentRecordedBy")
+
 }
 
 model OtpCode {
@@ -90,9 +118,29 @@ model OtpCode {
   expiresAt  DateTime
   attempts   Int       @default(0)
   consumedAt DateTime?
+  ip         String?
   createdAt  DateTime  @default(now())
 
   @@index([email])
+  @@index([ip])
+}
+
+/** Server-side refresh-token sessions: rotation + reuse detection. */
+model RefreshSession {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  // Round 5, P5-S7: set ONLY when this session was revoked by a
+  // rotation, pointing at the successor session. Lets a lost-response
+  // retry prove it is a retry of the same rotation (grace window)
+  // instead of theft. Logout revocations leave this null.
+  replacedById String?
+
+  @@index([userId])
 }
 
 model DeviceToken {
@@ -114,16 +162,76 @@ model Venue {
   name              String
   address           String
   city              String
+  /// Public contact number players can call (directions, running late).
+  phone             String?
   lat               Float?
   lng               Float?
   sports            String[]
   amenities         String[]
   images            String[]
+  /// Rich photo entries [{ url, blurhash, width, height }] kept in
+  /// lockstep with `images` (plain URLs, legacy consumers). Additive —
+  /// no destructive column change; new uploads populate both.
+  photos            Json                @default("[]")
   rating            Float       @default(0)
   ratingCount       Int         @default(0)
   autoAccept        Boolean     @default(false)
   minAdvanceMinutes Int         @default(120)
   maxAdvanceDays    Int         @default(14)
+  archivedAt        DateTime?
+  /// Subscription plan (Basic / Normal / Premium / a specialized custom
+  /// plan). Null = the platform default plan applies.
+  planId            String?
+  plan              Plan?     @relation(fields: [planId], references: [id])
+  /// Billing clock: starts at first approval. Free until anchor +
+  /// plan.freeMonths (or freeUntilOverride); then yearly periods.
+  billingStartAt    DateTime?
+  billingPaidUntil  DateTime?
+  freeUntilOverride DateTime?
+  /// Round 5, R5-S4: the override value before the most recent
+  /// extend-free, so a void rewind can restore the pre-extension state
+  /// instead of collapsing the whole extension to the period start.
+  freeUntilOverridePrev DateTime?
+  /// Materialized by the nightly billing sweep: an overdue venue is
+  /// paused on public surfaces exactly like a suspended owner's venue.
+  billingPaused     Boolean   @default(false)
+  billingDueNotifiedFor DateTime?
+  /// Frozen current paid period (plan changes must not re-anchor it):
+  /// set when a plan changes without restart, from the period in effect
+  /// at that moment. Period boundaries then walk forward from this
+  /// anchor instead of being recomputed from the new plan's freeMonths.
+  billingPeriodStart DateTime?
+  billingPeriodEnd   DateTime?
+  /// Yearly price locked for the frozen period above; the new plan's
+  /// price applies from the next period, not retroactively.
+  billingPeriodPrice Int?
+  /// Plan whose features/caps apply inside the frozen period above
+  /// (a plan change without restart must not switch features early).
+  /// Null = the venue's current plan applies. Cleared on restart and
+  /// on free-extension (both re-derive periods).
+  frozenPlanId String?
+  frozenPlan   Plan?    @relation("VenueFrozenPlan", fields: [frozenPlanId], references: [id], onDelete: SetNull)
+  /// Admin user who onboarded this venue (null for legacy rows and
+  /// owner-created venues). Delegated venues.onboard operators may
+  /// mutate images only on venues they created.
+  createdById String?
+  /// Per-arena court cap set by the super admin. Null = the plan's
+  /// maxCourts applies. Overrides the plan when set.
+  courtLimitOverride Int?
+  /// Per-arena team-seat cap set by the super admin. Null = the plan's
+  /// maxStaff applies. Setting it also grants staff seats even when the
+  /// plan lacks the staff_accounts feature (explicit admin grant).
+  staffLimitOverride Int?
+  /// Super-admin moderation: none | paused | blocked | disabled. Any
+  /// non-'none' state hides the venue from players everywhere (same
+  /// plumbing as billingPaused); the reason is shown to the owner.
+  moderationStatus  String    @default("none")
+  moderationReason  String?
+  /// Reason given when a pending submission is rejected (admin reject
+  /// flow). Cleared when the venue is requeued or resubmitted.
+  rejectionReason   String?
+  moderatedAt       DateTime?
+  moderatedById     String?
   status            VenueStatus @default(draft)
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
@@ -133,6 +241,10 @@ model Venue {
   reviews      Review[]
   favorites    Favorite[]
   staff        VenueStaff[]
+  events       VenueEvent[]
+  reports   VenueReport[]
+  payments     VenuePayment[]
+  promos       PromoCode[]
   allowedRoles VenueAllowedRole[]
   badges       VenueBadge[]
   gamePosts    GamePost[]
@@ -174,14 +286,88 @@ model Court {
   openMinutes  Int      @default(360) // 6:00 AM, minutes since midnight
   closeMinutes Int      @default(1380) // 11:00 PM
   slotMinutes  Int      @default(60)
+  /// Optimistic-concurrency version for the weekly-hours template
+  /// (Round 4, O-S1): every setWeeklyHours save bumps it, so a stale
+  /// draft (two tabs editing) is rejected with 409 instead of
+  /// silently overwriting the newer template.
+  weeklyHoursVersion Int @default(0)
   isActive     Boolean  @default(true)
+  /// Super-admin approval for owner-created courts: approved | pending |
+  /// rejected. Existing and admin-created courts are approved; a pending
+  /// court is invisible to players and cannot be booked.
+  status       String   @default("approved")
+  /// Reason given when the court is rejected (admin reject flow).
+  /// Cleared when the court goes back into the review queue.
+  rejectionReason String?
+  /// Per-court photo entries [{ url, blurhash, width, height }] —
+  /// managed by owners/admins, shown on the venue page under the
+  /// court's tab. (Venues keep their own gallery + sport tags.)
+  photos       Json     @default("[]")
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  slotBlocks SlotBlock[]
-  bookings   Booking[]
+  slotBlocks     SlotBlock[]
+  events         VenueEvent[]
+  weeklyWindows  CourtWeeklyWindow[]
+  recurringBlocks RecurringBlock[]
+  priceWindows   CourtPriceWindow[]
+  bookings       Booking[]
+  waitlistEntries SlotWaitlist[]
 
   @@index([venueId])
+}
+
+/// One row per open window of a weekday — multiple rows per weekday mean
+/// split shifts (e.g. 06:00–11:00 and 16:00–23:00). A court with NO rows
+/// at all falls back to its openMinutes/closeMinutes for every day; a
+/// court WITH rows is closed on weekdays that have no row.
+model CourtWeeklyWindow {
+  id           String   @id @default(cuid())
+  courtId      String
+  court        Court    @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  weekday      Int // 0 = Sunday … 6 = Saturday (JS getDay)
+  startMinutes Int
+  endMinutes   Int
+  createdAt    DateTime @default(now())
+
+  @@index([courtId, weekday])
+}
+
+/// A block that repeats on the given weekdays, optionally bounded by a
+/// date range (e.g. every Friday 12:30–14:30, or a Ramadan schedule for
+/// one month). One-off date blocks stay in SlotBlock.
+model RecurringBlock {
+  id           String    @id @default(cuid())
+  courtId      String
+  court        Court     @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  weekdays     Int[] // 0 = Sunday … 6 = Saturday
+  startMinutes Int
+  endMinutes   Int
+  reason       String?
+  startsOn     DateTime? @db.Date
+  endsOn       DateTime? @db.Date
+  createdAt    DateTime  @default(now())
+
+  @@index([courtId])
+}
+
+/// A peak/off-peak rate window: on the given weekdays, slots starting
+/// inside [startMinutes, endMinutes) price at pricePerHour instead of
+/// the court's base rate. Optional date range for seasonal rates.
+/// Windows must not overlap each other for the same slot.
+model CourtPriceWindow {
+  id           String    @id @default(cuid())
+  courtId      String
+  court        Court     @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  weekdays     Int[] // 0 = Sunday … 6 = Saturday
+  startMinutes Int
+  endMinutes   Int
+  pricePerHour Decimal   @db.Decimal(10, 2)
+  startsOn     DateTime? @db.Date
+  endsOn       DateTime? @db.Date
+  createdAt    DateTime  @default(now())
+
+  @@index([courtId])
 }
 
 model SlotBlock {
@@ -215,7 +401,10 @@ model Booking {
   totalPrice     Decimal       @db.Decimal(10, 2)
   discountAmount Decimal       @default(0) @db.Decimal(10, 2)
   promoCodeId    String?
-  promoCode      PromoCode?    @relation(fields: [promoCodeId], references: [id])
+  // SetNull: deleting a promo must not fail on (or orphan) bookings
+  // that referenced it — cancelled bookings keep promoCodeId while
+  // their redemption was refunded to usedCount 0.
+  promoCode      PromoCode?    @relation(fields: [promoCodeId], references: [id], onDelete: SetNull)
   status         BookingStatus @default(pending)
   shareCode      String?       @unique // group booking join link
   checkInCode    String        @unique // QR shown in app, scanned by venue
@@ -226,6 +415,7 @@ model Booking {
   updatedAt      DateTime      @updatedAt
 
   participants     BookingParticipant[]
+  gamePost         GamePost?
   reviews          Review[]
   reschedules      RescheduleRequest[]
   disputes         Dispute[]
@@ -244,6 +434,10 @@ model BookingParticipant {
   booking   Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   name      String
   phone     String?
+  /// Round 5, D5-S54: signed-in joiner identity (null for guest joins).
+  /// Phone dupes are guarded by a partial unique index (see migration
+  /// 20261025170000_round5_r3_schema); blank phones are stored as null.
+  userId    String?
   joinedAt  DateTime @default(now())
 
   @@index([bookingId])
@@ -256,7 +450,7 @@ model RescheduleRequest {
   requestedDate         DateTime @db.Date
   requestedStartMinutes Int
   requestedEndMinutes   Int
-  status                String   @default("pending") // pending | approved | rejected
+  status                String   @default("pending") // pending | approved | rejected | withdrawn
   reason                String?
   createdAt             DateTime @default(now())
   decidedAt             DateTime?
@@ -289,9 +483,34 @@ model Review {
   comment    String?
   ownerReply String?
   repliedAt  DateTime?
+  /// Round 5, R5 (review-reply history): every superseded owner reply
+  /// is appended here as { reply: string, repliedAt: string (ISO) }
+  /// BEFORE ownerReply/repliedAt are overwritten, so reply edits keep
+  /// a full audit trail. Empty array for reviews never edited.
+  ownerReplyHistory Json @default("[]")
   createdAt  DateTime  @default(now())
 
   @@index([venueId])
+}
+
+model SlotWaitlist {
+  id           String    @id @default(cuid())
+  userId       String
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  courtId      String
+  court        Court     @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  date         DateTime  @db.Date
+  startMinutes Int
+  /// Slot length (minutes) at wait time (Round 4: waitlist pings must
+  /// use the waited slot size, not the court's current one). NULL for
+  /// entries created before this field existed — those fall back to
+  /// the court's current slotMinutes at ping time.
+  slotMinutes  Int?
+  notifiedAt   DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@unique([userId, courtId, date, startMinutes])
+  @@index([courtId, date, startMinutes])
 }
 
 model GamePost {
@@ -305,8 +524,13 @@ model GamePost {
   date          DateTime  @db.Date
   startMinutes  Int
   playersNeeded Int
+  squadSize     Int?
+  level         String?
   note          String?
   status        String    @default("open") // open | full | closed
+  reminderSent  Boolean   @default(false)
+  bookingId     String?   @unique
+  booking       Booking?  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   isCurated     Boolean   @default(false)
   curatedById   String?
   curatedBy     User?     @relation("CuratedPosts", fields: [curatedById], references: [id])
@@ -324,6 +548,8 @@ model GameParticipant {
   userId   String?
   name     String
   phone    String?
+  /** pending = join requested, awaiting the host; joined = accepted. */
+  status   String   @default("joined")
   joinedAt DateTime @default(now())
 
   @@index([postId])
@@ -334,6 +560,11 @@ model GameParticipant {
 // ---------------------------------------------------------------------------
 model PromoCode {
   id           String    @id @default(cuid())
+  /// Null = a platform-wide promo (super admin). Set = an owner-managed
+  /// promo valid only at that venue.
+  venueId      String?
+  venue        Venue?    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  createdById  String?
   code         String    @unique
   kind         String // percent | flat
   value        Decimal   @db.Decimal(10, 2)
@@ -357,7 +588,9 @@ model PromoRedemption {
   userId      String
   user        User      @relation(fields: [userId], references: [id])
   bookingId   String?
-  booking     Booking?  @relation(fields: [bookingId], references: [id])
+  // SetNull (not the Prisma default): deleting a booking — e.g. with
+  // its court — must not fail on, or orphan, its promo redemptions.
+  booking     Booking?  @relation(fields: [bookingId], references: [id], onDelete: SetNull)
   createdAt   DateTime  @default(now())
 
   @@index([promoCodeId, userId])
@@ -401,8 +634,13 @@ model VenueBadge {
 
 model Dispute {
   id           String    @id @default(cuid())
-  bookingId    String
-  booking      Booking   @relation(fields: [bookingId], references: [id])
+  // Nullable because the relation is SetNull (Prisma requires the FK
+  // to be optional for SetNull). In practice a dispute always has a
+  // booking: court delete removes resolved / dismissed disputes
+  // explicitly and refuses open ones; this is a backstop for any
+  // future delete path that forgets.
+  bookingId    String?
+  booking      Booking?  @relation(fields: [bookingId], references: [id], onDelete: SetNull)
   raisedById   String
   raisedBy     User      @relation("RaisedDisputes", fields: [raisedById], references: [id])
   reason       String
@@ -412,7 +650,34 @@ model Dispute {
   resolvedBy   User?     @relation("ResolvedDisputes", fields: [resolvedById], references: [id])
   createdAt    DateTime  @default(now())
   resolvedAt   DateTime?
+  /// Race-safe open guard: set to the booking id while the dispute is
+  /// open, cleared on resolution. NULLs are distinct in Postgres, so
+  /// legacy rows (NULL) never collide with a new open dispute.
+  openKey      String?   @unique
 
+  @@index([status])
+}
+
+model VenueReport {
+  id           String    @id @default(cuid())
+  venueId      String
+  venue        Venue     @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  userId       String
+  user         User      @relation("RaisedVenueReports", fields: [userId], references: [id])
+  category     String // fake_listing | wrong_info | closed | misconduct | unsafe | other
+  details      String?
+  status       String    @default("open") // open | reviewed | actioned | dismissed
+  resolution   String?
+  resolvedById String?
+  resolvedBy   User?     @relation("ResolvedVenueReports", fields: [resolvedById], references: [id])
+  createdAt    DateTime  @default(now())
+  resolvedAt   DateTime?
+  /// Race-safe outstanding guard: set to "<venueId>:<userId>" while the
+  /// report is open or reviewed, cleared once actioned/dismissed.
+  /// NULLs are distinct in Postgres, so legacy rows never collide.
+  openKey      String?   @unique
+
+  @@index([venueId, status])
   @@index([status])
 }
 
@@ -420,6 +685,7 @@ model Banner {
   id        String    @id @default(cuid())
   title     String
   imageUrl  String
+  blurhash  String?
   linkUrl   String?
   city      String?
   isActive  Boolean   @default(true)
@@ -442,18 +708,193 @@ model VenueSuggestion {
 
 model AuditLog {
   id        String   @id @default(cuid())
-  actorId   String
-  actor     User     @relation("ActorLogs", fields: [actorId], references: [id])
+  /// Null = system / automated action (e.g. the nightly billing sweep).
+  /// The panel renders a null actor as "System / automated".
+  actorId   String?
+  actor     User?    @relation("ActorLogs", fields: [actorId], references: [id])
   action    String
   entity    String
   entityId  String
+  /// Optional human-readable detail (e.g. which fields an edit changed).
+  details   String?
   createdAt DateTime @default(now())
 
   @@index([entity, entityId])
 }
 
+/// Subscription plans for venues. Features are keys from the plan
+/// feature catalog (src/plans/plans.service.ts); limits are null =
+/// unlimited. A plan with isCustom = true is a specialized plan built
+/// for one specific arena by the super admin.
+model Plan {
+  id          String   @id @default(cuid())
+  name        String
+  priceYearly Int      @default(0)
+  freeMonths  Int      @default(3)
+  features    Json     @default("[]")
+  maxVenues   Int?
+  maxCourts   Int?
+  maxStaff    Int?
+  isDefault   Boolean  @default(false)
+  isCustom    Boolean  @default(false)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  venues      Venue[]
+  frozenVenues Venue[] @relation("VenueFrozenPlan")
+  payments    VenuePayment[]
+}
+
 model Setting {
   key       String   @id
   value     String
+  updatedAt DateTime @updatedAt
+}
+
+/// In-app inbox copy of every personal notification (booking decisions,
+/// reminders, reschedule outcomes, game joins). Rows are written by
+/// NotificationsService.pushToUser alongside the push/email fan-out;
+/// broadcast campaigns are not fanned out into inboxes.
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  title     String
+  body      String
+  data      Json?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+}
+
+// ---------------------------------------------------------------------------
+// Arena view / click tracking. One row per identity per venue (or court)
+// per day: the unique dedupeKey makes "1 view per user per day" a database
+// guarantee, not an app hope. identity = user id, or "g:<visitorId>" for
+// guests, or "ip:<ip>" as a last resort.
+// ---------------------------------------------------------------------------
+model VenueEvent {
+  id        String   @id @default(cuid())
+  venueId   String
+  venue     Venue    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  courtId   String?
+  court     Court?   @relation(fields: [courtId], references: [id], onDelete: SetNull)
+  type      String // view | click | court_view
+  identity  String
+  userId    String?
+  day       DateTime @db.Date
+  dedupeKey String   @unique
+  createdAt DateTime @default(now())
+
+  @@index([venueId, type, day])
+  @@index([courtId, type, day])
+}
+
+// ---------------------------------------------------------------------------
+// Subscription payments ledger: every "mark paid" (and any manual entry)
+// writes a row, so platform revenue and per-arena revenue are sums of real
+// records, not flags.
+// ---------------------------------------------------------------------------
+model VenuePayment {
+  id           String   @id @default(cuid())
+  venueId      String
+  venue        Venue    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  planId       String?
+  plan         Plan?    @relation(fields: [planId], references: [id], onDelete: SetNull)
+  amount       Int // PKR
+  method       String? // bank | raast | cash | other
+  periodStart  DateTime?
+  periodEnd    DateTime?
+  note         String?
+  recordedById String?
+  recordedBy   User?    @relation("PaymentRecordedBy", fields: [recordedById], references: [id], onDelete: SetNull)
+  createdAt    DateTime @default(now())
+
+  @@index([venueId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast history: every admin broadcast is recorded at send time so the
+// CMS can show what went out, when, to which city and how many devices it
+// targeted.
+// ---------------------------------------------------------------------------
+model Broadcast {
+  id        String   @id @default(cuid())
+  title     String
+  body      String
+  city      String?
+  targeted  Int      @default(0)
+  /// Round 4, P-B1: `targeted` used to be the only count — and it was
+  /// the pre-send token count, so a broadcast that delivered to zero
+  /// phones (500-token batch throw) still recorded full delivery.
+  /// `delivered`/`failed` are the per-batch actuals from the chunked
+  /// send; history shows attempted vs delivered, never a lie.
+  delivered Int      @default(0)
+  failed    Int      @default(0)
+  /// Round 5, D5-S49: false for rows created before delivered/failed
+  /// counts existed (set by migration 20261025170000_round5_r3_schema);
+  /// true for every row written since. History must surface this so a
+  /// legacy 0/0 row is never read as a zero-delivery broadcast.
+  countsReliable Boolean @default(true)
+  sentById  String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+/// The sports catalog — created and managed ONLY by the super admin.
+/// Venues/courts reference sports by (canonical) name; writes are
+/// validated against this table so the list can never fragment.
+model Sport {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  icon      String?
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Idempotency records for destructive admin mutations (mark-paid,
+/// suspend/unsuspend, role create, plan assign). The panel sends a fresh
+/// `Idempotency-Key` per user-confirmed action and reuses it across
+/// retries of that action (timeout, 401-refresh); a replay within 24h
+/// returns the stored response instead of re-executing. Scope includes
+/// the route so a key can never replay across endpoints. Rows older
+/// than 24h are pruned opportunistically on each write and never replay.
+/// Migration: prisma/migrations/20261025041600_idempotency_key (already
+/// applied on migrate-built DBs; see docs/DEPLOY.md for the db-push
+/// case — never hand-edit an applied migration file).
+/// NOTE (Round 4, M-S1): the two raw partial indexes (system role
+/// name, court venue+lower(name)) intentionally have NO Prisma
+/// declaration — the shadow-DB diff cannot match them and may propose
+/// dropping them. Never accept a generated DROP INDEX for
+/// "Role_system_name_key", "Role_system_name_ci_key",
+/// "Court_venue_name_ci_key" (Round 5, D5-B1: the real index name —
+/// the old "Court_venue_name_key" spelling never existed), or
+/// "VenuePayment_void_note_key" (Round 5, D5-S4); run `migrate dev` on
+/// a scratch DB first and inspect the generated SQL (docs/DEPLOY.md).
+model IdempotencyKey {
+  id        String   @id @default(cuid())
+  scope     String // e.g. "POST /admin/venues/abc123/billing/mark-paid" (method + concrete path, no query)
+  actorId   String
+  key       String
+  response  Json
+  createdAt DateTime @default(now())
+
+  @@unique([scope, actorId, key])
+  @@index([createdAt])
+}
+
+/** Canonical amenity list, super-admin managed like the sports catalog. */
+model Amenity {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }

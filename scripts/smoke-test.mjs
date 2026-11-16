@@ -164,9 +164,11 @@ async function main() {
 
   // 9. Game board + favorites + promo validate
   try {
+    // Games are posted from a confirmed booking now (step 7's booking).
+    const mineForGame = await api('GET', '/bookings/me?filter=upcoming', playerToken);
+    const confirmedBooking = mineForGame.find((b) => b.status === 'confirmed');
     await api('POST', '/game-posts', playerToken, {
-      sport: 'Football', city: 'Lahore', date: slot.date, startMinutes: slot.startMinutes,
-      playersNeeded: 10, note: 'smoke test',
+      bookingId: confirmedBooking.id, squadSize: 6, playersNeeded: 4, note: 'smoke test',
     });
     await api('POST', '/favorites', playerToken, { venueId });
     const favs = await api('GET', '/favorites', playerToken);

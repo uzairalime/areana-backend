@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import configuration, { validationSchema } from './config';
 import { PrismaModule } from './common/prisma';
 import { JwtAuthGuard, PermGuard } from './common/auth';
@@ -13,6 +14,7 @@ import { BookingsModule } from './bookings/bookings.module';
 import { SearchModule } from './search/search.module';
 import { DeeplinkModule } from './deeplink/deeplink.module';
 import { GamePostsModule } from './game-posts/game-posts.module';
+import { WaitlistModule } from './waitlist/waitlist.module';
 import { PromosModule } from './promos/promos.module';
 import { FavoritesModule } from './favorites/favorites.module';
 import { ReviewsModule } from './reviews/reviews.module';
@@ -26,9 +28,19 @@ import { NotificationsModule } from './notifications/notifications.module';
 import { StorageModule } from './storage/storage.module';
 import { SchedulerModule } from './scheduler/scheduler.module';
 import { HealthModule } from './health/health.module';
+import { IdempotencyModule } from './common/idempotency/idempotency.module';
+import { SportsModule } from './sports/sports.module';
+import { AmenitiesModule } from './amenities/amenities.module';
 
 @Module({
   imports: [
+    // NOTE (scaling): the default throttler store is in-memory per
+    // process — correct for the single-container VPS deployment. If the
+    // API ever runs 2+ instances, swap in a shared (Redis) store or the
+    // limits multiply per instance. THROTTLE_LIMIT tunes without a deploy.
+    ThrottlerModule.forRoot([
+      { ttl: 60000, limit: parseInt(process.env.THROTTLE_LIMIT ?? '300', 10) },
+    ]),
     ConfigModule.forRoot({ isGlobal: true, load: [configuration], validationSchema }),
     PrismaModule, // @Global
     NotificationsModule, // @Global (email + push)
@@ -41,6 +53,7 @@ import { HealthModule } from './health/health.module';
     SearchModule,
     DeeplinkModule,
     GamePostsModule,
+    WaitlistModule,
     PromosModule,
     FavoritesModule,
     ReviewsModule,
@@ -53,8 +66,12 @@ import { HealthModule } from './health/health.module';
     StorageModule,
     SchedulerModule,
     HealthModule,
+    IdempotencyModule,
+    SportsModule,
+    AmenitiesModule,
   ],
   providers: [
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_GUARD, useClass: PermGuard },
   ],

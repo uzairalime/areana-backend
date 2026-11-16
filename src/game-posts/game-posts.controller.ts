@@ -1,8 +1,8 @@
-import { Body, Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { AuthUser, CurrentUser, Public, RequirePerm } from '../common/auth';
 import { GamePostsService } from './game-posts.service';
-import { CreateGamePostDto, GamePostQueryDto, JoinGamePostDto } from './dto';
+import { CreateGamePostDto, GamePostQueryDto, UpdateGamePostDto } from './dto';
 
 @ApiTags('game-posts')
 @Controller('game-posts')
@@ -11,24 +11,56 @@ export class GamePostsController {
 
   @Public()
   @Get()
-  list(@Query() query: GamePostQueryDto) {
-    return this.games.list(query);
+  list(@Query() query: GamePostQueryDto, @CurrentUser() user?: AuthUser) {
+    return this.games.list(query, user?.id);
+  }
+
+  @Public()
+  @Get(':id')
+  getOne(@Param('id') id: string, @CurrentUser() user?: AuthUser) {
+    return this.games.getOne(id, user?.id);
   }
 
   @RequirePerm('games.manage')
   @Post()
   create(@CurrentUser() user: AuthUser, @Body() dto: CreateGamePostDto) {
-    return this.games.create(user.id, dto);
+    return this.games.create(user, dto);
+  }
+
+  @RequirePerm('games.manage')
+  @Patch(':id')
+  update(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Body() dto: UpdateGamePostDto,
+  ) {
+    return this.games.update(id, user.id, dto);
   }
 
   @RequirePerm('games.manage')
   @Post(':id/join')
-  join(
+  join(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    return this.games.join(id, user);
+  }
+
+  @RequirePerm('games.manage')
+  @Post(':id/requests/:participantId/accept')
+  acceptRequest(
     @CurrentUser() user: AuthUser,
     @Param('id') id: string,
-    @Body() dto: JoinGamePostDto,
+    @Param('participantId') participantId: string,
   ) {
-    return this.games.join(id, user, dto);
+    return this.games.acceptRequest(id, user.id, participantId);
+  }
+
+  @RequirePerm('games.manage')
+  @Post(':id/requests/:participantId/reject')
+  rejectRequest(
+    @CurrentUser() user: AuthUser,
+    @Param('id') id: string,
+    @Param('participantId') participantId: string,
+  ) {
+    return this.games.rejectRequest(id, user.id, participantId);
   }
 
   @RequirePerm('games.manage')

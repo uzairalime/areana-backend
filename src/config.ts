@@ -1,5 +1,16 @@
 import * as Joi from 'joi';
 
+// Round 5, D5-S31: only 'development', 'test', 'production' are
+// known environments. Anything else set (staging, prod, typos) is
+// production-like for every dev-vs-prod gate that consumes this
+// helper; unset stays dev (the laptop case).
+export function isProdLikeEnv(nodeEnv: string | undefined): boolean {
+  return (
+    nodeEnv === 'production' ||
+    (nodeEnv !== undefined && !['development', 'test', 'production'].includes(nodeEnv))
+  );
+}
+
 export const validationSchema = Joi.object({
   PORT: Joi.number().default(3000),
   TZ: Joi.string().default('Asia/Karachi'),
@@ -30,8 +41,36 @@ export const validationSchema = Joi.object({
 
 export default () => ({
   port: parseInt(process.env.PORT ?? '3000', 10),
-  corsOrigin: (process.env.CORS_ORIGIN ?? '*').split(','),
-  isProd: process.env.NODE_ENV === 'production',
+  // Round 4, Swagger trivial: /api/docs used to be served
+  // unconditionally, including in production. SWAGGER_ENABLED defaults
+  // to on outside production and off in production; set it to 'true'
+  // explicitly to re-enable docs on a prod deploy (e.g. a staging box).
+  // Round 5, D5-S31: an unrecognised NODE_ENV (staging, prod, a typo
+  // like 'prodution') used to get DEV behaviours — Swagger served and
+  // OTP codes logged in plaintext — because both gates keyed on
+  // NODE_ENV === 'production' alone. Only the three known values get
+  // dev behaviour now; anything else is production-like (docs off
+  // unless explicitly enabled, OTP logging off). Unset stays dev:
+  // local runs without NODE_ENV are the laptop case, and the boot
+  // guards (main.ts) already fail those on TZ like production.
+  docsEnabled:
+    process.env.SWAGGER_ENABLED !== undefined
+      ? process.env.SWAGGER_ENABLED === 'true'
+      : !isProdLikeEnv(process.env.NODE_ENV),
+  // Round 4, P-S1: CORS origins used to be matched literally and
+  // untrimmed — `CORS_ORIGIN=https://player.areana.pk,
+  // https://panels.areana.pk` left the second entry as
+  // `" https://panels.areana.pk"`, which never matches the Origin
+  // header, so a correctly-listed origin was still CORS-blocked; a
+  // spaced `" *"` slipped past the boot guard (exact `includes('*')`
+  // missed it) while matching nothing. Trim, strip trailing slashes,
+  // drop empties — and the boot guard in main.ts now checks this
+  // cleaned list, so `" *"` is caught as open.
+  corsOrigin: (process.env.CORS_ORIGIN ?? '*')
+    .split(',')
+    .map((o) => o.trim().replace(/\/+$/, ''))
+    .filter((o) => o.length > 0),
+  isProd: isProdLikeEnv(process.env.NODE_ENV),
   jwt: {
     accessSecret: process.env.JWT_ACCESS_SECRET as string,
     refreshSecret: process.env.JWT_REFRESH_SECRET as string,

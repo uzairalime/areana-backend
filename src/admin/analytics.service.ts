@@ -4,6 +4,34 @@ import { PrismaService } from '../common/prisma';
 
 const ACTIVE_BOOKING: BookingStatus[] = [BookingStatus.confirmed, BookingStatus.completed];
 
+/** Shared date-range filter for analytics queries. Dates are PKT days
+ * (booking.date / event.day are @db.Date at UTC midnight); `to` is
+ * inclusive, implemented as an exclusive upper bound on the next day.
+ * A reversed range is swapped rather than returning nothing. */
+export interface AnalyticsRange {
+  from?: string;
+  to?: string;
+}
+
+function dayBounds(range: AnalyticsRange): { gte?: Date; lt?: Date } {
+  let { from, to } = range;
+  if (from && to && from > to) [from, to] = [to, from];
+  const out: { gte?: Date; lt?: Date } = {};
+  // PKT days, not UTC days: a PKT date starts at 19:00Z the previous
+  // day (UTC+05:00 year-round, no DST). The old UTC-midnight bounds
+  // silently cut off the first five hours of every PKT day on
+  // timestamp columns — and shifted the range by a day wherever an
+  // instant bound was compared against a @db.Date column.
+  if (from) out.gte = new Date(`${from}T00:00:00+05:00`);
+  if (to) out.lt = new Date(new Date(`${to}T00:00:00+05:00`).getTime() + 86400000);
+  return out;
+}
+
+function dateWhere(range: AnalyticsRange) {
+  const b = dayBounds(range);
+  return Object.keys(b).length > 0 ? b : undefined;
+}
+
 @Injectable()
 export class AnalyticsService {
   constructor(private prisma: PrismaService) {}
@@ -14,7 +42,13 @@ export class AnalyticsService {
   }
 
   // ------------------------------------------------------- 1. platform KPIs
-  async overview() {
+  // The range filters EVERY stat on the strip: entity counts by
+  // createdAt (players, owners, venues, pending queues, open disputes),
+  // booking activity by play date, payments by recorded date, traffic by
+  // tracked day. Only live subscriptions stay current-state (a venue is
+  // either on a live plan now or not — there is no period history for it).
+  // With no range, the previous all-time / today-onward meanings apply.
+  async overview(range: AnalyticsRange = {}) {
     const [
       players,
       owners,
@@ -26,18 +60,37 @@ export class AnalyticsService {
       pendingVenues,
       openDisputes,
     ] = await Promise.all([
-      this.prisma.user.count({ where: { role: { name: 'player' } } }),
-      this.prisma.user.count({ where: { role: { name: 'owner' } } }),
-      this.prisma.venue.groupBy({ by: ['status'], _count: true }),
-      this.prisma.booking.groupBy({ by: ['status'], _count: true, _sum: { totalPrice: true } }),
+      this.prisma.user.count({
+        where: { role: { name: 'player' }, createdAt: dateWhere(range) },
+      }),
+      this.prisma.user.count({
+        where: { role: { name: 'owner' }, createdAt: dateWhere(range) },
+      }),
+      this.prisma.venue.groupBy({
+        by: ['status'],
+        _count: true,
+        where: { createdAt: dateWhere(range) },
+      }),
+      this.prisma.booking.groupBy({
+        by: ['status'],
+        _count: true,
+        _sum: { totalPrice: true },
+        where: { date: dateWhere(range) },
+      }),
       this.prisma.booking.aggregate({
-        where: { status: { in: ACTIVE_BOOKING } },
+        where: { status: { in: ACTIVE_BOOKING }, date: dateWhere(range) },
         _sum: { totalPrice: true },
       }),
       this.prisma.booking.count({ where: { status: BookingStatus.pending } }),
-      this.prisma.user.count({ where: { status: 'pending', role: { name: 'owner' } } }),
-      this.prisma.venue.count({ where: { status: VenueStatus.pending } }),
-      this.prisma.dispute.count({ where: { status: 'open' } }),
+      this.prisma.user.count({
+        where: { status: 'pending', role: { name: 'owner' }, createdAt: dateWhere(range) },
+      }),
+      this.prisma.venue.count({
+        where: { status: VenueStatus.pending, createdAt: dateWhere(range) },
+      }),
+      this.prisma.dispute.count({
+        where: { status: 'open', createdAt: dateWhere(range) },
+      }),
     ]);
     const gmv = Number(gmvAgg._sum.totalPrice ?? 0);
     const pct = await this.commissionPct();
@@ -50,19 +103,82 @@ export class AnalyticsService {
       ),
       gmv,
       accruedCommission: Math.round((gmv * pct) / 100),
+      ...(await this.platformExtras(range)),
       pendingApprovals: { bookings: pendingBookings, owners: pendingOwners, venues: pendingVenues },
       openDisputes,
     };
   }
 
+  /** Super-admin v2 headline numbers: live bookings, subscriptions,
+   * ledger revenue and tracked engagement. */
+  private async platformExtras(range: AnalyticsRange = {}) {
+    const dayStr = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Karachi',
+    }).format(new Date());
+    const today = new Date(`${dayStr}T00:00:00.000Z`);
+    const rangeBounds = dateWhere(range);
+    const [activeBookings, currentSubscriptions, revenueAgg, views, clicks, openReports] =
+      await Promise.all([
+        // With a range: confirmed bookings whose play date falls in it.
+        // Without one: the original "confirmed, today onward" meaning.
+        this.prisma.booking.count({
+          where: rangeBounds
+            ? { status: BookingStatus.confirmed, date: rangeBounds }
+            : { status: BookingStatus.confirmed, date: { gte: today } },
+        }),
+        this.prisma.venue.count({
+          where: {
+            status: VenueStatus.approved,
+            billingStartAt: { not: null },
+            billingPaused: false,
+          },
+        }),
+        this.prisma.venuePayment.aggregate({
+          where: { createdAt: dateWhere(range) },
+          _sum: { amount: true },
+        }),
+        this.prisma.venueEvent.count({ where: { type: 'view', day: dateWhere(range) } }),
+        this.prisma.venueEvent.count({ where: { type: 'click', day: dateWhere(range) } }),
+        // Outstanding = open + reviewed: a report under investigation
+        // is still an open item.
+        this.prisma.venueReport.count({ where: { status: { in: ['open', 'reviewed'] } } }),
+      ]);
+    return {
+      openReports,
+      activeBookings,
+      currentSubscriptions,
+      subscriptionRevenue: revenueAgg._sum.amount ?? 0,
+      totalViews: views,
+      totalClicks: clicks,
+    };
+  }
+
   // ------------------------------------------------- 2. day/week/month graphs
-  async trends(days = 30, granularity: 'day' | 'week' | 'month' = 'day') {
-    const since = new Date();
-    since.setDate(since.getDate() - days);
-    since.setHours(0, 0, 0, 0);
+  async trends(
+    days = 30,
+    granularity: 'day' | 'week' | 'month' = 'day',
+    range: AnalyticsRange = {},
+  ) {
+    const bounds = dayBounds(range);
+    const since =
+      bounds.gte ??
+      (() => {
+        // PKT calendar days, not server-local midnights: the stored
+        // Booking.date is the UTC midnight of the PKT day, so a
+        // server-local midnight bound silently drops the first day.
+        const pktToday = new Intl.DateTimeFormat('en-CA', {
+          timeZone: 'Asia/Karachi',
+        }).format(new Date());
+        const d = new Date(`${pktToday}T00:00:00.000Z`);
+        // `days` counts today: days=30 must return 30 buckets, not 31
+        // (today plus 30 prior days). The old `- days` silently added
+        // one extra bucket to every default trends view.
+        d.setUTCDate(d.getUTCDate() - days + 1);
+        return new Date(`${d.toISOString().slice(0, 10)}T00:00:00+05:00`);
+      })();
     const rows = await this.prisma.booking.groupBy({
       by: ['date'],
-      where: { date: { gte: since }, status: { in: ACTIVE_BOOKING } },
+      where: { date: { gte: since, ...(bounds.lt ? { lt: bounds.lt } : {}) }, status: { in: ACTIVE_BOOKING } },
       _count: true,
       _sum: { totalPrice: true },
       orderBy: { date: 'asc' },
@@ -92,7 +208,7 @@ export class AnalyticsService {
   }
 
   // ---------------------------------------------------------- 3. breakdowns
-  async breakdown() {
+  async breakdown(range: AnalyticsRange = {}) {
     const [byCity, bySport, venueStatus] = await Promise.all([
       this.prisma.venue.groupBy({ by: ['city'], _count: true }),
       this.prisma.court.groupBy({ by: ['sport'], _count: true }),
@@ -100,7 +216,7 @@ export class AnalyticsService {
     ]);
     const cityBookings = await this.prisma.booking.groupBy({
       by: ['venueId'],
-      where: { status: { in: ACTIVE_BOOKING } },
+      where: { status: { in: ACTIVE_BOOKING }, date: dateWhere(range) },
       _count: true,
       _sum: { totalPrice: true },
     });
@@ -127,7 +243,7 @@ export class AnalyticsService {
   }
 
   // ------------------------------------------------- 4. arena leaderboard
-  async venueLeaderboard() {
+  async venueLeaderboard(range: AnalyticsRange = {}) {
     const venues = await this.prisma.venue.findMany({
       where: { status: VenueStatus.approved },
       select: {
@@ -142,7 +258,7 @@ export class AnalyticsService {
     const rows: any[] = [];
     for (const v of venues) {
       const bookings = await this.prisma.booking.findMany({
-        where: { venueId: v.id },
+        where: { venueId: v.id, date: dateWhere(range) },
         select: { userId: true, date: true, status: true, totalPrice: true, startMinutes: true, endMinutes: true },
       });
       const active = bookings.filter((b) => ACTIVE_BOOKING.includes(b.status));
@@ -154,7 +270,24 @@ export class AnalyticsService {
         where: { venueId: v.id, isActive: true },
         select: { openMinutes: true, closeMinutes: true },
       });
-      const days = new Set(bookings.map((b) => b.date.toISOString().slice(0, 10))).size || 1;
+      // Occupancy over the REQUESTED range's days, not the days that
+      // happen to have bookings: a venue booked on 2 of 30 days is 7%
+      // occupied, not 100%. Only when no bounded range is given
+      // (open-ended view) fall back to booked days.
+      let rangeFrom = range.from;
+      let rangeTo = range.to;
+      if (rangeFrom && rangeTo && rangeFrom > rangeTo) {
+        [rangeFrom, rangeTo] = [rangeTo, rangeFrom];
+      }
+      const days =
+        rangeFrom && rangeTo
+          ? Math.max(
+              1,
+              Math.round(
+                (new Date(rangeTo).getTime() - new Date(rangeFrom).getTime()) / 86400000,
+              ) + 1,
+            )
+          : new Set(bookings.map((b) => b.date.toISOString().slice(0, 10))).size || 1;
       const availMin = courts.reduce((s, c) => s + Math.max(0, c.closeMinutes - c.openMinutes), 0) * days;
       // New vs returning: first booking date per player at this venue.
       const firstSeen = new Map<string, string>();
@@ -164,9 +297,15 @@ export class AnalyticsService {
           firstSeen.set(b.userId, b.date.toISOString().slice(0, 10));
         }
       }
-      const cutoff = new Date();
-      cutoff.setDate(cutoff.getDate() - 30);
-      const newPlayers = [...firstSeen.values()].filter((d) => d >= cutoff.toISOString().slice(0, 10)).length;
+      // PKT calendar date, not server-local: firstSeen holds PKT date
+      // strings (Booking.date is the UTC midnight of the PKT day).
+      const pktToday = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Karachi',
+      }).format(new Date());
+      const cutoffDay = new Date(`${pktToday}T00:00:00.000Z`);
+      cutoffDay.setUTCDate(cutoffDay.getUTCDate() - 30);
+      const cutoffStr = cutoffDay.toISOString().slice(0, 10);
+      const newPlayers = [...firstSeen.values()].filter((d) => d >= cutoffStr).length;
       rows.push({
         venueId: v.id,
         name: v.name,
@@ -188,7 +327,10 @@ export class AnalyticsService {
   }
 
   // ------------------------------------------------------- 5a. venue drill-down
-  async venueDetail(venueId: string) {
+  // A range, when given, applies to the drill-down too (bookings by
+  // play date, reviews/customers by created date) — otherwise a
+  // period-filtered leaderboard would open an all-time modal.
+  async venueDetail(venueId: string, range: AnalyticsRange = {}) {
     const venue = await this.prisma.venue.findUnique({
       where: { id: venueId },
       include: {
@@ -201,20 +343,20 @@ export class AnalyticsService {
     if (!venue) throw new NotFoundException('Venue not found');
     const [bookings, reviews, customers] = await Promise.all([
       this.prisma.booking.findMany({
-        where: { venueId },
+        where: { venueId, date: dateWhere(range) },
         include: { court: { select: { name: true } }, user: { select: { name: true } } },
         orderBy: [{ date: 'desc' }, { startMinutes: 'desc' }],
         take: 200,
       }),
       this.prisma.review.findMany({
-        where: { venueId },
+        where: { venueId, createdAt: dateWhere(range) },
         include: { user: { select: { name: true } } },
         orderBy: { createdAt: 'desc' },
         take: 50,
       }),
       this.prisma.booking.groupBy({
         by: ['userId'],
-        where: { venueId, userId: { not: null } },
+        where: { venueId, userId: { not: null }, date: dateWhere(range) },
         _count: true,
       }),
     ]);
@@ -234,7 +376,7 @@ export class AnalyticsService {
   }
 
   // ------------------------------------------------------- 5b. owner drill-down
-  async ownerDetail(ownerId: string) {
+  async ownerDetail(ownerId: string, range: AnalyticsRange = {}) {
     const owner = await this.prisma.user.findUnique({
       where: { id: ownerId },
       include: { role: { select: { name: true } } },
@@ -247,7 +389,7 @@ export class AnalyticsService {
     const perVenue = await Promise.all(
       venues.map(async (v) => {
         const agg = await this.prisma.booking.aggregate({
-          where: { venueId: v.id, status: { in: ACTIVE_BOOKING } },
+          where: { venueId: v.id, status: { in: ACTIVE_BOOKING }, date: dateWhere(range) },
           _count: true,
           _sum: { totalPrice: true },
         });
@@ -267,7 +409,7 @@ export class AnalyticsService {
   }
 
   // -------------------------------------------------------- 5c. user drill-down
-  async userDetail(userId: string) {
+  async userDetail(userId: string, range: AnalyticsRange = {}) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: { role: { select: { name: true } } },
@@ -275,14 +417,14 @@ export class AnalyticsService {
     if (!user) throw new NotFoundException('User not found');
     const [bookings, referralsMade, redemptions, disputes] = await Promise.all([
       this.prisma.booking.findMany({
-        where: { userId },
+        where: { userId, date: dateWhere(range) },
         include: { venue: { select: { name: true } }, court: { select: { name: true } } },
         orderBy: [{ date: 'desc' }],
         take: 100,
       }),
-      this.prisma.referral.count({ where: { referrerId: userId } }),
-      this.prisma.promoRedemption.count({ where: { userId } }),
-      this.prisma.dispute.count({ where: { raisedById: userId } }),
+      this.prisma.referral.count({ where: { referrerId: userId, createdAt: dateWhere(range) } }),
+      this.prisma.promoRedemption.count({ where: { userId, createdAt: dateWhere(range) } }),
+      this.prisma.dispute.count({ where: { raisedById: userId, createdAt: dateWhere(range) } }),
     ]);
     const { passwordHash: _p, ...safe } = user;
     return {

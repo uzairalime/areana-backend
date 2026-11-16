@@ -35,13 +35,23 @@ export class JwtAuthGuard extends AuthGuard('jwt') {
     super();
   }
 
-  canActivate(context: ExecutionContext) {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const isPublic = this.reflector.getAllAndOverride<boolean>('isPublic', [
       context.getHandler(),
       context.getClass(),
     ]);
-    if (isPublic) return true;
-    return super.canActivate(context);
+    if (isPublic) {
+      // Best-effort personalization: when a valid token rides along on a
+      // public route, attach the user (never reject) so endpoints can
+      // answer "did I join this?" without a separate authed route.
+      try {
+        await super.canActivate(context);
+      } catch {
+        /* stay anonymous */
+      }
+      return true;
+    }
+    return super.canActivate(context) as Promise<boolean>;
   }
 }
 

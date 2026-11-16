@@ -2,19 +2,23 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { BookingStatus, Prisma, UserStatus } from '@prisma/client';
 import { PrismaService } from '../common/prisma';
+import { offsetPageFromDb, pageLimit } from '../common/pagination';
 import { CourtsService } from '../courts/courts.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PromosService } from '../promos/promos.service';
 import {
+  addMonths,
   isSameDay,
   minutesSinceMidnight,
   parseDateOnly,
   startOfToday,
 } from '../common/date.util';
+import { parseSettingFloat, parseSettingInt } from '../common/settings.util';
 import { CreateBookingDto, CreateRecurringDto, JoinSharedDto, MyBookingsQueryDto } from './dto';
 
 export interface CreateBookingInput extends CreateBookingDto {
@@ -23,6 +27,8 @@ export interface CreateBookingInput extends CreateBookingDto {
   recurrenceId?: string;
   /** Walk-ins / staff-created bookings skip the advance-notice window. */
   skipWindowCheck?: boolean;
+  /** Recurring-series occurrences skip only the max-advance window. */
+  skipMaxAdvance?: boolean;
 }
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -35,6 +41,8 @@ function shortCode(len: number): string {
 
 @Injectable()
 export class BookingsService {
+  private readonly logger = new Logger(BookingsService.name);
+
   constructor(
     private prisma: PrismaService,
     private courts: CourtsService,
@@ -56,24 +64,174 @@ export class BookingsService {
     const slotCount = input.slotCount ?? 1;
     const { startMinutes } = input;
 
-    this.validateSlotGrid(court, startMinutes, slotCount);
+    await this.validateSlotGrid(court, date, startMinutes, slotCount);
     const endMinutes = startMinutes + court.slotMinutes * slotCount;
     if (!input.skipWindowCheck) {
-      this.validateWindow(court, date, startMinutes);
+      this.validateWindow(court, date, startMinutes, input.skipMaxAdvance);
     }
 
     await this.assertNoOverlap(court.id, date, startMinutes, endMinutes);
 
-    const gross = Number(court.pricePerHour) * ((court.slotMinutes * slotCount) / 60);
+    // Per-slot pricing: each slot takes the rate of the price window
+    // covering it (peak/off-peak), else the court's base rate — so a
+    // booking spanning the peak boundary prices each hour correctly.
+    // Post-midnight slots of an overnight booking price from the
+    // morning's weekday windows first, falling back to the evening
+    // window covering the spill hour, then the base rate (O-S20).
+    const priceWindows = await this.courts.priceWindowsForDateRange(court.id, date);
+    const baseRate = Number(court.pricePerHour);
+    let gross = 0;
+    for (let i = 0; i < slotCount; i++) {
+      const rate = this.courts.rateForSlotPair(
+        priceWindows,
+        baseRate,
+        startMinutes + i * court.slotMinutes,
+      );
+      gross += rate * (court.slotMinutes / 60);
+    }
+    // Round the gross before any discount math: 45-minute slots at odd
+    // hourly rates otherwise store fractional paisa, and GMV sums drift
+    // from the rounded receipts players see.
+    gross = Math.round(gross * 100) / 100;
     let discount = 0;
     let promo: { id: string } | null = null;
     if (input.promoCode && input.userId) {
-      const res = await this.promos.validatePromo(input.promoCode, input.userId, gross);
-      discount = res.discount;
-      promo = res.promo;
+      const res = await this.promos.validatePromo(input.promoCode, input.userId, gross, court.venueId);
+      // A zero discount must not consume a redemption: a Rs 0/hr court
+      // (or a discount rounding to Rs 0.00) used to burn a single-use
+      // code for nothing. The booking proceeds without the promo, so
+      // the use stays available for a booking it actually discounts.
+      if (res.discount > 0) {
+        discount = res.discount;
+        promo = res.promo;
+      }
     }
 
-    const booking = await this.prisma.$transaction(async (tx) => {
+    // Round 5, D5-T6: share/check-in codes are @unique, so a collision
+    // used to roll the whole booking back as a raw 500. The tx body
+    // runs through runTx with fresh codes per attempt (max 3); only
+    // a collision on shareCode/checkInCode retries — any other P2002
+    // (e.g. the slot unique) rethrows immediately.
+    const runTx = (shareCode: string, checkInCode: string) =>
+      this.prisma.$transaction(async (tx) => {
+      // Serialize creation per court (venue row first, then court —
+      // the same order the archive path uses, so the two can never
+      // deadlock). The locks make the re-checks below see every
+      // concurrent insert AND every concurrent guard change: two
+      // players booking overlapping (not just identical) slots in the
+      // same second cannot both confirm — the @@unique backstop only
+      // matches identical start minutes — and a court deleted,
+      // deactivated, or re-queued, or a venue archived/suspended,
+      // between the pre-check and the insert no longer takes a booking
+      // it must not take. The early checks above stay as fail-fasts;
+      // these are authoritative.
+      await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${court.venueId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM "Court" WHERE id = ${court.id} FOR UPDATE`;
+      await this.courts.assertBookableInTx(tx, court.id);
+      // Re-read price + slot length inside the tx and re-price (Round
+      // 4, R-S6/R-S8): the pre-check's rate and slot length can go
+      // stale between pre-check and insert (owner reprices or resizes
+      // the court), which used to store a booking at a price the
+      // player never saw, on a grid that no longer exists. A changed
+      // price aborts with "price changed, please confirm" instead of
+      // silently charging the new amount; the end minute is always
+      // re-derived from the tx-fresh slot length × slot count.
+      const fresh = await tx.court.findUnique({
+        where: { id: court.id },
+        select: { pricePerHour: true, slotMinutes: true },
+      });
+      if (!fresh) throw new NotFoundException('Court not found');
+      if (fresh.slotMinutes <= 0) {
+        throw new BadRequestException('Court slot length is invalid');
+      }
+      const txEndMinutes = startMinutes + fresh.slotMinutes * slotCount;
+      const txPriceWindows = await this.courts.priceWindowsForDateRange(court.id, date, tx);
+      const txBaseRate = Number(fresh.pricePerHour);
+      let txGross = 0;
+      for (let i = 0; i < slotCount; i++) {
+        txGross +=
+          this.courts.rateForSlotPair(
+            txPriceWindows,
+            txBaseRate,
+            startMinutes + i * fresh.slotMinutes,
+          ) * (fresh.slotMinutes / 60);
+      }
+      txGross = Math.round(txGross * 100) / 100;
+      // Round 5, R5-S9: the duration must match what was displayed,
+      // regardless of price — a free court shrunk 60→30 min (gross 0
+      // = 0) or a compensating rate change must not store a shorter
+      // booking than the player picked.
+      if (txEndMinutes !== endMinutes) {
+        throw new BadRequestException('Slot length changed — please pick again');
+      }
+      if (txGross !== gross) {
+        throw new BadRequestException('Price changed — please confirm the new price and try again');
+      }
+      // Round 5, P5-S47: re-run the advance-notice / past window
+      // inside the transaction, against the tx-fresh venue settings.
+      // The pre-check can go stale under lock contention (a slot at
+      // the notice horizon committing after the boundary, or a
+      // next-minute slot committing after its start). Walk-ins keep
+      // their skip; recurring series keep the max-advance exemption.
+      if (!input.skipWindowCheck) {
+        const txVenue = await tx.venue.findUnique({
+          where: { id: court.venueId },
+          select: { minAdvanceMinutes: true, maxAdvanceDays: true },
+        });
+        if (!txVenue) throw new NotFoundException('Venue not found');
+        this.validateWindow(
+          { ...court, venue: txVenue },
+          date,
+          startMinutes,
+          input.skipMaxAdvance,
+        );
+      }
+      // Hours re-validation inside the tx: the pre-check's windows can
+      // go stale between pre-check and insert (owner shrinks hours, or
+      // adds a template closing the weekday), stranding a booking
+      // outside the hours it was sold under. Blocks are covered by
+      // assertNoOverlap below, which already re-checks them in-tx.
+      // A tx-time window failure means the hours moved since the
+      // player picked the slot, so it gets its own message (R-S8) —
+      // not the generic pre-check one.
+      try {
+        await this.courts.assertSlotInTx(tx, court.id, date, startMinutes, txEndMinutes);
+      } catch (e) {
+        if (e instanceof BadRequestException) {
+          throw new BadRequestException('Court hours changed — please pick again');
+        }
+        throw e;
+      }
+      await this.assertNoOverlap(court.id, date, startMinutes, txEndMinutes, tx);
+      // Round 5, P5-S48 / R5-S7: re-read the promo terms from the
+      // locked promo row and recompute the discount. An owner edit
+      // between validation and commit aborts with the same
+      // "price changed" shape as the court-price guard above, instead
+      // of storing the stale discount with a fresh redemption.
+      let txDiscount = discount;
+      if (promo && input.userId) {
+        txDiscount = await this.promos.recomputeDiscount(promo.id, txGross, tx);
+        if (txDiscount !== discount) {
+          throw new BadRequestException('Price changed — please confirm the new price and try again');
+        }
+      }
+      // Round 5, R5-S8: a client-supplied expectedTotal is the price
+      // the player confirmed. If the price moved since that preview
+      // (e.g. a blind retry after a "price changed" 400), abort with
+      // a payload carrying the new gross/total so the client can
+      // re-confirm — never book silently at the new price.
+      if (input.expectedTotal !== undefined && input.expectedTotal !== null) {
+        const net = Math.max(0, txGross - txDiscount);
+        if (Math.round(input.expectedTotal * 100) / 100 !== net) {
+          throw new BadRequestException({
+            message: 'Price changed — please confirm the new price and try again',
+            code: 'PRICE_CHANGED',
+            expectedTotal: input.expectedTotal,
+            newGross: txGross,
+            newTotal: net,
+          });
+        }
+      }
       const b = await tx.booking.create({
         data: {
           userId: input.userId,
@@ -82,13 +240,15 @@ export class BookingsService {
           courtId: court.id,
           date,
           startMinutes,
-          endMinutes,
-          totalPrice: gross - discount,
+          endMinutes: txEndMinutes,
+          // Never store a negative price: a discount larger than the
+          // gross (e.g. a misconfigured promo) floors at zero.
+          totalPrice: Math.max(0, gross - discount),
           discountAmount: discount,
           promoCodeId: promo?.id,
           status: court.venue.autoAccept ? BookingStatus.confirmed : BookingStatus.pending,
-          shareCode: shortCode(8),
-          checkInCode: shortCode(10),
+          shareCode,
+          checkInCode,
           recurrenceId: input.recurrenceId,
         },
         include: {
@@ -97,36 +257,95 @@ export class BookingsService {
         },
       });
       if (promo && input.userId) {
-        await this.promos.applyPromo(promo.id, input.userId, b.id, tx);
+        await this.promos.applyPromo(promo.id, input.userId, b.id, tx, {
+          amount: txGross,
+          discount,
+        });
       }
       return b;
-    });
+      });
+    let booking: Awaited<ReturnType<typeof runTx>> | undefined;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        booking = await runTx(shortCode(8), shortCode(10));
+        break;
+      } catch (e) {
+        const target =
+          e instanceof Prisma.PrismaClientKnownRequestError
+            ? (e.meta?.target as unknown)
+            : null;
+        const targets = Array.isArray(target) ? target : target ? [target] : [];
+        const isCodeCollision =
+          e instanceof Prisma.PrismaClientKnownRequestError &&
+          e.code === 'P2002' &&
+          targets.some((t) => t === 'shareCode' || t === 'checkInCode');
+        if (attempt < 2 && isCodeCollision) continue;
+        throw e;
+      }
+    }
+    if (!booking) throw new BadRequestException('Could not create booking — please try again');
 
     // Notify the arena owner (email) — only for player-made requests, not walk-ins.
+    // Auto-accept venues used to notify nobody: the old condition
+    // required a pending request, so a confirmed booking never emailed
+    // (Round 4). Pending requests keep the approval wording; confirmed
+    // bookings get the confirmed wording.
     const ownerEmail = (booking.venue as any).owner?.email;
-    if (ownerEmail && input.userId && booking.status === BookingStatus.pending) {
+    if (ownerEmail && input.userId) {
       const hh = String(Math.floor(startMinutes / 60)).padStart(2, '0');
       const mm = String(startMinutes % 60).padStart(2, '0');
-      await this.notifications.notifyOwnerNewBooking(
-        ownerEmail,
-        booking.venue.name,
-        `${booking.court.name} — ${input.date} ${hh}:${mm} (${slotCount} slot${slotCount > 1 ? 's' : ''}), Rs ${Number(booking.totalPrice).toFixed(0)}`,
-      ).catch(() => {});
+      const summary = `${booking.court.name} — ${input.date} ${hh}:${mm} (${slotCount} slot${slotCount > 1 ? 's' : ''}), Rs ${Number(booking.totalPrice).toFixed(0)}`;
+      // Fire-and-forget (Round 4, P-S7): the owner email must not
+      // hang this response after the booking committed — the helper
+      // retries once and logs failures with context, never throws.
+      if (booking.status === BookingStatus.pending) {
+        void this.notifications.notifyOwnerNewBooking(ownerEmail, booking.venue.name, summary);
+      } else if (booking.status === BookingStatus.confirmed) {
+        void this.notifications.notifyOwnerConfirmedBooking(ownerEmail, booking.venue.name, summary);
+      }
     }
-    return booking;
+    // Round 5, R5-19: the create response carries createdAt (already
+    // on the row) plus expiresAt — the pending-expiry deadline
+    // instant, so the success screen can show a clock-time deadline
+    // instead of a duration. Null for auto-accept (confirmed)
+    // bookings, which never expire as pending.
+    const expiresAt = await this.pendingExpiryAt(booking);
+    return {
+      ...booking,
+      expiresAt: expiresAt ? expiresAt.toISOString() : null,
+    };
   }
 
-  private validateSlotGrid(court: any, startMinutes: number, slotCount: number) {
-    if (
-      startMinutes < court.openMinutes ||
-      startMinutes + court.slotMinutes * slotCount > court.closeMinutes ||
-      (startMinutes - court.openMinutes) % court.slotMinutes !== 0
-    ) {
+  /**
+   * The booking must sit fully inside ONE of the day's open windows
+   * (weekly template or default hours) and align to the slot grid
+   * anchored at that window's start.
+   */
+  private async validateSlotGrid(
+    court: any,
+    date: Date,
+    startMinutes: number,
+    slotCount: number,
+  ) {
+    const endMinutes = startMinutes + court.slotMinutes * slotCount;
+    const windows = await this.courts.windowsForDate(court, date);
+    if (windows.length === 0) {
+      throw new BadRequestException('Court is closed on this day');
+    }
+    const w = windows.find(
+      (x) => startMinutes >= x.startMinutes && endMinutes <= x.endMinutes,
+    );
+    if (!w || (startMinutes - w.startMinutes) % court.slotMinutes !== 0) {
       throw new BadRequestException('Slot is outside court hours or misaligned');
     }
   }
 
-  private validateWindow(court: any, date: Date, startMinutes: number) {
+  private validateWindow(
+    court: any,
+    date: Date,
+    startMinutes: number,
+    skipMaxAdvance = false,
+  ) {
     const now = new Date();
     const bookingAt = new Date(date);
     bookingAt.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
@@ -137,16 +356,35 @@ export class BookingsService {
         `Bookings need at least ${court.venue.minAdvanceMinutes} minutes notice`,
       );
     }
-    const maxDate = startOfToday();
-    maxDate.setDate(maxDate.getDate() + court.venue.maxAdvanceDays);
-    if (date > maxDate) {
-      throw new BadRequestException(`Bookings open only ${court.venue.maxAdvanceDays} days ahead`);
+    // A recurring series is a standing commitment the owner approves —
+    // its later occurrences are exempt from the max-advance window
+    // (min-advance above still applies to every occurrence).
+    // Max-advance is an INSTANT like min-advance, not a calendar date:
+    // the old date comparison let the horizon vary by ~24h with the
+    // time of day. Exactly at the horizon stays allowed, matching the
+    // availability side.
+    if (!skipMaxAdvance) {
+      const maxBookableAt = new Date(
+        now.getTime() + court.venue.maxAdvanceDays * 24 * 3600_000,
+      );
+      if (bookingAt > maxBookableAt) {
+        throw new BadRequestException(`Bookings open only ${court.venue.maxAdvanceDays} days ahead`);
+      }
     }
     if (bookingAt <= now) throw new BadRequestException('Cannot book a slot in the past');
   }
 
-  private async assertNoOverlap(courtId: string, date: Date, startMinutes: number, endMinutes: number) {
-    const clash = await this.prisma.booking.findFirst({
+  private async assertNoOverlap(
+    courtId: string,
+    date: Date,
+    startMinutes: number,
+    endMinutes: number,
+    tx?: Prisma.TransactionClient,
+  ) {
+    // With a transaction client the reads see that transaction's
+    // uncommitted work (booking creation re-checks under the court lock).
+    const db = tx ?? this.prisma;
+    const clash = await db.booking.findFirst({
       where: {
         courtId,
         date,
@@ -158,16 +396,51 @@ export class BookingsService {
     });
     if (clash) throw new ConflictException('Slot overlaps an existing booking');
 
-    const blocked = await this.prisma.slotBlock.findFirst({
-      where: {
-        courtId,
-        date,
-        startMinutes: { lt: endMinutes },
-        endMinutes: { gt: startMinutes },
-      },
-      select: { id: true },
-    });
-    if (blocked) throw new ConflictException('Slot is blocked by the arena');
+    const ranges = await this.courts.blockedRangesForDate(courtId, date, tx);
+    if (
+      ranges.some((r) => startMinutes < r.endMinutes && endMinutes > r.startMinutes)
+    ) {
+      throw new ConflictException('Slot is blocked by the arena');
+    }
+
+    // Overnight spill: a booking ending after midnight (endMinutes >
+    // 1440, stored on the evening's date) must not clash with early
+    // bookings stored on the next date — and vice versa.
+    if (endMinutes > 1440) {
+      const nextDate = new Date(date);
+      nextDate.setDate(nextDate.getDate() + 1);
+      const spillClash = await db.booking.findFirst({
+        where: {
+          courtId,
+          date: nextDate,
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          startMinutes: { lt: endMinutes - 1440 },
+          endMinutes: { gt: 0 },
+        },
+        select: { id: true },
+      });
+      if (spillClash) throw new ConflictException('Slot overlaps an existing booking');
+    }
+    if (startMinutes < 360) {
+      const prevDate = new Date(date);
+      prevDate.setDate(prevDate.getDate() - 1);
+      const prev = await db.booking.findMany({
+        where: {
+          courtId,
+          date: prevDate,
+          status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          endMinutes: { gt: 1440 },
+        },
+        select: { startMinutes: true, endMinutes: true },
+      });
+      if (
+        prev.some(
+          (b) => b.startMinutes - 1440 < endMinutes && b.endMinutes - 1440 > startMinutes,
+        )
+      ) {
+        throw new ConflictException('Slot overlaps an existing booking');
+      }
+    }
   }
 
   // -------------------------------------------------------------- recurring
@@ -201,55 +474,300 @@ export class BookingsService {
           slotCount: dto.slotCount ?? 1,
           userId,
           recurrenceId,
+          skipMaxAdvance: true,
         });
         created.push(b);
       } catch (e: any) {
         skipped.push({ date: ds, reason: e.message ?? 'Unavailable' });
       }
     }
+    // A series that creates nothing must not return a bare 200 success
+    // (Round 4 trivial): the empty result carries an explicit message
+    // so the caller can tell "nothing booked" from "all booked".
+    if (created.length === 0) {
+      return {
+        recurrenceId,
+        created,
+        skipped,
+        message:
+          'No bookings could be created for this series — every date was unavailable (see skipped)',
+      };
+    }
     return { recurrenceId, created, skipped };
   }
 
   async cancelRecurringSeries(userId: string, recurrenceId: string) {
-    const res = await this.prisma.booking.updateMany({
+    // Round 5, P5-S46: include yesterday so spill-start occurrences
+    // (instant still today) reach the slotStarted filter below.
+    const yesterday = new Date(startOfToday());
+    yesterday.setDate(yesterday.getDate() - 1);
+    const candidates = await this.prisma.booking.findMany({
       where: {
         recurrenceId,
         userId,
         status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
-        date: { gte: startOfToday() },
+        date: { gte: yesterday },
       },
-      data: { status: BookingStatus.cancelled },
+      select: { id: true, date: true, startMinutes: true, status: true },
     });
-    return { cancelled: res.count };
+    // The started-check applies to today's occurrence too: a series
+    // cancel must not kill a slot that is already in play — it stays
+    // confirmed while the rest of the series is cancelled.
+    // Round 5, P5-S46: started = start instant (slotStarted), so a
+    // spill-start occurrence is judged by its instant, not its date.
+    const affected = candidates.filter((b) => !this.slotStarted(b));
+    // Claim each occurrence with the status it had when read: an owner
+    // accept landing between the read and this write wins — the
+    // just-confirmed occurrence is not silently cancelled, and its side
+    // effects (promo refund, waitlist ping, game-post cleanup) run only
+    // for occurrences actually cancelled here, never for ones another
+    // path already decided.
+    let cancelled = 0;
+    for (const b of affected) {
+      const claimed = await this.prisma.booking.updateMany({
+        where: { id: b.id, status: b.status },
+        data: { status: BookingStatus.cancelled },
+      });
+      if (claimed.count === 0) continue;
+      cancelled++;
+      await this.rejectPendingReschedules(b.id);
+      await this.releasePromo(b.id);
+      await this.cleanupGamePost(b.id, 'The host cancelled their booking, so this game is off.');
+      const full = await this.prisma.booking.findUnique({
+        where: { id: b.id },
+        select: { courtId: true, date: true, startMinutes: true, endMinutes: true },
+      });
+      if (full) await this.notifyWaitlist(full);
+    }
+    // The series player gets the same booking_cancelled signal as any
+    // other cancellation, so a cancelled series never silently stands
+    // on their calendar.
+    if (cancelled > 0) {
+      await this.notifications
+        .pushToUser(userId, {
+          title: 'Recurring series cancelled',
+          body: `${cancelled} booking${cancelled === 1 ? '' : 's'} in your recurring series were cancelled. Any promos used have been refunded.`,
+          data: { type: 'booking_cancelled' },
+        })
+        .catch(() => {});
+    }
+    return { cancelled };
   }
 
   // ------------------------------------------------------------------ read
   async listMine(userId: string, query: MyBookingsQueryDto) {
     const today = startOfToday();
+    // Past/upcoming is decided by the slot's END instant, not the play
+    // date: an overnight booking (endMinutes > 1440, stored on the
+    // evening's date) is still upcoming while it is being played after
+    // midnight, and only becomes past once its end instant passes. The
+    // end instant for a yesterday-evening game is today at
+    // (endMinutes − 1440), so "yesterday, endMinutes > 1440 + nowMin"
+    // is exactly "still in play". Slots never span more than one
+    // midnight (court windows cap at 20h), so three clauses are exact.
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    const nowMin = minutesSinceMidnight();
+    const ACTIVE: BookingStatus[] = [BookingStatus.pending, BookingStatus.confirmed];
+    const TERMINAL: BookingStatus[] = [
+      BookingStatus.cancelled,
+      BookingStatus.completed,
+      BookingStatus.no_show,
+    ];
     const where =
       query.filter === 'past'
         ? {
             userId,
             OR: [
-              { date: { lt: today } },
-              { status: { in: [BookingStatus.cancelled, BookingStatus.completed, BookingStatus.no_show] } },
+              { status: { in: TERMINAL } },
+              { status: { in: ACTIVE }, date: { lt: yesterday } },
+              { status: { in: ACTIVE }, date: yesterday, endMinutes: { lte: 1440 + nowMin } },
+              { status: { in: ACTIVE }, date: today, endMinutes: { lte: nowMin } },
             ],
           }
         : {
             userId,
-            date: { gte: today },
-            status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+            status: { in: ACTIVE },
+            OR: [
+              { date: { gt: today } },
+              { date: today, endMinutes: { gt: nowMin } },
+              { date: yesterday, endMinutes: { gt: 1440 + nowMin } },
+            ],
           };
 
-    return this.prisma.booking.findMany({
-      where,
+    const page = query.page ?? 1;
+    const limit = pageLimit(query.limit, 20);
+    const [total, items] = await Promise.all([
+      this.prisma.booking.count({ where }),
+      this.prisma.booking.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        include: {
+          court: { select: { name: true, sport: true } },
+        // images/photos power the venue photo on the player's booking
+        // cards — without them the cards rendered placeholders forever.
+        venue: { select: { name: true, address: true, city: true, lat: true, lng: true, images: true, photos: true } },
+        gamePost: {
+          select: {
+            id: true,
+            playersNeeded: true,
+            squadSize: true,
+            level: true,
+            status: true,
+            _count: {
+              select: { participants: { where: { status: 'joined' } } },
+            },
+          },
+        },
+        _count: { select: { participants: true, reviews: true } },
+      },
+        // Round 5, R5-12: the past filter orders date DESC (newest
+        // first — the player reads recent history first); upcoming
+        // stays date ASC (nearest slot first).
+        orderBy:
+          query.filter === 'past'
+            ? [{ date: 'desc' }, { startMinutes: 'desc' }]
+            : [{ date: 'asc' }, { startMinutes: 'asc' }],
+      }),
+    ]);
+    // Round 5, R5-14: hasReviewed is true when the player already
+    // reviewed that booking (Review.bookingId is unique, so the
+    // count is 0 or 1). _count is kept for back-compat.
+    const withReviewed = items.map((b) => ({
+      ...b,
+      hasReviewed: (b._count?.reviews ?? 0) > 0,
+    }));
+    return offsetPageFromDb(withReviewed, total, page, limit);
+  }
+
+  /** Round 5, R5-11: single booking detail for the owning player — */
+  /** same auth/ownership rule as listMine (id + userId match). */
+  async getMine(userId: string, bookingId: string) {
+    const booking = await this.prisma.booking.findFirst({
+      where: { id: bookingId, userId },
       include: {
         court: { select: { name: true, sport: true } },
-        venue: { select: { name: true, address: true, city: true } },
-        _count: { select: { participants: true } },
+        venue: { select: { name: true, address: true, city: true, lat: true, lng: true, images: true, photos: true } },
+        gamePost: {
+          select: {
+            id: true,
+            playersNeeded: true,
+            squadSize: true,
+            level: true,
+            status: true,
+            _count: {
+              select: { participants: { where: { status: 'joined' } } },
+            },
+          },
+        },
+        _count: { select: { participants: true, reviews: true } },
       },
-      orderBy: [{ date: 'asc' }, { startMinutes: 'asc' }],
     });
+    if (!booking) throw new NotFoundException('Booking not found');
+    return { ...booking, hasReviewed: (booking._count?.reviews ?? 0) > 0 };
+  }
+
+  /**
+   * Round 5, R5-16: the caller's own pending reschedule requests,
+   * with the booking reference + requested slot. Offset-paged
+   * (?page&limit, default 20) like listMine; newest first.
+   */
+  async listPendingReschedules(userId: string, page = 1, rawLimit?: number) {
+    const limit = pageLimit(rawLimit, 20);
+    const p = Math.max(1, page);
+    const where = {
+      status: 'pending',
+      booking: { userId },
+    };
+    const [total, items] = await Promise.all([
+      this.prisma.rescheduleRequest.count({ where }),
+      this.prisma.rescheduleRequest.findMany({
+        where,
+        include: {
+          booking: {
+            select: {
+              id: true,
+              venueId: true,
+              courtId: true,
+              date: true,
+              startMinutes: true,
+              endMinutes: true,
+              status: true,
+              venue: { select: { name: true } },
+              court: { select: { name: true } },
+            },
+          },
+        },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (p - 1) * limit,
+        take: limit,
+      }),
+    ]);
+    return offsetPageFromDb(items, total, p, limit);
+  }
+
+  /**
+   * Round 5, R5-19: the pending-expiry deadline for a booking, using
+   * the scheduler's exact formula (slot-relative expiry): expiry =
+   * min(slotStart, max(createdAt + pendingExpiryHours, slotStart -
+   * 24h)). Returns null for non-pending bookings (a confirmed
+   * booking has no pending deadline). The setting is read with the
+   * same validated parse as the scheduler (default 2h, garbage/zero
+   * falls back to 2h).
+   */
+  async pendingExpiryAt(booking: {
+    status: BookingStatus;
+    date: Date;
+    startMinutes: number;
+    createdAt: Date;
+  }): Promise<Date | null> {
+    if (booking.status !== BookingStatus.pending) return null;
+    const parsed = parseSettingFloat(
+      (await this.prisma.setting.findUnique({ where: { key: 'pendingExpiryHours' } }))?.value,
+      2,
+    );
+    const hours = parsed > 0 ? parsed : 2;
+    const slotStart = this.slotStartAt(booking);
+    return new Date(
+      Math.min(
+        slotStart.getTime(),
+        Math.max(booking.createdAt.getTime() + hours * 3600_000, slotStart.getTime() - 24 * 3600_000),
+      ),
+    );
+  }
+
+  /**
+   * Round 5, R5-17: notify every SIGNED-IN share participant of a
+   * booking (BookingParticipant.userId != null) about a lifecycle
+   * event, via push + email (NotificationsService.notifyPlayerEvent).
+   * Guest joiners (userId null, phone only) have no push/email
+   * channel and are skipped. The host (booking.userId) is never a
+   * participant row, so no exclusion is needed; `excludeUserId` is
+   * accepted for callers that already notified one participant.
+   */
+  async notifyShareParticipants(
+    bookingId: string,
+    title: string,
+    body: string,
+    type: string,
+    emailSubject: string,
+    excludeUserId?: string,
+  ): Promise<void> {
+    const rows = await this.prisma.bookingParticipant.findMany({
+      where: { bookingId, userId: { not: null } },
+      select: { userId: true },
+    });
+    for (const r of rows) {
+      if (!r.userId || r.userId === excludeUserId) continue;
+      await this.notifications
+        .notifyPlayerEvent(
+          r.userId,
+          { title, body, data: { type, bookingId } },
+          emailSubject,
+        )
+        .catch(() => {});
+    }
   }
 
   async cancelMine(userId: string, bookingId: string) {
@@ -258,16 +776,76 @@ export class BookingsService {
     if (!UPCOMING.includes(booking.status)) {
       throw new BadRequestException('Only upcoming bookings can be cancelled');
     }
-    const now = new Date();
-    const started =
-      booking.date < startOfToday() ||
-      (isSameDay(booking.date, now) && booking.startMinutes <= minutesSinceMidnight(now));
-    if (started) throw new BadRequestException('Cannot cancel a slot that already started');
+    // Round 5, P5-S46: started = start instant, not play date.
+    if (this.slotStarted(booking)) {
+      throw new BadRequestException('Cannot cancel a slot that already started');
+    }
 
-    return this.prisma.booking.update({
-      where: { id: bookingId },
+    // Round 5, P5-B1: the old unconditional update cancelled
+    // checked-in bookings (a player on the premises, slot freed and
+    // re-sold) and let a check-in landing between the read and the
+    // write leave a cancelled booking with checkedInAt set. The claim
+    // below makes cancel vs check-in a single-winner race, mirroring
+    // cancelByOwner/markNoShow: only the claimer runs the wake.
+    const claimed = await this.prisma.booking.updateMany({
+      where: {
+        id: bookingId,
+        userId,
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        checkedInAt: null,
+      },
       data: { status: BookingStatus.cancelled },
     });
+    if (claimed.count === 0) {
+      const current = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+      if (current?.checkedInAt) {
+        throw new BadRequestException('This booking is already checked in — it cannot be cancelled');
+      }
+      if (current && !UPCOMING.includes(current.status)) {
+        throw new BadRequestException('Only upcoming bookings can be cancelled');
+      }
+      throw new BadRequestException('This booking can no longer be cancelled');
+    }
+    await this.rejectPendingReschedules(bookingId);
+    await this.cleanupGamePost(bookingId, 'The host cancelled their booking, so this game is off.');
+    await this.notifyWaitlist(booking);
+    await this.releasePromo(bookingId);
+    // Round 5, R5-17: share participants hear about the cancel too
+    // (push + email, signed-in joiners only).
+    await this.notifyShareParticipants(
+      bookingId,
+      'Game cancelled',
+      `The host cancelled the game on ${booking.date.toISOString().slice(0, 10)} — this shared game is off.`,
+      'booking_cancelled',
+      'Shared game cancelled',
+    ).catch(() => {});
+    // The arena owner is told, mirroring the owner-cancel path that
+    // tells the player (Round 4: player cancels used to notify
+    // nobody, so the arena kept a dead booking on its books).
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: booking.venueId },
+      select: {
+        name: true,
+        ownerId: true,
+        owner: { select: { email: true } },
+      },
+    });
+    if (venue) {
+      const hh = String(Math.floor(booking.startMinutes / 60)).padStart(2, '0');
+      const mm = String(booking.startMinutes % 60).padStart(2, '0');
+      const summary = `${booking.date.toISOString().slice(0, 10)} ${hh}:${mm}`;
+      if (venue.owner?.email) {
+        void this.notifications.notifyOwnerCancelledBooking(venue.owner.email, venue.name, summary);
+      }
+      await this.notifications
+        .pushToUser(venue.ownerId, {
+          title: 'Booking cancelled',
+          body: `A player cancelled their booking at ${venue.name} (${summary}).`,
+          data: { type: 'booking_cancelled', venueId: booking.venueId },
+        })
+        .catch(() => {});
+    }
+    return this.prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
   }
 
   // ------------------------------------------------------------------ share
@@ -276,8 +854,20 @@ export class BookingsService {
     if (!booking) throw new NotFoundException('Booking not found');
     let shareCode = booking.shareCode;
     if (!shareCode) {
-      shareCode = shortCode(8);
-      await this.prisma.booking.update({ where: { id: bookingId }, data: { shareCode } });
+      // Round 5, D5-T6: retry the backfill on a shareCode collision
+      // (up to 3 attempts) instead of surfacing a raw P2002 500.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        shareCode = shortCode(8);
+        try {
+          await this.prisma.booking.update({ where: { id: bookingId }, data: { shareCode } });
+          break;
+        } catch (e) {
+          const isCollision =
+            e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002';
+          if (attempt < 2 && isCollision) continue;
+          throw e;
+        }
+      }
     }
     return { shareCode, joinUrl: `/join/${shareCode}` };
   }
@@ -288,15 +878,156 @@ export class BookingsService {
       where: { shareCode },
       include: {
         court: { select: { name: true, sport: true } },
-        venue: { select: { name: true, address: true, city: true } },
+        venue: { select: { name: true, address: true, city: true, images: true, photos: true } },
         participants: { select: { name: true, joinedAt: true } },
+        // Round 5, R5-26: capacity source (see below).
+        gamePost: { select: { playersNeeded: true } },
       },
     });
     if (!booking || booking.status === BookingStatus.cancelled) {
       throw new NotFoundException('Booking link is invalid or expired');
     }
-    const { checkInCode: _c, ...safe } = booking as any;
-    return safe;
+    // Joins until START (Round 4 decision, enforced identically in
+    // getShared, the join page path via this lookup, and joinShared):
+    // a link for a game that already started takes no new joiners,
+    // even if the game is still being played. Round 5, P5-T18: the
+    // started case uses ONE status/message on both paths — the
+    // 400 "already started" form (joinShared's form), not getShared's
+    // old 404, so callers see the same started signal either way.
+    if (this.slotStarted(booking)) {
+      throw new BadRequestException('This game has already started');
+    }
+    const { checkInCode: _c, gamePost: _gp, ...safe } = booking as any;
+    // Round 5, R5-26: `capacity` is the max number of share
+    // participants. There is NO stored share-booking cap in the
+    // schema (joinShared enforces none), so the only server-derived
+    // cap is the linked game post's playersNeeded — the same number
+    // the game-board join path treats as "full" (joined >=
+    // playersNeeded). A shared booking with no linked game post has
+    // capacity null = uncapped; the panel renders "Squad full" only
+    // when capacity != null && participants.length >= capacity.
+    // (gamePost itself is stripped from the payload — only the
+    // derived capacity is exposed.)
+    return { ...safe, capacity: (booking as any).gamePost?.playersNeeded ?? null };
+  }
+
+  /**
+   * A game post lives and dies with its booking: when the booking is
+   * cancelled, delete the post and tell everyone who joined it.
+   */
+  async cleanupGamePost(bookingId: string, reason: string) {
+    const post = await this.prisma.gamePost.findUnique({
+      where: { bookingId },
+    });
+    if (!post) return;
+    const squad = await this.prisma.gameParticipant.findMany({
+      where: { postId: post.id, userId: { not: null } },
+      select: { userId: true },
+    });
+    for (const s of squad) {
+      await this.notifications
+        .pushToUser(s.userId!, {
+          title: 'Game cancelled',
+          body: reason,
+          data: { type: 'game_cancelled' },
+        })
+        .catch(() => {});
+    }
+    // deleteMany, not findUnique-then-delete: a host deleting their
+    // post between the read and the delete used to throw P2025 here,
+    // aborting the whole venue cascade mid-loop. Deleting zero rows
+    // when the post is already gone is the correct outcome.
+    await this.prisma.gamePost.deleteMany({ where: { bookingId } });
+  }
+
+  /**
+   * When a booked slot frees up (cancellation, reschedule-away), tell
+   * everyone waitlisted for exactly that slot — first come, first served.
+   * The ping uses each entry's WAITED slot size (Round 4): the old
+   * code stepped the freed range by the court's CURRENT slotMinutes,
+   * so after an owner resized the court, waiters on the old grid were
+   * never pinged. Entries whose waited slot overlaps the freed range
+   * are claimed (atomic UPDATE ... WHERE notifiedAt IS NULL) and
+   * pinged; entries created before slot sizes were stored fall back
+   * to the court's current slotMinutes.
+   */
+  async notifyWaitlist(booking: {
+    courtId: string;
+    date: Date;
+    startMinutes: number;
+    endMinutes: number;
+  }) {
+    const court = await this.prisma.court.findUnique({
+      where: { id: booking.courtId },
+      include: { venue: { select: { name: true } } },
+    });
+    if (!court) return;
+    // A legacy court with slotMinutes <= 0 (no longer creatable, but
+    // possibly already stored) would loop forever stepping by 0 or
+    // backwards — skip the notify rather than hang the request.
+    if (court.slotMinutes <= 0) return;
+    const entries = await this.prisma.slotWaitlist.findMany({
+      where: { courtId: booking.courtId, date: booking.date, notifiedAt: null },
+      select: { id: true, userId: true, startMinutes: true, slotMinutes: true },
+      orderBy: { startMinutes: 'asc' },
+    });
+    for (const e of entries) {
+      // Round 5, D5-S48: entries created before slot sizes were
+      // stored (slotMinutes NULL) must not mis-fire after a re-grid.
+      // The current-grid fallback shrank the waited slot, so a freed
+      // adjacent slot never pinged them. For NULL entries, use a
+      // conservative overlap window instead: the freed range pings
+      // them if it overlaps [start − courtSlotMinutes,
+      // start + courtSlotMinutes] — i.e. any adjacent freed slot on
+      // the current grid pings the legacy waiter, rather than only a
+      // freed slot exactly covering their (unknown) old slot. This
+      // may over-ping by one adjacent slot, which is the safe
+      // direction: a missed ping strands the waiter forever, while
+      // an extra ping just offers a neighbouring slot.
+      let waitedStart: number;
+      let waitedEnd: number;
+      if (e.slotMinutes == null) {
+        waitedStart = e.startMinutes - court.slotMinutes;
+        waitedEnd = e.startMinutes + court.slotMinutes;
+      } else {
+        if (e.slotMinutes <= 0) continue;
+        waitedStart = e.startMinutes;
+        waitedEnd = e.startMinutes + e.slotMinutes;
+      }
+      // The null case uses INCLUSIVE boundaries on purpose: a freed
+      // slot adjacent to the window (e.g. 09:30–10:00 against a
+      // 09:00 waiter's [08:30, 09:30] window) touches at exactly one
+      // endpoint and must still ping — that is the D5-S48 scenario
+      // (half of a 60-minute wait freed as a 30-minute slot).
+      const overlaps =
+        e.slotMinutes == null
+          ? waitedStart <= booking.endMinutes && waitedEnd >= booking.startMinutes
+          : waitedStart < booking.endMinutes && waitedEnd > booking.startMinutes;
+      if (!overlaps) {
+        continue;
+      }
+      // Claim BEFORE notifying: the old read-then-ping-then-mark let
+      // two concurrent cancellations both read the same un-notified
+      // entries and ping every waiter twice. The UPDATE ... RETURNING
+      // claims exactly the rows this caller won; a loser claims
+      // nothing and pings nobody.
+      const claimed = await this.prisma.$queryRaw<{ id: string }[]>`
+        UPDATE "SlotWaitlist"
+        SET "notifiedAt" = NOW()
+        WHERE "id" = ${e.id}
+          AND "notifiedAt" IS NULL
+        RETURNING "id"`;
+      if (claimed.length === 0) continue;
+      const hh = String(Math.floor(e.startMinutes / 60) % 24).padStart(2, '0');
+      const mm = String(e.startMinutes % 60).padStart(2, '0');
+      await this.notifications
+        .pushToUser(e.userId, {
+          title: 'A slot just opened up',
+          body: `${court.venue.name} · ${court.name} on ${booking.date.toISOString().slice(0, 10)} at ${hh}:${mm} is free again — grab it before someone else does.`,
+          data: { type: 'slot_opened' },
+        })
+        .catch(() => {});
+    }
   }
 
   async joinShared(shareCode: string, dto: JoinSharedDto, userId?: string) {
@@ -304,14 +1035,48 @@ export class BookingsService {
     if (!booking || booking.status === BookingStatus.cancelled) {
       throw new NotFoundException('Booking link is invalid or expired');
     }
-    let name = dto.name;
+    // Joins until START (Round 4 decision): a game that already
+    // started takes no new joiners — the old end-instant rule let an
+    // overnight game accept joiners after midnight while it was being
+    // played.
+    if (this.slotStarted(booking)) {
+      throw new BadRequestException('This game has already started');
+    }
+    // One join per phone number — stops accidental (or spammed) duplicates.
+    // Round 5, P5-T17: trim both fields; reject an empty name; a
+    // blank phone normalizes to null (required for the partial unique
+    // index — empty strings would collide across joiners).
+    const name = (dto.name ?? '').trim();
+    if (!name) {
+      throw new BadRequestException('Name must not be empty');
+    }
+    const phone = (dto.phone ?? '').trim() || null;
+    if (phone) {
+      const dupe = await this.prisma.bookingParticipant.findFirst({
+        where: { bookingId: booking.id, phone },
+      });
+      if (dupe) {
+        throw new ConflictException('This number has already joined this game');
+      }
+    }
+    let displayName = name;
     if (userId) {
       const user = await this.prisma.user.findUnique({ where: { id: userId } });
-      if (user?.name) name = user.name;
+      if (user?.name) displayName = user.name;
     }
-    return this.prisma.bookingParticipant.create({
-      data: { bookingId: booking.id, name, phone: dto.phone },
-    });
+    try {
+      return await this.prisma.bookingParticipant.create({
+        data: { bookingId: booking.id, name: displayName, phone, userId: userId ?? null },
+      });
+    } catch (e) {
+      // The partial unique index is the race backstop for the dupe
+      // check above: two simultaneous joins with the same phone land
+      // one row and one clean 409, never a raw P2002.
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        throw new ConflictException('This number has already joined this game');
+      }
+      throw e;
+    }
   }
 
   // ------------------------------------------------------- reschedule requests
@@ -321,6 +1086,16 @@ export class BookingsService {
     if (!booking) throw new NotFoundException('Booking not found');
     if (booking.status !== BookingStatus.confirmed) {
       throw new BadRequestException('Only confirmed bookings can be rescheduled');
+    }
+    // The original slot must not have started (or ended), and a booking
+    // already checked in can no longer move — otherwise an in-progress
+    // game could be teleported to another day.
+    // Round 5, P5-S46: started = start instant, not play date.
+    if (booking.checkedInAt) {
+      throw new BadRequestException('A checked-in booking cannot be rescheduled');
+    }
+    if (this.slotStarted(booking)) {
+      throw new BadRequestException('Cannot reschedule a slot that already started');
     }
     const existing = await this.prisma.rescheduleRequest.findFirst({
       where: { bookingId, status: 'pending' },
@@ -334,24 +1109,188 @@ export class BookingsService {
     slotAt.setHours(Math.floor(startMinutes / 60), startMinutes % 60, 0, 0);
     if (slotAt <= new Date()) throw new BadRequestException('New slot must be in the future');
 
-    return this.prisma.rescheduleRequest.create({
-      data: {
-        bookingId,
-        requestedDate: date,
-        requestedStartMinutes: startMinutes,
-        requestedEndMinutes: endMinutes,
-      },
+    // The requested slot must actually be bookable (Round 4): the old
+    // code accepted any future minute — startMinutes 9999, or a
+    // closed-hour slot — and left the owner to auto-reject it. Sane
+    // integer first (the setHours rollover above would otherwise
+    // bless 9999 as a date a week out), then containment in one
+    // effective window for the requested date on the court's grid —
+    // including the previous evening's spill window for early-morning
+    // requests (same rule as reschedule-accept, O-S13).
+    if (!Number.isInteger(startMinutes) || startMinutes < 0 || startMinutes >= 1440) {
+      throw new BadRequestException('Requested slot is outside court hours');
+    }
+    const court = await this.prisma.court.findUnique({ where: { id: booking.courtId } });
+    if (!court) throw new NotFoundException('Court not found');
+    if (court.slotMinutes <= 0) {
+      throw new BadRequestException('Court slot length is invalid');
+    }
+    // Round 5, P5-S49: the requested slot must satisfy the venue's
+    // min/max-advance windows, exactly as a fresh booking must — a
+    // move to a slot 30 minutes out, or 6 months out, is refused
+    // here instead of landing on the owner as a fait accompli. (The
+    // accept-time re-check belongs to the owner accept path.)
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: court.venueId },
+      select: { minAdvanceMinutes: true, maxAdvanceDays: true },
     });
+    if (!venue) throw new NotFoundException('Venue not found');
+    this.validateWindow({ ...court, venue }, date, startMinutes);
+    const windows = await this.courts.windowsForDate(court, date);
+    let window = windows.find(
+      (w) => startMinutes >= w.startMinutes && endMinutes <= w.endMinutes,
+    );
+    if (!window && startMinutes < 360) {
+      const prevDate = new Date(date);
+      prevDate.setDate(prevDate.getDate() - 1);
+      const prevWindows = await this.courts.windowsForDate(court, prevDate);
+      const spill = prevWindows
+        .filter((w) => w.endMinutes > 1440)
+        .map((w) => ({ startMinutes: w.startMinutes - 1440, endMinutes: w.endMinutes - 1440 }));
+      window = spill.find(
+        (w) => startMinutes >= w.startMinutes && endMinutes <= w.endMinutes,
+      );
+    }
+    if (!window || (startMinutes - window.startMinutes) % court.slotMinutes !== 0) {
+      throw new BadRequestException('Requested slot is outside court hours');
+    }
+
+    // Round 5, P5-S50: the partial unique index on
+    // RescheduleRequest(bookingId) WHERE status='pending' is the
+    // race backstop for the pending check above — a concurrent
+    // double-submit lands one row and one clean 409, never two
+    // pending requests. The wording matches the existing
+    // duplicate-pending error exactly.
+    try {
+      return await this.prisma.rescheduleRequest.create({
+        data: {
+          bookingId,
+          requestedDate: date,
+          requestedStartMinutes: startMinutes,
+          requestedEndMinutes: endMinutes,
+        },
+      });
+    } catch (e) {
+      if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        throw new ConflictException('A reschedule request is already pending');
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * The player withdraws their own pending reschedule request (Round
+   * 4): previously a request could only leave pending by an owner
+   * decision, so a player who changed their mind was stuck until the
+   * owner acted. The claim is status-conditioned, so a concurrent
+   * owner decision wins instead of being overwritten.
+   */
+  async withdrawReschedule(userId: string, bookingId: string) {
+    const booking = await this.prisma.booking.findFirst({ where: { id: bookingId, userId } });
+    if (!booking) throw new NotFoundException('Booking not found');
+    const claimed = await this.prisma.rescheduleRequest.updateMany({
+      where: { bookingId, status: 'pending' },
+      data: { status: 'withdrawn', decidedAt: new Date() },
+    });
+    if (claimed.count === 0) {
+      throw new BadRequestException('No pending reschedule request to withdraw');
+    }
+    // Round 5, P5-T21 (withdraw side): the venue owner must hear
+    // about the withdrawal — previously they opened the request to
+    // find it silently gone. The accept path's distinct error for an
+    // already-decided request must contain "withdrawn by player"
+    // (owner accept path, other worker's file — reported for them to
+    // match); no reschedule-accept branch lives in this service.
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: booking.venueId },
+      select: { name: true, ownerId: true },
+    });
+    if (venue) {
+      const hh = String(Math.floor(booking.startMinutes / 60)).padStart(2, '0');
+      const mm = String(booking.startMinutes % 60).padStart(2, '0');
+      await this.notifications
+        .pushToUser(venue.ownerId, {
+          title: 'Reschedule request withdrawn',
+          body: `The player withdrew their reschedule request at ${venue.name} (${booking.date.toISOString().slice(0, 10)} ${hh}:${mm}).`,
+          data: { type: 'reschedule_withdrawn', venueId: booking.venueId },
+        })
+        .catch(() => {});
+    }
+    return { withdrawn: true };
   }
 
   // ------------------------------------------------------- owner operations
+  /**
+   * True once a slot has started — or the player already checked in
+   * (check-in opens 30 minutes early, so a checked-in booking is live
+   * even before its start minute). Shared by every cascade that must
+   * not cancel games already in play.
+   * Round 5, P5-S46: "started" is the start INSTANT, not the play
+   * date — a spill-start booking (startMinutes >= 1440, e.g. Friday
+   * 01:00 stored as Friday + 1500) is NOT started at midnight, it
+   * starts at Saturday 01:00. The old date comparison treated it as
+   * started from midnight, making it un-cancellable, unjoinable, and
+   * invisible to the cascade at exactly the time it was still upcoming.
+   */
+  private slotLive(b: {
+    date: Date;
+    startMinutes: number;
+    checkedInAt?: Date | null;
+  }): boolean {
+    if (b.checkedInAt) return true;
+    return this.slotStarted(b);
+  }
+
   /** Owner/staff act on bookings of their venues (ownership verified by caller). */
   async acceptBooking(bookingId: string) {
     const booking = await this.getPending(bookingId);
-    const updated = await this.prisma.booking.update({
-      where: { id: bookingId },
+    // Re-validate slot fit at accept time: the world may have changed
+    // since the request was made (hours shrunk, a block added, another
+    // booking confirmed into the slot). A booking that no longer fits
+    // stays pending for the owner to reject — it must not confirm into
+    // a window that no longer exists. Same checks as reschedule-accept.
+    const court = await this.prisma.court.findUnique({ where: { id: booking.courtId } });
+    if (!court) throw new NotFoundException('Court not found');
+    const endMinutes = booking.endMinutes;
+    const windows = await this.courts.windowsForDate(court, booking.date);
+    const fits = windows.some(
+      (w) =>
+        booking.startMinutes >= w.startMinutes &&
+        endMinutes <= w.endMinutes &&
+        (booking.startMinutes - w.startMinutes) % court.slotMinutes === 0,
+    );
+    if (!fits) {
+      throw new BadRequestException('This booking no longer fits the court hours');
+    }
+    const blocked = await this.courts.blockedRangesForDate(booking.courtId, booking.date);
+    if (
+      blocked.some((r) => booking.startMinutes < r.endMinutes && endMinutes > r.startMinutes)
+    ) {
+      throw new ConflictException('This slot is blocked by the arena');
+    }
+    const clash = await this.prisma.booking.findFirst({
+      where: {
+        id: { not: bookingId },
+        courtId: booking.courtId,
+        date: booking.date,
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+        startMinutes: { lt: endMinutes },
+        endMinutes: { gt: booking.startMinutes },
+      },
+      select: { id: true },
+    });
+    if (clash) throw new ConflictException('This slot is no longer available');
+    // Atomic claim: only one decider can move the booking out of pending;
+    // a simultaneous second decision gets 'already decided' instead of
+    // silently overwriting the first.
+    const claimed = await this.prisma.booking.updateMany({
+      where: { id: bookingId, status: BookingStatus.pending },
       data: { status: BookingStatus.confirmed },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException('This booking has already been decided');
+    }
+    const updated = await this.prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
     if (booking.userId) {
       await this.notifications.notifyPlayerDecision(booking.userId, true, booking.venue.name, this.fmtWhen(booking)).catch(() => {});
     }
@@ -360,13 +1299,27 @@ export class BookingsService {
 
   async rejectBooking(bookingId: string, reason?: string) {
     const booking = await this.getPending(bookingId);
-    const updated = await this.prisma.booking.update({
-      where: { id: bookingId },
+    const claimed = await this.prisma.booking.updateMany({
+      where: { id: bookingId, status: BookingStatus.pending },
       data: { status: BookingStatus.cancelled },
     });
+    if (claimed.count === 0) {
+      throw new BadRequestException('This booking has already been decided');
+    }
+    const updated = await this.prisma.booking.findUniqueOrThrow({ where: { id: bookingId } });
+    await this.releasePromo(bookingId);
     if (booking.userId) {
       await this.notifications.notifyPlayerDecision(booking.userId, false, booking.venue.name, this.fmtWhen(booking), reason).catch(() => {});
     }
+    // Round 5, R5-17: a rejected booking is a cancelled shared game
+    // for its participants.
+    await this.notifyShareParticipants(
+      bookingId,
+      'Game cancelled',
+      `The arena did not approve the game at ${booking.venue.name} (${this.fmtWhen(booking)}) — this shared game is off.`,
+      'booking_cancelled',
+      'Shared game cancelled',
+    ).catch(() => {});
     return updated;
   }
 
@@ -378,34 +1331,228 @@ export class BookingsService {
     const accepted: string[] = [];
     const skipped: { id: string; reason: string }[] = [];
     for (const b of pendings) {
-      try {
-        await this.assertNoOverlap(b.courtId, b.date, b.startMinutes, b.endMinutes);
-        await this.prisma.booking.update({ where: { id: b.id }, data: { status: BookingStatus.confirmed } });
-        accepted.push(b.id);
-        if (b.userId) {
-          await this.notifications.notifyPlayerDecision(b.userId, true, b.venue.name, this.fmtWhen(b)).catch(() => {});
+      // Per-occurrence gates, like single accept: the court must still
+      // be bookable and the slot must not have started while the
+      // series sat pending. A failure skips (cancels) just that
+      // occurrence — the rest of the series still confirms.
+      let skipReason: string | null = null;
+      if (this.slotLive(b)) {
+        skipReason = 'Slot already started';
+      } else {
+        try {
+          await this.courts.getActiveCourt(b.courtId);
+        } catch {
+          skipReason = 'Court is no longer bookable';
         }
-      } catch {
-        await this.prisma.booking.update({ where: { id: b.id }, data: { status: BookingStatus.cancelled } });
-        skipped.push({ id: b.id, reason: 'Slot no longer available' });
+        if (!skipReason) {
+          try {
+            await this.assertNoOverlap(b.courtId, b.date, b.startMinutes, b.endMinutes);
+          } catch {
+            skipReason = 'Slot no longer available';
+          }
+        }
+      }
+      if (skipReason) {
+        // Claim with the read status: a concurrent single-accept or
+        // cancel that already decided this occurrence wins, and its
+        // side effects are that path's job — not a double refund here.
+        const claimed = await this.prisma.booking.updateMany({
+          where: { id: b.id, status: BookingStatus.pending },
+          data: { status: BookingStatus.cancelled },
+        });
+        if (claimed.count === 0) {
+          skipped.push({ id: b.id, reason: 'Already decided' });
+          continue;
+        }
+        await this.releasePromo(b.id);
+        skipped.push({ id: b.id, reason: skipReason });
+        continue;
+      }
+      const claimed = await this.prisma.booking.updateMany({
+        where: { id: b.id, status: BookingStatus.pending },
+        data: { status: BookingStatus.confirmed },
+      });
+      if (claimed.count === 0) {
+        skipped.push({ id: b.id, reason: 'Already decided' });
+        continue;
+      }
+      accepted.push(b.id);
+      if (b.userId) {
+        await this.notifications.notifyPlayerDecision(b.userId, true, b.venue.name, this.fmtWhen(b)).catch(() => {});
       }
     }
     return { accepted, skipped };
+  }
+
+  /**
+   * Defense in depth for check-in: bookings are created through the
+   * getActiveCourt choke point, but a venue sanctioned, paused, or
+   * suspended afterwards must not keep accepting check-ins for
+   * bookings that slipped through (e.g. made before the sanction).
+   */
+  private async assertVenueAcceptsCheckIns(venueId: string) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: {
+        status: true,
+        archivedAt: true,
+        billingPaused: true,
+        moderationStatus: true,
+        owner: { select: { status: true } },
+        billingStartAt: true,
+        billingPaidUntil: true,
+        freeUntilOverride: true,
+        billingPeriodStart: true,
+        billingPeriodEnd: true,
+        billingPeriodPrice: true,
+        planId: true,
+      },
+    });
+    if (
+      !venue ||
+      venue.status !== 'approved' ||
+      venue.archivedAt ||
+      venue.billingPaused ||
+      venue.moderationStatus !== 'none' ||
+      venue.owner.status !== 'active' ||
+      // Round 5, P5-S54: billingPaused alone is not enough — a venue
+      // whose grace ended since the last nightly sweep is overdue by
+      // computation but still billingPaused=false, and must refuse
+      // check-ins like it already refuses new bookings.
+      (await this.isVenueBillingOverdue(venue))
+    ) {
+      throw new BadRequestException('This arena is not currently accepting check-ins');
+    }
+  }
+
+  /**
+   * Computed live-overdue check, mirroring CourtsService's private
+   * isBillingOverdue (which this service cannot call — it is private
+   * and courts/* is owned by another worker): free trial, then paid
+   * coverage, then the frozen/current period price, then the grace
+   * window. A Rs 0 period is never overdue.
+   */
+  private async isVenueBillingOverdue(venue: {
+    billingStartAt: Date | null;
+    billingPaidUntil: Date | null;
+    freeUntilOverride: Date | null;
+    billingPeriodStart: Date | null;
+    billingPeriodEnd: Date | null;
+    billingPeriodPrice: unknown;
+    planId: string | null;
+  }): Promise<boolean> {
+    if (!venue.billingStartAt) return false;
+    const plan = venue.planId
+      ? await this.prisma.plan.findUnique({ where: { id: venue.planId } })
+      : await this.prisma.plan.findFirst({ where: { isDefault: true } });
+    if (!plan) return false;
+    const freeUntil =
+      venue.freeUntilOverride ?? addMonths(venue.billingStartAt, plan.freeMonths);
+    const now = new Date();
+    if (now < freeUntil) return false;
+    if (venue.billingPaidUntil && venue.billingPaidUntil > now) return false;
+    let periodStart: Date;
+    let periodEnd: Date;
+    if (venue.billingPeriodStart && venue.billingPeriodEnd) {
+      periodStart = venue.billingPeriodStart;
+      periodEnd = venue.billingPeriodEnd;
+      while (venue.billingPaidUntil && venue.billingPaidUntil >= periodEnd) {
+        periodStart = periodEnd;
+        periodEnd = addMonths(periodStart, 12);
+      }
+    } else {
+      periodStart = freeUntil;
+      periodEnd = addMonths(freeUntil, 12);
+      while (venue.billingPaidUntil && venue.billingPaidUntil >= periodEnd) {
+        periodStart = periodEnd;
+        periodEnd = addMonths(periodStart, 12);
+      }
+      while (now < periodStart && periodStart > freeUntil) {
+        periodEnd = periodStart;
+        periodStart = addMonths(periodStart, -12);
+      }
+    }
+    const frozenPrice =
+      venue.billingPeriodStart &&
+      venue.billingPeriodEnd &&
+      periodStart.getTime() === venue.billingPeriodStart.getTime() &&
+      venue.billingPeriodPrice != null
+        ? Number(venue.billingPeriodPrice)
+        : null;
+    const price = frozenPrice ?? plan.priceYearly;
+    if (Number(price) === 0) return false;
+    const setting = await this.prisma.setting.findUnique({
+      where: { key: 'billingGraceDays' },
+    });
+    const grace = setting ? parseInt(setting.value, 10) || 14 : 14;
+    return now > new Date(periodStart.getTime() + grace * 24 * 3600_000);
   }
 
   async checkInByCode(checkInCode: string, venueId: string) {
     const booking = await this.prisma.booking.findFirst({
       where: { checkInCode, venueId },
       include: {
-        court: { select: { name: true } },
+        court: { select: { name: true, isActive: true } },
         user: { select: { name: true, phone: true } },
       },
     });
     if (!booking) throw new NotFoundException('Invalid check-in code');
-    return booking;
+    await this.assertVenueAcceptsCheckIns(venueId);
+    // Scan responses used to return bare booking details, leaving the
+    // panel to guess whether check-in would succeed. The flag mirrors
+    // checkIn's own rules exactly: confirmed, not already checked in,
+    // inside [start − 30min, end] as instants, and on an active court.
+    // Non-confirmed codes are always false — a pending/cancelled
+    // booking is never check-in-able, whatever the clock says. The
+    // window is instant-based, not play-date-based, so an overnight
+    // booking stays check-in-able after midnight.
+    const now = new Date();
+    const openAt = this.slotStartAt(booking);
+    openAt.setMinutes(openAt.getMinutes() - 30);
+    const endAt = this.slotEndAt(booking);
+    const canCheckIn =
+      booking.status === BookingStatus.confirmed &&
+      !booking.checkedInAt &&
+      booking.court.isActive &&
+      now >= openAt &&
+      now <= endAt;
+    return { ...booking, canCheckIn };
   }
 
   async checkIn(bookingId: string) {
+    const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    if (!booking) throw new NotFoundException('Booking not found');
+    await this.assertVenueAcceptsCheckIns(booking.venueId);
+    // A deactivated court takes no check-ins, even for bookings made
+    // while it was live (deactivation refuses upcoming bookings, but
+    // courts deactivated before that guard — or by direct edit — can
+    // still hold a confirmed booking).
+    const court = await this.prisma.court.findUnique({
+      where: { id: booking.courtId },
+      select: { isActive: true },
+    });
+    if (!court?.isActive) throw new BadRequestException('This court is no longer active');
+    if (booking.checkedInAt) {
+      throw new BadRequestException('This booking is already checked in');
+    }
+    if (booking.status !== BookingStatus.confirmed) {
+      throw new BadRequestException('Only confirmed bookings can be checked in');
+    }
+    // Check-in window: from 30 minutes before the slot until the slot
+    // ends, as instants — not "game day". An overnight booking's end
+    // lives on the next calendar day, so a play-date check would refuse
+    // a player arriving after midnight and then strike them no-show.
+    // Anything outside the window is almost certainly a wrong scan.
+    const now = new Date();
+    const openAt = this.slotStartAt(booking);
+    openAt.setMinutes(openAt.getMinutes() - 30);
+    const endAt = this.slotEndAt(booking);
+    if (now < openAt) {
+      throw new BadRequestException('Check-in opens 30 minutes before the slot');
+    }
+    if (now > endAt) {
+      throw new BadRequestException('This slot has already ended');
+    }
     return this.prisma.booking.update({
       where: { id: bookingId },
       data: { checkedInAt: new Date() },
@@ -415,21 +1562,626 @@ export class BookingsService {
   async markNoShow(bookingId: string) {
     const booking = await this.prisma.booking.findUnique({ where: { id: bookingId } });
     if (!booking) throw new NotFoundException('Booking not found');
-    const updated = await this.prisma.booking.update({
-      where: { id: bookingId },
+    // Idempotent: re-marking an already no-show booking changes nothing
+    // (in particular, it must not add a second strike).
+    if (booking.status === BookingStatus.no_show) return booking;
+    if (booking.status !== BookingStatus.confirmed) {
+      throw new BadRequestException('Only confirmed bookings can be marked as no-show');
+    }
+    // A player who checked in played the game — striking them would be
+    // a data error, not a no-show.
+    if (booking.checkedInAt) {
+      throw new BadRequestException('A checked-in booking cannot be marked as no-show');
+    }
+    // A stored inverted booking (endMinutes <= startMinutes, minted
+    // by legacy slotMinutes <= 0 courts) has an EMPTY check-in window
+    // [start−30, end]: it can never be checked into, never occupies
+    // its hour, and must never collect a strike — the nightly sweep
+    // routes through here too, so without this guard it would strike
+    // the player, suspend at 3 strikes, and cancel all future bookings
+    // for a game that was never playable. The backfill cancelling such
+    // bookings is a separate data round; this guard stops new strikes.
+    if (booking.endMinutes <= booking.startMinutes) {
+      throw new BadRequestException('This booking has an invalid slot and cannot be marked as no-show');
+    }
+    // A no-show can only be recorded once the slot has actually ended —
+    // end instant, not play date, so an overnight game is never struck
+    // mid-game after midnight.
+    if (!this.slotEnded(booking)) {
+      throw new BadRequestException('A booking can only be marked no-show after its slot ends');
+    }
+    // Atomic claim: the status AND checkedInAt conditions inside the
+    // UPDATE mean two staff members marking at once can't both pass —
+    // one strike total — and a check-in landing between the read and
+    // this write wins instead of striking a player who showed up
+    // (mirrors the dispute confirm_no_show claim).
+    const claimed = await this.prisma.booking.updateMany({
+      where: { id: bookingId, status: BookingStatus.confirmed, checkedInAt: null },
       data: { status: BookingStatus.no_show },
     });
+    if (claimed.count === 0) {
+      return this.prisma.booking.findUnique({ where: { id: bookingId } });
+    }
+    const updated = await this.prisma.booking.findUnique({ where: { id: bookingId } });
+    // A no-showed booking must never be resurrected by a stale pending
+    // reschedule request.
+    await this.rejectPendingReschedules(bookingId);
     if (booking.userId) {
-      const user = await this.prisma.user.update({
-        where: { id: booking.userId },
-        data: { noShowCount: { increment: 1 } },
-      });
-      const limit = parseInt((await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value ?? '3', 10);
-      if (user.noShowCount >= limit) {
-        await this.prisma.user.update({ where: { id: booking.userId }, data: { status: UserStatus.suspended } });
-      }
+      await this.recordNoShowStrike(booking.userId);
     }
     return updated;
+  }
+
+  /**
+   * Tell a player about a no-show strike — every strike, not just the
+   * suspending one. Shared by markNoShow and the dispute path, which
+   * increments the count inside its own transaction.
+   */
+  async pushNoShowStrike(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { noShowCount: true },
+    });
+    if (!user) return;
+    // Validated like graceDays: a mistyped value ("three") used to
+    // parse to NaN, so `count >= NaN` was always false and strike
+    // suspension never fired — and "0" suspended on the first strike.
+    const limit = parseSettingInt(
+      (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value,
+      3,
+      1,
+    );
+    await this.notifications
+      .pushToUser(userId, {
+        title: 'No-show recorded',
+        body: `You were marked as a no-show — strike ${user.noShowCount} of ${limit}. At ${limit} strikes your account is suspended.`,
+        data: { type: 'no_show_strike' },
+      })
+      .catch(() => {});
+  }
+
+  /**
+   * One no-show strike, shared by the owner path (markNoShow) and the
+   * dispute path (admin confirm_no_show): increment, push the strike
+   * notice, then suspend at the configured strike limit with the full
+   * cascade.
+   */
+  async recordNoShowStrike(userId: string) {
+    const user = await this.prisma.user.update({
+      where: { id: userId },
+      data: { noShowCount: { increment: 1 } },
+    });
+    const limit = parseSettingInt(
+      (await this.prisma.setting.findUnique({ where: { key: 'noShowStrikeLimit' } }))?.value,
+      3,
+      1,
+    );
+    await this.pushNoShowStrike(userId);
+    if (user.noShowCount >= limit && user.status === UserStatus.active) {
+      await this.suspendPlayerWithCascade(userId);
+    }
+    return user.noShowCount;
+  }
+
+  /** Refund a booking's promo (uses are given back on cancel/expiry). */
+  async releasePromo(bookingId: string, tx?: Prisma.TransactionClient) {
+    await this.promos.refundBookingPromo(bookingId, tx);
+  }
+
+  /**
+   * Sanction / suspension / overdue-pause policy: when a venue stops
+   * being bookable, its upcoming bookings do not stand — they are
+   * cancelled, their game posts and waitlists are cleaned up, promos
+   * are refunded, and every affected player is told why. "Upcoming"
+   * means not yet started and not checked in: cancelling a game
+   * already in play would strand players mid-game.
+   */
+  async cancelVenueUpcomingBookings(venueId: string, reason: string) {
+    const venue = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: {
+        name: true,
+        status: true,
+        moderationStatus: true,
+        billingPaused: true,
+        owner: { select: { status: true } },
+      },
+    });
+    // Round 5, P5-S46: candidates must include yesterday's spill-start
+    // bookings (startMinutes >= 1440, instant still today). The old
+    // `date >= today` filter excluded them before slotLive ever ran,
+    // so a suspension cascade left a still-upcoming spill booking
+    // standing at a suspended venue. Yesterday is enough: slot starts
+    // fit inside windows ending by 1800, so no spill instant reaches
+    // past 06:00 the next day. slotLive (instant-based) filters the
+    // genuinely-started ones out.
+    const yesterday = new Date(startOfToday());
+    yesterday.setDate(yesterday.getDate() - 1);
+    const candidates = await this.prisma.booking.findMany({
+      where: {
+        venueId,
+        date: { gte: yesterday },
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+      },
+      select: {
+        id: true,
+        userId: true,
+        date: true,
+        courtId: true,
+        startMinutes: true,
+        endMinutes: true,
+        checkedInAt: true,
+      },
+    });
+    const upcoming = candidates.filter((b) => !this.slotLive(b));
+    // The snapshot above can go stale mid-loop: an unsuspend landing
+    // while a suspension cascade is still cancelling would otherwise
+    // keep cancelling a live venue's weekend. The stop rule snapshots
+    // the FULL "venue is still sanctioned" predicate (Round 4, R-S2)
+    // — status + moderation + billingPaused + owner status, not just
+    // the venue status column — and re-checks it before each booking
+    // and each drain pass. A human decision changing any leg stops
+    // the cascade; the cascade must not overrule them.
+    const sanctionAtStart = venue
+      ? {
+          status: venue.status,
+          moderationStatus: venue.moderationStatus,
+          billingPaused: venue.billingPaused,
+          ownerStatus: venue.owner.status,
+        }
+      : null;
+    // Round 5, R5-B5 (null-snapshot leg): if the venue row is gone
+    // there is no sanction predicate to re-check — the old code
+    // skipped the stop check entirely and claimed anyway. Treat a
+    // null snapshot as stopped: cancel nothing, report stoppedEarly.
+    // Round 5, R5-S6: the drain no longer discards its count — it
+    // returns { cancelled, stoppedEarly } so callers (and the panel
+    // round) can surface a partial cascade instead of reporting
+    // success for a half-cancelled venue.
+    let stoppedEarly = false;
+    if (!sanctionAtStart) {
+      return { cancelled: 0, stoppedEarly: true };
+    }
+    let cancelled = 0;
+    for (const b of upcoming) {
+      if (sanctionAtStart) {
+        const current = await this.readSanction(venueId);
+        if (!current || !this.sameSanction(current, sanctionAtStart)) {
+          stoppedEarly = true;
+          break;
+        }
+      }
+      // Claim + database wake in ONE transaction (Round 4, R-S4):
+      // the old claim-then-finalize split left a crash window where
+      // the booking was cancelled but its game post stayed, its promo
+      // stayed spent, and its pending reschedules stayed pending.
+      // Only the pushes (player/squad/waitlist notices) stay outside
+      // the transaction — a crash there loses a notification, never
+      // state.
+      // Round 5, R5-B5: the first loop gets the same in-transaction
+      // sanction re-check the drain passes have (Round 4, R-S3). The
+      // old first loop checked only before the tx, so an unsuspend
+      // landing between the pre-check and a booking's claim cancelled
+      // one extra booking at a venue that was live again. The venue
+      // row is locked inside the tx and the FULL sanction predicate
+      // re-read there; a mismatch aborts this booking's claim.
+      const claimed = await this.prisma.$transaction(async (tx) => {
+        if (sanctionAtStart) {
+          await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+          const current = await this.readSanctionInTx(tx, venueId);
+          if (!current || !this.sameSanction(current, sanctionAtStart)) {
+            return { stopped: true } as const;
+          }
+        }
+        return this.claimCascadeInTx(tx, b);
+      });
+      // A 'stopped' sentinel (sanction changed inside the tx) stops
+      // the whole cascade — it is NOT the same as a null claim, which
+      // just means another path already decided this booking.
+      if ((claimed as { stopped?: boolean } | null)?.stopped) {
+        stoppedEarly = true;
+        break;
+      }
+      if (!claimed) continue;
+      cancelled++;
+      // One booking's failing wake must never abort the whole cascade:
+      // a game post deleted between findUnique and delete used to throw
+      // P2025 here, skipping every remaining booking while the caller
+      // reported success. Log the failure and continue — the booking
+      // itself is already cancelled; only its wake is partial.
+      try {
+        await this.finalizeCascadeNotices(b, venue?.name, venueId, reason, (claimed as { squad: string[] }).squad);
+      } catch (err) {
+        this.logger.error(
+          `Cascade finalize failed for booking ${b.id}: ${(err as Error).message}`,
+        );
+      }
+    }
+    // Drain: a booking inserting while the cascade snapshots can
+    // survive at a suspended venue. Venue-row flips (suspendVenue,
+    // moderation) serialize against creation's venue lock, but an
+    // OWNER suspension flips the user row, not the venue row — so a
+    // creation whose re-verification ran before the flip can commit
+    // mid-cascade, invisible to the snapshot above. Each drain pass
+    // locks the venue row first (creation txs hold that lock from
+    // re-verification to commit, so a pass either waits for an
+    // in-flight insert and then sees it, or runs after the insert
+    // committed and sees it), claims whatever is still standing, and
+    // repeats until a pass finds nothing. The sanction stop rule
+    // applies here too, and the pass cap bounds the loop if bookings
+    // keep arriving (a creation starting after the final pass still
+    // fails its own re-verification against the suspended venue/owner).
+    for (let pass = 0; pass < 5; pass++) {
+      if (sanctionAtStart) {
+        const current = await this.readSanction(venueId);
+        if (!current || !this.sameSanction(current, sanctionAtStart)) {
+          stoppedEarly = true;
+          break;
+        }
+      }
+      const { stopped, done } = await this.prisma.$transaction(async (tx) => {
+        // Round 4, P-S12/P-S13: the claim holds the venue lock while
+        // iterating bookings — bound the lock wait so a slow cascade
+        // cannot wedge the pool (a timeout aborts this pass, which the
+        // caller logs and the next pass retries; it surfaces as a
+        // retryable 503, never a wedged connection).
+        await tx.$executeRaw`SET LOCAL lock_timeout = '5s'`;
+        await tx.$queryRaw`SELECT id FROM "Venue" WHERE id = ${venueId} FOR UPDATE`;
+        // Re-check the sanction predicate INSIDE the transaction,
+        // after the row lock (Round 4, R-S3): a sanction change that
+        // landed between the pass's pre-check and the lock must abort
+        // the claim, not just the next pass.
+        if (sanctionAtStart) {
+          const current = await this.readSanctionInTx(tx, venueId);
+          if (!current || !this.sameSanction(current, sanctionAtStart)) {
+            return { stopped: true, done: [] as { booking: (typeof upcoming)[number]; squad: string[] }[] };
+          }
+        }
+        const rows = await tx.booking.findMany({
+          where: {
+            venueId,
+            // Round 5, P5-S46: yesterday, same as the snapshot above —
+            // spill-start bookings must reach the slotLive filter.
+            date: { gte: yesterday },
+            status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+          },
+          select: {
+            id: true,
+            userId: true,
+            date: true,
+            courtId: true,
+            startMinutes: true,
+            endMinutes: true,
+            checkedInAt: true,
+          },
+        });
+        const standing = rows.filter((b) => !this.slotLive(b));
+        const done: { booking: (typeof standing)[number]; squad: string[] }[] = [];
+        for (const b of standing) {
+          const claimed = await this.claimCascadeInTx(tx, b);
+          if (claimed) done.push({ booking: b, squad: claimed.squad });
+        }
+        return { stopped: false, done };
+      });
+      if (stopped) {
+        stoppedEarly = true;
+        break;
+      }
+      if (done.length === 0) break;
+      cancelled += done.length;
+      for (const { booking: b, squad } of done) {
+        try {
+          await this.finalizeCascadeNotices(b, venue?.name, venueId, reason, squad);
+        } catch (err) {
+          this.logger.error(
+            `Cascade finalize failed for booking ${b.id}: ${(err as Error).message}`,
+          );
+        }
+      }
+    }
+    return { cancelled, stoppedEarly };
+  }
+
+  /** The full "venue is still sanctioned" predicate for the cascade stop rule. */
+  private async readSanction(venueId: string) {
+    const v = await this.prisma.venue.findUnique({
+      where: { id: venueId },
+      select: {
+        status: true,
+        moderationStatus: true,
+        billingPaused: true,
+        owner: { select: { status: true } },
+      },
+    });
+    if (!v) return null;
+    return {
+      status: v.status,
+      moderationStatus: v.moderationStatus,
+      billingPaused: v.billingPaused,
+      ownerStatus: v.owner.status,
+    };
+  }
+
+  private async readSanctionInTx(tx: Prisma.TransactionClient, venueId: string) {
+    const v = await tx.venue.findUnique({
+      where: { id: venueId },
+      select: {
+        status: true,
+        moderationStatus: true,
+        billingPaused: true,
+        owner: { select: { status: true } },
+      },
+    });
+    if (!v) return null;
+    return {
+      status: v.status,
+      moderationStatus: v.moderationStatus,
+      billingPaused: v.billingPaused,
+      ownerStatus: v.owner.status,
+    };
+  }
+
+  private sameSanction(
+    a: { status: unknown; moderationStatus: unknown; billingPaused: unknown; ownerStatus: unknown },
+    b: { status: unknown; moderationStatus: unknown; billingPaused: unknown; ownerStatus: unknown },
+  ) {
+    return (
+      a.status === b.status &&
+      a.moderationStatus === b.moderationStatus &&
+      a.billingPaused === b.billingPaused &&
+      a.ownerStatus === b.ownerStatus
+    );
+  }
+
+  /**
+   * Claim one booking for the cascade AND run its database wake inside
+   * the caller's transaction (Round 4, R-S4): status-conditioned
+   * cancel, pending reschedules rejected, linked game post deleted,
+   * promo released. Returns null when another path already claimed
+   * the booking. The squad user ids are returned so the caller can
+   * notify them after commit.
+   */
+  private async claimCascadeInTx(
+    tx: Prisma.TransactionClient,
+    b: { id: string },
+  ): Promise<{ squad: string[] } | null> {
+    // Round 5, R5-B6: checkedInAt IS NULL in the claim, mirroring the
+    // markNoShow claim — a check-in landing between the snapshot
+    // filter and this write must win, not get cancelled mid-game.
+    const claimed = await tx.booking.updateMany({
+      where: { id: b.id, status: { in: [BookingStatus.pending, BookingStatus.confirmed] }, checkedInAt: null },
+      data: { status: BookingStatus.cancelled },
+    });
+    if (claimed.count === 0) return null;
+    await tx.rescheduleRequest.updateMany({
+      where: { bookingId: b.id, status: 'pending' },
+      data: { status: 'rejected', reason: 'Booking is no longer active', decidedAt: new Date() },
+    });
+    const post = await tx.gamePost.findUnique({
+      where: { bookingId: b.id },
+      select: { id: true },
+    });
+    let squad: string[] = [];
+    if (post) {
+      squad = (
+        await tx.gameParticipant.findMany({
+          where: { postId: post.id, userId: { not: null } },
+          select: { userId: true },
+        })
+      ).map((s) => s.userId!);
+      await tx.gamePost.deleteMany({ where: { bookingId: b.id } });
+    }
+    await this.promos.refundBookingPromo(b.id, tx);
+    return { squad };
+  }
+
+  /**
+   * The per-booking wake AFTER a cascade claim commits: squad told
+   * their game is off, freed slots pinged to their waitlists, player
+   * told why. Runs post-commit (pushes cannot be transactional) and
+   * never aborts the cascade — the caller logs and continues.
+   */
+  private async finalizeCascadeNotices(
+    b: {
+      id: string;
+      userId: string | null;
+      date: Date;
+      courtId: string;
+      startMinutes: number;
+      endMinutes: number;
+      checkedInAt: Date | null;
+    },
+    venueName: string | undefined,
+    venueId: string,
+    reason: string,
+    squadUserIds: string[],
+  ) {
+    for (const userId of squadUserIds) {
+      await this.notifications
+        .pushToUser(userId, {
+          title: 'Game cancelled',
+          body: 'The arena cancelled the booking, so this game is off.',
+          data: { type: 'game_cancelled' },
+        })
+        .catch(() => {});
+    }
+    await this.notifyWaitlist(b);
+    if (b.userId) {
+      await this.notifications
+        .pushToUser(b.userId, {
+          title: 'Booking cancelled',
+          body: `Your booking at ${venueName ?? 'the arena'} on ${b.date.toISOString().slice(0, 10)} was cancelled: ${reason}.`,
+          data: { type: 'booking_cancelled', venueId },
+        })
+        .catch(() => {});
+    }
+    // Round 5, R5-17: cascade cancels (suspension, overdue-pause,
+    // owner delete, moderation) also reach share participants — the
+    // cascade previously told the player and the game squad only.
+    await this.notifyShareParticipants(
+      b.id,
+      'Game cancelled',
+      `The game at ${venueName ?? 'the arena'} on ${b.date.toISOString().slice(0, 10)} was cancelled: ${reason}.`,
+      'booking_cancelled',
+      'Shared game cancelled',
+    ).catch(() => {});
+  }
+
+  /**
+   * Cancel every future booking of a player, with the full wake: linked
+   * game posts deleted + squads notified, freed slots pinged to their
+   * waitlists, venue owners emailed. Shared by suspension + deletion.
+   * Started and checked-in bookings are history, not cancellations —
+   * they are left alone. Returns how many bookings were cancelled.
+   */
+  async cancelFutureBookings(userId: string, ownerNote: string) {
+    // Round 5, P5-S46: include yesterday so spill-start bookings
+    // (instant still today) reach the slotLive filter below.
+    const yesterday = new Date(startOfToday());
+    yesterday.setDate(yesterday.getDate() - 1);
+    const candidates = await this.prisma.booking.findMany({
+      where: {
+        userId,
+        date: { gte: yesterday },
+        status: { in: [BookingStatus.pending, BookingStatus.confirmed] },
+      },
+      include: {
+        venue: { select: { name: true, owner: { select: { email: true } } } },
+      },
+    });
+    const future = candidates.filter((b) => !this.slotLive(b));
+    for (const b of future) {
+      await this.prisma.booking.update({
+        where: { id: b.id },
+        data: { status: BookingStatus.cancelled },
+      });
+      await this.rejectPendingReschedules(b.id);
+      await this.releasePromo(b.id);
+      await this.cleanupGamePost(b.id, 'This game is off — the host is no longer on Areana.');
+      // Round 5, R5-17: player-suspension/deletion cancels also reach
+      // share participants.
+      await this.notifyShareParticipants(
+        b.id,
+        'Game cancelled',
+        `The game on ${b.date.toISOString().slice(0, 10)} was cancelled ${ownerNote} — this shared game is off.`,
+        'booking_cancelled',
+        'Shared game cancelled',
+      ).catch(() => {});
+      await this.notifyWaitlist(b);
+      if (b.venue.owner?.email) {
+        void this.notifications.notifyOwnerNewBooking(
+          b.venue.owner.email,
+          b.venue.name,
+          `A booking on ${b.date.toISOString().slice(0, 10)} was cancelled ${ownerNote}.`,
+        );
+      }
+    }
+    return future.length;
+  }
+
+  /**
+   * Pull a player out of every game they joined or asked to join:
+   * squad spots reopen (full games go back to open) and hosts hear
+   * about it. Used by suspension and account deletion.
+   */
+  async exitGames(userId: string) {
+    const rows = await this.prisma.gameParticipant.findMany({
+      where: { userId },
+      include: {
+        post: {
+          select: {
+            id: true,
+            creatorId: true,
+            sport: true,
+            status: true,
+            date: true,
+            startMinutes: true,
+          },
+        },
+      },
+    });
+    if (rows.length === 0) return;
+    await this.prisma.gameParticipant.deleteMany({ where: { userId } });
+    const byPost = new Map<string, { post: (typeof rows)[number]['post']; wasJoined: boolean }>();
+    for (const r of rows) {
+      const cur = byPost.get(r.post.id);
+      byPost.set(r.post.id, {
+        post: r.post,
+        wasJoined: (cur?.wasJoined ?? false) || r.status === 'joined',
+      });
+    }
+    for (const { post, wasJoined } of byPost.values()) {
+      if (!wasJoined) continue;
+      // Round 5, P5-S46: started = start instant, not play date.
+      const started = this.slotStarted(post);
+      if (post.status === 'full' && !started) {
+        await this.prisma.gamePost.update({
+          where: { id: post.id },
+          data: { status: 'open' },
+        });
+      }
+      if (post.creatorId !== userId) {
+        await this.notifications
+          .pushToUser(post.creatorId, {
+            title: 'Squad update',
+            body: `A player left your ${post.sport} game — their spot is open again.`,
+            data: { type: 'game_roster_changed' },
+          })
+          .catch(() => {});
+      }
+    }
+  }
+
+  /** Delete any game posts the player still hosts (squads notified). */
+  async deleteHostedPosts(userId: string) {
+    const posts = await this.prisma.gamePost.findMany({
+      where: { creatorId: userId },
+      select: { id: true, sport: true },
+    });
+    for (const post of posts) {
+      const squad = await this.prisma.gameParticipant.findMany({
+        where: { postId: post.id, userId: { not: null } },
+        select: { userId: true },
+      });
+      for (const s of squad) {
+        await this.notifications
+          .pushToUser(s.userId!, {
+            title: 'Game cancelled',
+            body: `The ${post.sport} game you were in was removed — the host left Areana.`,
+            data: { type: 'game_cancelled' },
+          })
+          .catch(() => {});
+      }
+      await this.prisma.gamePost.delete({ where: { id: post.id } });
+    }
+  }
+
+  async suspendPlayerWithCascade(userId: string) {
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { status: UserStatus.suspended },
+    });
+    const cancelledCount = await this.cancelFutureBookings(
+      userId,
+      "because the player's account was suspended",
+    );
+    await this.exitGames(userId);
+    await this.notifications
+      .pushToUser(userId, {
+        title: 'Account suspended',
+        body:
+          cancelledCount > 0
+            ? `Your Areana account has been suspended and your ${cancelledCount} upcoming booking${cancelledCount === 1 ? ' was' : 's were'} cancelled.`
+            : 'Your Areana account has been suspended.',
+        data: { type: 'account_suspended' },
+      })
+      .catch(() => {});
+    // Revoke live sessions too, so suspension is immediate, not at the
+    // next refresh.
+    await this.prisma.refreshSession.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
   }
 
   async cancelByOwner(bookingId: string) {
@@ -438,10 +2190,104 @@ export class BookingsService {
     if (!UPCOMING.includes(booking.status)) {
       throw new BadRequestException('Only upcoming bookings can be cancelled');
     }
-    return this.prisma.booking.update({
+    // Same guards as the player cancel path: a slot that already
+    // started is history, not a cancellation — and a checked-in
+    // player is already on the court.
+    // Round 5, P5-S46: started = start instant, not play date.
+    if (this.slotStarted(booking)) {
+      throw new BadRequestException('Cannot cancel a slot that already started');
+    }
+    if (booking.checkedInAt) {
+      throw new BadRequestException('This booking is already checked in — it cannot be cancelled');
+    }
+    const updated = await this.prisma.booking.update({
       where: { id: bookingId },
       data: { status: BookingStatus.cancelled },
     });
+    await this.rejectPendingReschedules(bookingId);
+    await this.cleanupGamePost(bookingId, 'The venue cancelled the booking, so this game is off.');
+    await this.notifyWaitlist(booking);
+    await this.releasePromo(bookingId);
+    // Round 5, R5-17: owner cancels reach share participants too.
+    await this.notifyShareParticipants(
+      bookingId,
+      'Game cancelled',
+      `The arena cancelled the game on ${booking.date.toISOString().slice(0, 10)} — this shared game is off.`,
+      'booking_cancelled',
+      'Shared game cancelled',
+    ).catch(() => {});
+    // A cancelled game the player never hears about is a player who
+    // shows up anyway — the venue cancel pushes like the venue
+    // suspension cascade does.
+    if (booking.userId) {
+      const venue = await this.prisma.venue.findUnique({
+        where: { id: booking.venueId },
+        select: { name: true },
+      });
+      await this.notifications
+        .pushToUser(booking.userId, {
+          title: 'Booking cancelled',
+          body: `Your booking at ${venue?.name ?? 'the arena'} on ${booking.date.toISOString().slice(0, 10)} was cancelled by the arena. Any promo used has been refunded.`,
+          data: { type: 'booking_cancelled', venueId: booking.venueId },
+        })
+        .catch(() => {});
+    }
+    return updated;
+  }
+
+  /**
+   * A booking leaving the active states must never be resurrected by a
+   * stale pending reschedule request — reject them all, with a reason,
+   * so the owner can no longer accept one.
+   */
+  async rejectPendingReschedules(bookingId: string, reason = 'Booking is no longer active') {
+    await this.prisma.rescheduleRequest.updateMany({
+      where: { bookingId, status: 'pending' },
+      data: { status: 'rejected', reason, decidedAt: new Date() },
+    });
+  }
+
+  /**
+   * True once the slot's start has passed. Start INSTANT, not play
+   * date, so an overnight game stops taking joiners at its start
+   * (Round 4 join-until-START rule) even though it ends after
+   * midnight — and so a spill-start booking (startMinutes >= 1440)
+   * is not "already started" from midnight (Round 5, P5-S46).
+   */
+  slotStarted(b: { date: Date; startMinutes: number }, now = new Date()): boolean {
+    return this.slotStartAt(b) <= now;
+  }
+
+  /**
+   * True once the slot's end has passed. endMinutes is minutes since
+   * play-day midnight and may exceed 1440 for overnight bookings, so
+   * the end day is derived from it instead of assuming the play date.
+   */
+  slotEnded(b: { date: Date; endMinutes: number }, now = new Date()): boolean {
+    const endDay = new Date(b.date);
+    endDay.setDate(endDay.getDate() + Math.floor(b.endMinutes / 1440));
+    const endMin = b.endMinutes % 1440;
+    const today = startOfToday();
+    return endDay < today || (isSameDay(endDay, today) && endMin <= minutesSinceMidnight(now));
+  }
+
+  /**
+   * Slot start/end as instants. Built from local midnight of the play day
+   * — not from the stored Date, which is UTC midnight (05:00 PKT) and
+   * would shift every instant by five hours — and setMinutes rolls
+   * values past 1440 (or below 0) across midnight, so overnight slots
+   * get their true end instant on the next calendar day.
+   */
+  slotStartAt(b: { date: Date; startMinutes: number }): Date {
+    const d = new Date(b.date.getFullYear(), b.date.getMonth(), b.date.getDate());
+    d.setMinutes(b.startMinutes);
+    return d;
+  }
+
+  slotEndAt(b: { date: Date; endMinutes: number }): Date {
+    const d = new Date(b.date.getFullYear(), b.date.getMonth(), b.date.getDate());
+    d.setMinutes(b.endMinutes);
+    return d;
   }
 
   private async getPending(bookingId: string) {

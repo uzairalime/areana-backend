@@ -1,0 +1,11 @@
+# One-time helper for the fresh-database install (docs/ORACLE-DEPLOY.md
+# §5). Publishes Postgres on host-local 5432 so the checkout's prisma
+# CLI can reach it for `db push` + the migration resolves.
+#
+# Use ONLY for the first-install sequence, then stop using it:
+#   docker compose -f docker-compose.prod.yml -f docker-compose.prod.first-install.yml up -d db
+# Normal operation uses the base file alone (no published db port).
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"

@@ -1,4 +1,4 @@
-import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsInt, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 export class CreateReviewDto {
@@ -15,5 +15,6 @@ export class CreateReviewDto {
   @ApiPropertyOptional({ example: 'Great turf, well maintained!' })
   @IsOptional()
   @IsString()
+  @MaxLength(1000)
   comment?: string;
 }

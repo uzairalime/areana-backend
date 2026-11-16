@@ -1,10 +1,11 @@
 import { Module } from '@nestjs/common';
 import { AvailabilityModule } from '../availability/availability.module';
+import { PlansModule } from '../plans/plans.module';
 import { SearchController } from './search.controller';
 import { SearchService } from './search.service';
 
 @Module({
-  imports: [AvailabilityModule],
+  imports: [AvailabilityModule, PlansModule],
   controllers: [SearchController],
   providers: [SearchService],
 })
