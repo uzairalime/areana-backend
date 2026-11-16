@@ -180,13 +180,20 @@ export class AuthService {
     try {
       await this.mail.sendOtp(email, code);
     } catch (e) {
+      // Log SMTP diagnostics without exposing credentials or provider responses.
+      const smtpError = e as { code?: string; command?: string; responseCode?: number };
+      this.logger.error(
+        `OTP email delivery failed via ${this.config.get('smtp.host')}:${this.config.get('smtp.port')} ` +
+        `(code=${smtpError?.code ?? 'unknown'}, command=${smtpError?.command ?? 'unknown'}, ` +
+        `responseCode=${smtpError?.responseCode ?? 'unknown'}). Check the SMTP server and configuration.`,
+      );
       if (e instanceof MailDeliveryDelayedError) {
         throw new HttpException(
           'Mail delivery was delayed and could not be confirmed — your previous code still works, or request a new one shortly.',
           HttpStatus.SERVICE_UNAVAILABLE,
         );
       }
-      throw e;
+      throw new ServiceUnavailableException('Unable to send login code. Please try again later.');
     }
     // Round 5, P5-S52 + D5-S35: invalidate predecessors INSIDE the
     // same transaction as the create. The old sequence (invalidate,
