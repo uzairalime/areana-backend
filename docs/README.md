@@ -18,6 +18,7 @@ and how the pieces are used together.
 | [admin.md](admin.md) | Super-admin: approvals, users, roles, badges, disputes, broadcasts, settings, interventions |
 | [analytics.md](analytics.md) | Layered analytics: KPIs → trends → breakdowns → leaderboard → drill-downs |
 | [platform.md](platform.md) | Notifications, image storage, scheduler jobs, health |
+| [aws-deployment-plan.md](aws-deployment-plan.md) | New-account Free Tier EC2/RDS plan, readiness, deployment, rollback, recovery, and credit/cost planning |
 | [models.md](models.md) | Every database model, field by field |
 
 Interactive explorer: `http://localhost:3000/api/docs` (Swagger, auto-generated).

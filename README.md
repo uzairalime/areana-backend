@@ -20,6 +20,10 @@ npm run start:dev
 
 > Keep `TZ=Asia/Karachi` — "today" and slot cutoffs are computed in server local time.
 
+## AWS deployment
+
+See the [Free Tier EC2 and RDS deployment plan](docs/aws-deployment-plan.md) for new-account eligibility, a micro-instance launch, readiness work, configuration, staging checks, deployment, rollback, recovery, and credit/cost planning.
+
 ## Auth & permissions
 
 | Who | How |
