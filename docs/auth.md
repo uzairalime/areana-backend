@@ -17,6 +17,23 @@ Sends a 6-digit code. Rate limited: 5 codes/hour per email, 5 attempts per code.
 The code is bcrypt-hashed in the DB, expires in 10 minutes. In dev it's also
 logged to the console and visible in Mailpit (`:8025`).
 
+Errors: `429` if the hourly limit is reached; `503` if email delivery fails.
+Failed deliveries are removed from the database so they do not consume the
+hourly quota or replace a previously sent code. SMTP diagnostics are logged
+on the backend; credentials and provider error details are not returned to clients.
+
+For local development, start Mailpit before requesting a code. With Docker,
+run `docker compose up -d mailpit`. On macOS without Docker, install it with
+`brew install mailpit`, then run `mailpit`. Keep `SMTP_HOST=localhost` and
+`SMTP_PORT=1025`, and read the captured email at `http://localhost:8025`.
+Mailpit captures messages locally; delivery to a real inbox requires a real
+SMTP provider and its credentials in `.env`.
+
+If the backend logs Prisma `P2021` for `public.OtpCode`, the configured
+database has not been initialized. Run `npm run prisma:deploy` followed by
+`npm run db:seed` against the local database in `.env`. Seeding supplies the
+`player` role required by `/auth/verify-otp`.
+
 ### `POST /auth/verify-otp` — public
 Verifies the code and returns tokens. **First verification = signup**: `name`
 and `phone` are required only when the account doesn't exist yet.

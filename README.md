@@ -9,7 +9,7 @@ Implements the full v1 plan (`~/workspace/areana/PLAN.md`).
 cp .env.example .env          # then set JWT secrets + ADMIN_PASSWORD
 docker compose up -d          # postgres + mailpit (email catcher)
 npm install
-npx prisma migrate dev --name init
+npm run prisma:deploy          # applies the checked-in database migrations
 npm run db:seed               # roles, badges, settings + super admin from ADMIN_EMAIL/ADMIN_PASSWORD
 npm run start:dev
 ```

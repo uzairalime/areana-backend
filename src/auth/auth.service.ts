@@ -5,6 +5,8 @@ import {
   HttpException,
   HttpStatus,
   Injectable,
+  Logger,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -35,6 +37,8 @@ function randomCode(prefix: string): string {
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private prisma: PrismaService,
     private jwt: JwtService,
@@ -58,14 +62,30 @@ export class AuthService {
     }
 
     const code = String(Math.floor(100000 + Math.random() * 900000));
-    await this.prisma.otpCode.create({
+    const record = await this.prisma.otpCode.create({
       data: {
         email,
         codeHash: await bcrypt.hash(code, 10),
         expiresAt: new Date(Date.now() + OTP_TTL_MS),
       },
     });
-    await this.mail.sendOtp(email, code);
+    try {
+      await this.mail.sendOtp(email, code);
+    } catch (error) {
+      const smtpError = error as { code?: string; command?: string; responseCode?: number };
+      this.logger.error(
+        `OTP email delivery failed via ${this.config.get('smtp.host')}:${this.config.get('smtp.port')} ` +
+        `(code=${smtpError?.code ?? 'unknown'}, command=${smtpError?.command ?? 'unknown'}, ` +
+        `responseCode=${smtpError?.responseCode ?? 'unknown'}). Check the SMTP server and configuration.`,
+      );
+      // An undelivered code must not mask an earlier code or consume the hourly quota.
+      try {
+        await this.prisma.otpCode.delete({ where: { id: record.id } });
+      } catch {
+        this.logger.error('Failed to remove an undelivered OTP record.');
+      }
+      throw new ServiceUnavailableException('Unable to send login code. Please try again later.');
+    }
     return { message: 'Login code sent to your email' };
   }
 
